@@ -1,0 +1,241 @@
+/* ==========================================================================
+   fusion_light — 浅色现代
+   基线：极简线性 · 1px 细线 · 4/6px 圆角 · 无阴影 · 黑白灰 + 单一强调（#2563EB）
+   ========================================================================== */
+
+* {
+    font-family: "Segoe UI", "Microsoft YaHei UI", "Inter", sans-serif;
+    font-size: 13px;
+    outline: none;
+}
+
+QWidget {
+    background-color: #FAFAFA;
+    color: #111111;
+    selection-background-color: #2563EB;
+    selection-color: #FFFFFF;
+}
+
+/* ===== 主窗口与导航 ===== */
+QMainWindow::separator {
+    background: #E5E5E5;
+    width: 1px;
+    height: 1px;
+}
+
+#navRail {
+    background: #FFFFFF;
+    border-right: 1px solid #E5E5E5;
+}
+#navRail QPushButton {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 8px 12px;
+    text-align: left;
+    color: #666666;
+}
+#navRail QPushButton:hover {
+    color: #111111;
+    border-color: #111111;
+}
+#navRail QPushButton:checked {
+    color: #111111;
+    background: #FAFAFA;
+    border-color: #111111;
+}
+
+/* ===== 按钮 ===== */
+QPushButton {
+    background: #FFFFFF;
+    border: 1px solid #E5E5E5;
+    border-radius: 6px;
+    padding: 6px 14px;
+    color: #111111;
+}
+QPushButton:hover  { border-color: #111111; }
+QPushButton:pressed { background: #FAFAFA; }
+QPushButton:disabled {
+    color: #BBBBBB;
+    border-color: #E5E5E5;
+}
+QPushButton[role="primary"] {
+    background: #111111;
+    color: #FFFFFF;
+    border-color: #111111;
+}
+QPushButton[role="primary"]:hover { background: #000000; }
+
+/* ===== 输入控件 ===== */
+QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+    background: #FFFFFF;
+    border: 1px solid #E5E5E5;
+    border-radius: 4px;
+    padding: 6px 10px;
+    selection-background-color: #2563EB;
+    selection-color: #FFFFFF;
+}
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus,
+QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+    border-color: #111111;
+}
+QComboBox::drop-down { border: none; width: 24px; }
+QComboBox QAbstractItemView {
+    background: #FFFFFF;
+    border: 1px solid #E5E5E5;
+    selection-background-color: #2563EB;
+    selection-color: #FFFFFF;
+}
+QCheckBox, QRadioButton { spacing: 8px; background: transparent; }
+QCheckBox::indicator, QRadioButton::indicator {
+    width: 14px; height: 14px;
+    border: 1px solid #E5E5E5;
+    border-radius: 3px;
+    background: #FFFFFF;
+}
+QCheckBox::indicator:checked {
+    background: #111111;
+    border-color: #111111;
+}
+
+/* ===== 标签 ===== */
+QLabel { background: transparent; }
+QLabel[role="title"]    { font-size: 16px; font-weight: 500; }
+QLabel[role="subtitle"] { color: #666666; }
+QLabel[role="hint"]     { color: #999999; font-size: 12px; }
+
+/* ===== 海报卡片 ===== */
+#posterCard {
+    background: #FFFFFF;
+    border: 1px solid #E5E5E5;
+    border-radius: 4px;
+}
+#posterCard:hover { border-color: #111111; }
+#posterCard QLabel[role="title"] { font-size: 13px; font-weight: 500; }
+#posterCard QLabel[role="meta"]  { color: #999999; font-size: 12px; }
+
+/* ===== 列表 / 表格 ===== */
+QListWidget, QTreeWidget, QTableWidget {
+    background: #FFFFFF;
+    border: 1px solid #E5E5E5;
+    border-radius: 4px;
+    gridline-color: #E5E5E5;
+}
+QListWidget::item, QTreeWidget::item, QTableWidget::item {
+    border-bottom: 1px solid #F0F0F0;
+    padding: 4px;
+}
+QListWidget::item:selected, QTreeWidget::item:selected, QTableWidget::item:selected {
+    background: #FAFAFA;
+    color: #111111;
+    border-left: 2px solid #2563EB;
+}
+QListWidget::item:hover, QTreeWidget::item:hover, QTableWidget::item:hover {
+    background: #FAFAFA;
+}
+
+/* ===== 集数行 ===== */
+#episodeRow { border-bottom: 1px solid #F0F0F0; }
+#episodeRow[watched="true"] QLabel { color: #BBBBBB; }
+#episodeRow[watched="true"] QLabel[role="check"] { color: #2563EB; }
+
+/* ===== 动态行 ===== */
+#timelineRow { border-bottom: 1px solid #F0F0F0; }
+#timelineRow:hover { background: #FAFAFA; }
+
+/* ===== 滚动条 ===== */
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: #E5E5E5;
+    border-radius: 4px;
+    min-height: 24px;
+    margin: 2px;
+}
+QScrollBar::handle:vertical:hover { background: #111111; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 0;
+}
+QScrollBar::handle:horizontal {
+    background: #E5E5E5;
+    border-radius: 4px;
+    min-width: 24px;
+    margin: 2px;
+}
+QScrollBar::handle:horizontal:hover { background: #111111; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+
+/* ===== 状态栏 ===== */
+QStatusBar {
+    background: #FFFFFF;
+    border-top: 1px solid #E5E5E5;
+    color: #666666;
+}
+
+/* ===== 菜单 ===== */
+QMenuBar {
+    background: #FFFFFF;
+    border-bottom: 1px solid #E5E5E5;
+}
+QMenuBar::item:selected { background: #FAFAFA; }
+QMenu {
+    background: #FFFFFF;
+    border: 1px solid #E5E5E5;
+}
+QMenu::item:selected {
+    background: #2563EB;
+    color: #FFFFFF;
+}
+
+/* ===== 进度条 ===== */
+QProgressBar {
+    background: #FFFFFF;
+    border: 1px solid #E5E5E5;
+    border-radius: 4px;
+    text-align: center;
+    color: #666666;
+}
+QProgressBar::chunk {
+    background: #111111;
+    border-radius: 3px;
+}
+
+/* ===== Tab ===== */
+QTabWidget::pane {
+    border: 1px solid #E5E5E5;
+    border-radius: 4px;
+}
+QTabBar::tab {
+    background: transparent;
+    border: 1px solid transparent;
+    border-bottom: none;
+    padding: 6px 14px;
+    color: #666666;
+}
+QTabBar::tab:selected {
+    color: #111111;
+    border-color: #E5E5E5;
+    border-bottom-color: #FFFFFF;
+}
+QTabBar::tab:hover { color: #111111; }
+
+/* ===== 工具提示 ===== */
+QToolTip {
+    background: #FFFFFF;
+    color: #111111;
+    border: 1px solid #E5E5E5;
+    padding: 4px 8px;
+}
+
+/* ===== 分隔线 ===== */
+QFrame[frameShape="4"], QFrame[frameShape="5"] {
+    color: #E5E5E5;
+    background: #E5E5E5;
+    border: none;
+}
