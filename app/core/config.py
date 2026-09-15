@@ -20,9 +20,26 @@ DEFAULTS: dict[str, dict[str, str]] = {
     },
     "bangumi": {
         "token": "",
+        "username": "",
         "api_base": "https://api.bgm.tv",
         "proxy": "",
         "user_agent": "AnimeMarker/1.0 (https://github.com/yourname/anime-marker)",
+        "inprogress_cache_ttl": "300",
+    },
+    "qbittorrent": {
+        "host": "127.0.0.1",
+        "port": "8080",
+        "username": "admin",
+        "password": "",
+        "category": "Bangumi",
+        "save_path": "",
+        "webui_url": "",
+    },
+    "rss": {
+        "poll_interval": "30",
+        "rule": "new_only",
+        "auto_download": "false",
+        "poll_on_start": "true",
     },
     "launcher": {
         "enable_ls": "true",

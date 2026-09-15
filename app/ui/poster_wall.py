@@ -14,11 +14,12 @@ from PySide6.QtWidgets import QScrollArea, QVBoxLayout, QWidget
 
 from app.core.database import Database, Subject
 from app.ui.widgets import EmptyState, FlowLayout, PosterCard
+from app.ui_layout import POSTER_MARGIN, POSTER_SPACING
 
 log = logging.getLogger(__name__)
 
-SPACING = 16
-MARGIN = 24
+SPACING = POSTER_SPACING
+MARGIN = POSTER_MARGIN
 
 
 class PosterWallPage(QWidget):

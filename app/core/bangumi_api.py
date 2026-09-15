@@ -15,9 +15,27 @@ from urllib3.util.retry import Retry
 
 log = logging.getLogger(__name__)
 
+# 条目类型（subject_type）
+SUBJECT_TYPE_BOOK = 1
+SUBJECT_TYPE_ANIME = 2
+SUBJECT_TYPE_MUSIC = 3
+SUBJECT_TYPE_GAME = 4
+SUBJECT_TYPE_REAL = 6
+
+# 收藏类型（type）
+COLLECT_TYPE_WISH = 1      # 想看
+COLLECT_TYPE_DONE = 2      # 看过
+COLLECT_TYPE_DOING = 3     # 在看
+COLLECT_TYPE_ON_HOLD = 4   # 搁置
+COLLECT_TYPE_DROPPED = 5   # 抛弃
+
 
 class BangumiError(RuntimeError):
     """Bangumi API 业务异常。"""
+
+
+class BangumiAuthError(BangumiError):
+    """Token 无效或权限不足（401/403）。"""
 
 
 class BangumiClient:
@@ -60,6 +78,15 @@ class BangumiClient:
             resp = self.session.get(url, params=params, timeout=self.timeout)
             resp.raise_for_status()
             return resp.json()
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", 0)
+            if status in (401, 403):
+                log.warning("Bangumi GET %s 权限不足: %s", url, status)
+                raise BangumiAuthError(
+                    "Token 无效或权限不足（请重新生成 Token 并勾选读取收藏）"
+                ) from e
+            log.warning("Bangumi GET %s 失败: %s", url, e)
+            raise BangumiError(str(e)) from e
         except requests.RequestException as e:
             log.warning("Bangumi GET %s 失败: %s", url, e)
             raise BangumiError(str(e)) from e
@@ -103,3 +130,63 @@ class BangumiClient:
             return self._get(f"/v0/users/-/collections/{subject_id}")
         except BangumiError:
             return None
+
+    # ---------- F18：用户在看列表 ----------
+    def get_me(self) -> Optional[dict]:
+        """GET /v0/me，用 Token 解析当前用户（未配置 username 时使用）。"""
+        try:
+            data = self._get("/v0/me")
+            return data if isinstance(data, dict) else None
+        except BangumiError as e:
+            log.warning("解析当前用户失败（Token 可能无效）: %s", e)
+            return None
+
+    def get_user_collections(
+        self,
+        username: str,
+        subject_type: int = SUBJECT_TYPE_ANIME,
+        collect_type: int = COLLECT_TYPE_DOING,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        """GET /v0/users/{username}/collections。
+
+        默认取「动画 + 在看」（subject_type=2, type=3）。
+        """
+        if not username:
+            raise BangumiError("未配置 Bangumi 用户名，且无法从 Token 解析")
+        data = self._get(
+            f"/v0/users/{username}/collections",
+            subject_type=subject_type,
+            type=collect_type,
+            limit=limit,
+            offset=offset,
+        )
+        if isinstance(data, dict):
+            return data.get("data", [])
+        if isinstance(data, list):
+            return data
+        return []
+
+    def iter_user_collections(
+        self,
+        username: str,
+        subject_type: int = SUBJECT_TYPE_ANIME,
+        collect_type: int = COLLECT_TYPE_DOING,
+        page_size: int = 50,
+        max_items: int = 500,
+    ) -> list[dict]:
+        """分页拉取全部在看收藏（带 max_items 上限保护）。"""
+        out: list[dict] = []
+        offset = 0
+        while len(out) < max_items:
+            page = self.get_user_collections(
+                username, subject_type, collect_type, page_size, offset
+            )
+            if not page:
+                break
+            out.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
+        return out[:max_items]

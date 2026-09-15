@@ -50,25 +50,3 @@ def dark_palette() -> QPalette:
     p.setColor(QPalette.ToolTipText, QColor("#FAFAFA"))
     p.setColor(QPalette.Link, QColor("#FFFFFF"))
     return p
-
-
-def high_contrast_palette() -> QPalette:
-    """高对比：纯黑底 #000000，纯白文字 #FFFFFF。"""
-    p = QPalette()
-    p.setColor(QPalette.Window, QColor("#000000"))
-    p.setColor(QPalette.Base, QColor("#000000"))
-    p.setColor(QPalette.AlternateBase, QColor("#000000"))
-    p.setColor(QPalette.WindowText, QColor("#FFFFFF"))
-    p.setColor(QPalette.Text, QColor("#FFFFFF"))
-    p.setColor(QPalette.PlaceholderText, QColor("#AAAAAA"))
-    p.setColor(QPalette.Button, QColor("#000000"))
-    p.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-    p.setColor(QPalette.Highlight, QColor("#FFFFFF"))
-    p.setColor(QPalette.HighlightedText, QColor("#000000"))
-    p.setColor(QPalette.Mid, QColor("#FFFFFF"))
-    p.setColor(QPalette.Dark, QColor("#000000"))
-    p.setColor(QPalette.Light, QColor("#FFFFFF"))
-    p.setColor(QPalette.ToolTipBase, QColor("#000000"))
-    p.setColor(QPalette.ToolTipText, QColor("#FFFFFF"))
-    p.setColor(QPalette.Link, QColor("#FFFFFF"))
-    return p

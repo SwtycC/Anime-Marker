@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -17,7 +18,9 @@ from typing import Any, Iterator, Optional
 
 from app.utils.paths import database_path
 
-SCHEMA_VERSION = 1
+log = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -58,6 +61,49 @@ CREATE TABLE IF NOT EXISTS watch_log (
     progress   REAL,
     created_at TEXT
 );
+
+-- F18：在看列表缓存（离线降级 / 首屏秒开）
+CREATE TABLE IF NOT EXISTS inprogress_cache (
+    bangumi_id   INTEGER PRIMARY KEY,
+    name         TEXT,
+    name_cn      TEXT,
+    cover_url    TEXT,
+    ep_status    INTEGER,
+    total_eps    INTEGER,
+    collect_type INTEGER,
+    updated_at   TEXT
+);
+
+-- F19：RSS 订阅源
+CREATE TABLE IF NOT EXISTS rss_sources (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT,
+    url          TEXT UNIQUE,
+    bangumi_id   INTEGER,
+    enabled      INTEGER DEFAULT 1,
+    rule         TEXT DEFAULT 'new_only',
+    last_poll_at TEXT,
+    last_error   TEXT,
+    created_at   TEXT
+);
+
+-- F19：下载记录（判新第三层 + 状态回查）
+CREATE TABLE IF NOT EXISTS download_history (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id     INTEGER REFERENCES rss_sources(id) ON DELETE CASCADE,
+    subject_id    INTEGER,
+    ep_index      REAL,
+    torrent_title TEXT,
+    magnet        TEXT,
+    torrent_hash  TEXT,
+    status        TEXT DEFAULT 'pending',
+    created_at    TEXT,
+    updated_at    TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_download_source_ep
+    ON download_history(source_id, ep_index);
+CREATE INDEX IF NOT EXISTS idx_download_hash ON download_history(torrent_hash);
 """
 
 
@@ -100,6 +146,53 @@ class TimelineEntry:
     watched_at: str
 
 
+@dataclass
+class InProgressItem:
+    """F18：在看列表缓存条目。"""
+
+    bangumi_id: int
+    name: str
+    name_cn: str
+    cover_url: str
+    ep_status: int
+    total_eps: int
+    collect_type: int
+    updated_at: str
+    # 运行时填充（不落库）
+    local_subject_id: Optional[int] = None
+
+
+@dataclass
+class RssSource:
+    """F19：RSS 订阅源。"""
+
+    id: int
+    name: str
+    url: str
+    bangumi_id: Optional[int]
+    enabled: bool
+    rule: str
+    last_poll_at: str
+    last_error: str
+    created_at: str
+
+
+@dataclass
+class DownloadRecord:
+    """F19：下载记录。"""
+
+    id: int
+    source_id: int
+    subject_id: Optional[int]
+    ep_index: float
+    torrent_title: str
+    magnet: str
+    torrent_hash: str
+    status: str
+    created_at: str
+    updated_at: str
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -119,9 +212,16 @@ class Database:
     # ---------- schema ----------
     def _init_schema(self) -> None:
         with self._lock, self._conn:
-            self._conn.executescript(SCHEMA_SQL)
+            self._conn.executescript(SCHEMA_SQL)  # 全部 IF NOT EXISTS，旧库增量补齐
+            cur = self._conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            )
+            row = cur.fetchone()
+            old = int(row["value"]) if row and str(row["value"]).isdigit() else 0
+            if old != SCHEMA_VERSION:
+                log.info("schema 版本 %s → %s（增量建表，无破坏性变更）", old, SCHEMA_VERSION)
             self._conn.execute(
-                "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
 
@@ -252,3 +352,209 @@ class Database:
     def clear_subject_episodes(self, subject_id: int) -> None:
         with self._cursor() as cur:
             cur.execute("DELETE FROM episodes WHERE subject_id=?", (subject_id,))
+
+    def find_subject_by_bangumi_id(self, bangumi_id: int) -> Optional[int]:
+        """按 Bangumi ID 查本地 subject 主键（F18 本地关联）。"""
+        with self._cursor() as cur:
+            cur.execute("SELECT id FROM subjects WHERE bangumi_id=?", (bangumi_id,))
+            row = cur.fetchone()
+            return int(row["id"]) if row else None
+
+    def count_locally_watched_eps(self, subject_id: int) -> int:
+        """本地已看集数（F19 订阅页「已完成集数」）。"""
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM episodes WHERE subject_id=? AND watched=1",
+                (subject_id,),
+            )
+            return int(cur.fetchone()["n"])
+
+    def list_local_ep_indices(self, subject_id: int) -> set[float]:
+        """本地已有集数序号集合（F19 三层查重第一层）。"""
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT ep_index FROM episodes WHERE subject_id=?", (subject_id,)
+            )
+            return {float(r["ep_index"]) for r in cur.fetchall() if r["ep_index"] is not None}
+
+    # ---------- F18：在看缓存 ----------
+    def replace_inprogress_cache(self, items: list[dict]) -> None:
+        """整体替换在看缓存（先清后插，保证与线上一致）。"""
+        now = _now()
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM inprogress_cache")
+            cur.executemany(
+                """
+                INSERT OR REPLACE INTO inprogress_cache
+                    (bangumi_id, name, name_cn, cover_url,
+                     ep_status, total_eps, collect_type, updated_at)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                [
+                    (
+                        it.get("bangumi_id"),
+                        it.get("name", ""),
+                        it.get("name_cn", ""),
+                        it.get("cover_url", ""),
+                        int(it.get("ep_status") or 0),
+                        int(it.get("total_eps") or 0),
+                        int(it.get("collect_type") or 3),
+                        now,
+                    )
+                    for it in items
+                    if it.get("bangumi_id")
+                ],
+            )
+
+    def load_inprogress_cache(self) -> list[InProgressItem]:
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM inprogress_cache ORDER BY updated_at DESC, name_cn")
+            return [InProgressItem(**dict(r)) for r in cur.fetchall()]
+
+    def inprogress_cache_age(self) -> Optional[float]:
+        """缓存距今秒数；无缓存返回 None。"""
+        with self._cursor() as cur:
+            cur.execute("SELECT MAX(updated_at) AS t FROM inprogress_cache")
+            row = cur.fetchone()
+            if not row or not row["t"]:
+                return None
+            try:
+                dt = datetime.fromisoformat(row["t"])
+            except ValueError:
+                return None
+            return (datetime.now(dt.tzinfo) - dt).total_seconds()
+
+    # ---------- F19：订阅源 ----------
+    def add_rss_source(
+        self,
+        name: str,
+        url: str,
+        bangumi_id: Optional[int] = None,
+        rule: str = "new_only",
+    ) -> int:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO rss_sources(name, url, bangumi_id, enabled, rule, created_at)
+                VALUES (?,?,?,1,?,?)
+                ON CONFLICT(url) DO UPDATE SET name=excluded.name
+                """,
+                (name, url, bangumi_id, rule, _now()),
+            )
+            cur.execute("SELECT id FROM rss_sources WHERE url=?", (url,))
+            return int(cur.fetchone()["id"])
+
+    def list_rss_sources(self, only_enabled: bool = False) -> list[RssSource]:
+        sql = "SELECT * FROM rss_sources"
+        if only_enabled:
+            sql += " WHERE enabled=1"
+        sql += " ORDER BY id"
+        with self._cursor() as cur:
+            cur.execute(sql)
+            out: list[RssSource] = []
+            for r in cur.fetchall():
+                d = dict(r)
+                d["enabled"] = bool(d["enabled"])
+                out.append(RssSource(**d))
+            return out
+
+    def update_rss_source(self, source_id: int, **fields: Any) -> None:
+        allowed = {
+            "name", "url", "bangumi_id", "enabled",
+            "rule", "last_poll_at", "last_error",
+        }
+        cols = {k: v for k, v in fields.items() if k in allowed}
+        if not cols:
+            return
+        assignments = ",".join(f"{k}=?" for k in cols)
+        with self._cursor() as cur:
+            cur.execute(
+                f"UPDATE rss_sources SET {assignments} WHERE id=?",
+                [*cols.values(), source_id],
+            )
+
+    def delete_rss_source(self, source_id: int) -> None:
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM rss_sources WHERE id=?", (source_id,))
+
+    # ---------- F19：下载记录 ----------
+    def is_episode_downloaded(self, source_id: int, ep_index: float) -> bool:
+        """第三层查重：该订阅的该集是否已有下载记录。"""
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM download_history WHERE source_id=? AND ep_index=? LIMIT 1",
+                (source_id, float(ep_index)),
+            )
+            return cur.fetchone() is not None
+
+    def add_download_record(
+        self,
+        source_id: int,
+        ep_index: float,
+        torrent_title: str,
+        magnet: str,
+        subject_id: Optional[int] = None,
+        status: str = "pending",
+    ) -> int:
+        now = _now()
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO download_history
+                    (source_id, subject_id, ep_index, torrent_title,
+                     magnet, status, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(source_id, ep_index) DO UPDATE SET
+                    torrent_title=excluded.torrent_title,
+                    magnet=excluded.magnet,
+                    status=excluded.status,
+                    updated_at=excluded.updated_at
+                """,
+                (source_id, subject_id, float(ep_index), torrent_title,
+                 magnet, status, now, now),
+            )
+            cur.execute(
+                "SELECT id FROM download_history WHERE source_id=? AND ep_index=?",
+                (source_id, float(ep_index)),
+            )
+            return int(cur.fetchone()["id"])
+
+    def update_download_status(
+        self,
+        record_id: int,
+        status: str,
+        torrent_hash: str = "",
+    ) -> None:
+        with self._cursor() as cur:
+            if torrent_hash:
+                cur.execute(
+                    "UPDATE download_history SET status=?, torrent_hash=?, updated_at=? WHERE id=?",
+                    (status, torrent_hash, _now(), record_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE download_history SET status=?, updated_at=? WHERE id=?",
+                    (status, _now(), record_id),
+                )
+
+    def list_downloads(self, source_id: Optional[int] = None) -> list[DownloadRecord]:
+        with self._cursor() as cur:
+            if source_id is None:
+                cur.execute("SELECT * FROM download_history ORDER BY ep_index DESC")
+            else:
+                cur.execute(
+                    "SELECT * FROM download_history WHERE source_id=? ORDER BY ep_index DESC",
+                    (source_id,),
+                )
+            return [DownloadRecord(**dict(r)) for r in cur.fetchall()]
+
+    def count_downloads_by_status(self, source_id: int) -> dict[str, int]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT status, COUNT(*) AS n FROM download_history
+                WHERE source_id=? GROUP BY status
+                """,
+                (source_id,),
+            )
+            return {r["status"]: int(r["n"]) for r in cur.fetchall()}

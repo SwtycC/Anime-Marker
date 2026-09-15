@@ -10,22 +10,16 @@ from __future__ import annotations
 from PySide6.QtWidgets import QApplication
 
 from app.ui_styles.base import UIStyle
-from app.ui_styles.compact import CompactStyle
 from app.ui_styles.fusion_dark import FusionDarkStyle
 from app.ui_styles.fusion_light import FusionLightStyle
-from app.ui_styles.high_contrast import HighContrastStyle
-from app.ui_styles.windows_native import WindowsNativeStyle
 
 DEFAULT_STYLE_KEY = "fusion_dark"
 
 REGISTRY: dict[str, UIStyle] = {
     s.key: s
     for s in [
-        WindowsNativeStyle(),
         FusionDarkStyle(),
         FusionLightStyle(),
-        CompactStyle(),
-        HighContrastStyle(),
     ]
 }
 
