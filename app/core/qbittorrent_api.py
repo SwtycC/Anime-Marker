@@ -48,7 +48,7 @@ class QbClient:
         category: str = "Bangumi",
         save_path: str = "",
         webui_url: str = "",
-        timeout: float = 10.0,
+        timeout: float = 3.0,
     ) -> None:
         self.host = host
         self.port = int(port)
@@ -59,6 +59,8 @@ class QbClient:
         self._webui_url = webui_url
         self.timeout = timeout
         self._client = None
+        # 记录最近一次失败原因，避免日志被 urllib3 重试刷屏
+        self.last_error = ""
 
     # ---------- 连接 ----------
     @property
@@ -83,12 +85,18 @@ class QbClient:
                 port=self.port,
                 username=self.username,
                 password=self.password,
-                REQUESTS_ARGS={"timeout": self.timeout},
+                REQUESTS_ARGS={
+                    "timeout": self.timeout,
+                    # 不重试：本机 Web UI 未开时立即失败，避免启动/操作被拖慢数秒
+                    "adapter_kwargs": {"max_retries": 0},
+                },
             )
             client.auth_log_in()
         except Exception as e:
-            raise QbError(f"连接 qBittorrent 失败（{self.webui_url}）：{e}") from e
+            self.last_error = str(e)
+            raise QbError(f"连接失败（{self.webui_url}）：{e}") from e
         self._client = client
+        self.last_error = ""
         return client
 
     def test_connection(self) -> str:

@@ -11,10 +11,10 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from PySide6.QtCore import QUrl, Signal
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QApplication, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
     QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
@@ -65,68 +65,87 @@ class SubscriptionPage(QWidget):
         self.rss_service = rss_service
         self.qb = qb
 
+        # 外层零边距：滚动条贴住窗口右边缘（同海报墙）
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(24, 24, 24, 24)
-        outer.setSpacing(12)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # 顶部固定区：标题 + 按钮 + 状态条 + 添加表单
+        header = QWidget(self)
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(24, 24, 24, 12)
+        header_layout.setSpacing(12)
 
         # ---- 标题行 ----
         top = QHBoxLayout()
-        title = QLabel("订阅", self)
+        title = QLabel("订阅", header)
         title.setProperty("role", "title")
         top.addWidget(title)
         top.addStretch(1)
 
-        self.poll_all_btn = QPushButton("轮询全部", self)
+        self.poll_all_btn = QPushButton("轮询全部", header)
         self.poll_all_btn.clicked.connect(self._on_poll_all)
         top.addWidget(self.poll_all_btn)
 
-        self.webui_btn = QPushButton("打开 Web UI", self)
+        self.webui_btn = QPushButton("打开 Web UI", header)
         self.webui_btn.clicked.connect(self._open_webui)
         top.addWidget(self.webui_btn)
-        outer.addLayout(top)
+
+        self.redetect_btn = QPushButton("重新检测", header)
+        self.redetect_btn.setToolTip("重新检测 qBittorrent Web UI 连通性")
+        self.redetect_btn.clicked.connect(self._on_redetect)
+        top.addWidget(self.redetect_btn)
+        header_layout.addLayout(top)
 
         # ---- qB 状态条 ----
-        self.qb_bar = QLabel(self)
+        self.qb_bar = QLabel(header)
         self.qb_bar.setObjectName("alertBar")
         self.qb_bar.setWordWrap(True)
-        outer.addWidget(self.qb_bar)
+        header_layout.addWidget(self.qb_bar)
 
         # ---- 添加订阅 ----
         add_row = QHBoxLayout()
         add_row.setSpacing(8)
 
-        self.name_edit = QLineEdit(self)
+        self.name_edit = QLineEdit(header)
         self.name_edit.setPlaceholderText("备注名（如：葬送的芙莉莲）")
         add_row.addWidget(self.name_edit, 1)
 
-        self.url_edit = QLineEdit(self)
+        self.url_edit = QLineEdit(header)
         self.url_edit.setPlaceholderText("RSS 链接（Mikan / dmhy …）")
         add_row.addWidget(self.url_edit, 2)
 
-        self.rule_combo = NoWheelComboBox(self)
+        self.rule_combo = NoWheelComboBox(header)
         for label, key in RULE_LABELS:
             self.rule_combo.addItem(label, userData=key)
         add_row.addWidget(self.rule_combo)
 
-        add_btn = QPushButton("添加", self)
+        add_btn = QPushButton("添加", header)
         add_btn.setProperty("role", "primary")
         add_btn.clicked.connect(self._on_add)
         add_row.addWidget(add_btn)
-        outer.addLayout(add_row)
+        header_layout.addLayout(add_row)
+
+        outer.addWidget(header)
 
         # ---- 列表 ----
         self.scroll = QScrollArea(self)
+        self.scroll.setObjectName("contentScroll")
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QScrollArea.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.viewport().setAutoFillBackground(False)
         outer.addWidget(self.scroll, 1)
 
         self.container = QWidget()
         self.list_layout = QVBoxLayout(self.container)
-        self.list_layout.setContentsMargins(0, 0, 0, 0)
+        self.list_layout.setContentsMargins(24, 0, 24, 8)
         self.list_layout.setSpacing(12)
         self.scroll.setWidget(self.container)
 
-        self.refresh_qb_status()
+        # 启动时只显示静态提示，不做网络请求（避免拖慢启动）：
+        # 真正检测 qBittorrent 连通性由「进入本页」或用户点「重新检测」触发
+        self._show_qb_placeholder()
         self.rss_service.poll_finished.connect(lambda _s: self.reload())
 
     # ---------- 数据 ----------
@@ -207,20 +226,38 @@ class SubscriptionPage(QWidget):
             return {}
 
     # ---------- qB 状态 ----------
-    def refresh_qb_status(self) -> None:
+    def _show_qb_placeholder(self) -> None:
+        """未检测前的静态提示（不发请求）。"""
         if self.qb is None:
             self.qb_bar.setText(
                 "未配置 qBittorrent：订阅仍会判新入库，但不会自动下发。"
             )
-            self.qb_bar.show()
+        else:
+            self.qb_bar.setText("qBittorrent 状态：未检测（点击「重新检测」）")
+        self.qb_bar.show()
+        self.qb_bar.setProperty("state", "idle")
+
+    def refresh_qb_status(self, silent: bool = False) -> None:
+        """检测 qBittorrent 连通性。
+
+        silent=True 时失败只显示状态文本、不弹窗（用于进入页面时自动检测）。
+        """
+        if self.qb is None:
+            self._show_qb_placeholder()
             return
+        if not silent:
+            self.qb_bar.setText("正在检测 qBittorrent…")
+            QApplication.processEvents()
         try:
             version = self.qb.test_connection()
             self.qb_bar.setText(f"qBittorrent 已连接（v{version}）")
-            self.qb_bar.show()
+            self.qb_bar.setProperty("state", "ok")
         except QbError as e:
-            self.qb_bar.setText(f"qBittorrent 连接失败：{e}")
-            self.qb_bar.show()
+            self.qb_bar.setText(f"qBittorrent 未连接：{e}")
+            self.qb_bar.setProperty("state", "error")
+        self.qb_bar.show()
+        self.qb_bar.style().unpolish(self.qb_bar)
+        self.qb_bar.style().polish(self.qb_bar)
 
     # ---------- 动作 ----------
     def _on_add(self) -> None:
@@ -274,6 +311,11 @@ class SubscriptionPage(QWidget):
     def _on_push(self, record_id: int) -> None:
         ok, msg = self.rss_service.push_pending(record_id)
         self.status_message.emit(msg)
+        self.reload()
+
+    def _on_redetect(self) -> None:
+        """手动触发检测（用户主动点击，允许阻塞式反馈）。"""
+        self.refresh_qb_status(silent=False)
         self.reload()
 
     def _open_webui(self) -> None:

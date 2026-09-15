@@ -28,6 +28,9 @@ TOKEN_HELP_URL = "https://next.bgm.tv/demo/access-token"
 #   = 26
 # 其余各行按此值左缩进，保证输入框左边缘对齐（实测校准）
 ROW_INDENT = 26
+# 「文本框 + 浏览…按钮」之间的间距（被 _indent_layout 包裹后需显式设置，
+# 否则容器 spacing=0 会让按钮紧贴文本框）
+PATH_ROW_SPACING = 6
 
 
 def _section_divider() -> QFrame:
@@ -146,6 +149,7 @@ class SettingsPage(QWidget):
         # ---- 路径 ----
         self.library_edit = QLineEdit(self.config.get("general", "library_path"), self)
         lib_row = QHBoxLayout()
+        lib_row.setSpacing(PATH_ROW_SPACING)
         lib_row.addWidget(self.library_edit, 1)
         lib_btn = QPushButton("浏览…", self)
         lib_btn.clicked.connect(self._pick_library)
@@ -154,6 +158,7 @@ class SettingsPage(QWidget):
 
         self.player_edit = QLineEdit(self.config.get("general", "player_path"), self)
         player_row = QHBoxLayout()
+        player_row.setSpacing(PATH_ROW_SPACING)
         player_row.addWidget(self.player_edit, 1)
         player_btn = QPushButton("浏览…", self)
         player_btn.clicked.connect(lambda: self._pick_file(self.player_edit, "PotPlayer"))
@@ -162,6 +167,7 @@ class SettingsPage(QWidget):
 
         self.ls_edit = QLineEdit(self.config.get("general", "ls_path"), self)
         ls_row = QHBoxLayout()
+        ls_row.setSpacing(PATH_ROW_SPACING)
         ls_row.addWidget(self.ls_edit, 1)
         ls_btn = QPushButton("浏览…", self)
         ls_btn.clicked.connect(lambda: self._pick_file(self.ls_edit, "Lossless Scaling"))

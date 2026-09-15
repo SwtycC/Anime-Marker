@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QMessageBox, QPushButton,
     QScrollArea, QVBoxLayout, QWidget,
@@ -87,36 +87,49 @@ class InProgressPage(QWidget):
         self._loader: Optional[_LoadWorker] = None
         self._cover_worker: Optional[_CoverWorker] = None
 
+        # 外层零边距：滚动条才能贴住窗口右边缘（同海报墙）
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(24, 24, 24, 24)
-        outer.setSpacing(12)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # 顶部固定区（标题 + 刷新按钮 + 提示条）：包一层容器给回 24px 边距
+        header = QWidget(self)
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(24, 24, 24, 12)
+        header_layout.setSpacing(12)
 
         top = QHBoxLayout()
-        title = QLabel("在看", self)
+        title = QLabel("在看", header)
         title.setProperty("role", "title")
         top.addWidget(title)
         top.addStretch(1)
 
-        self.refresh_btn = QPushButton("刷新", self)
+        self.refresh_btn = QPushButton("刷新", header)
         self.refresh_btn.setToolTip("强制重新拉取 Bangumi 在看列表")
         self.refresh_btn.clicked.connect(lambda: self.reload(force=True))
         top.addWidget(self.refresh_btn)
-        outer.addLayout(top)
+        header_layout.addLayout(top)
 
-        self.alert_bar = QLabel(self)
+        self.alert_bar = QLabel(header)
         self.alert_bar.setObjectName("alertBar")
         self.alert_bar.setWordWrap(True)
         self.alert_bar.hide()
-        outer.addWidget(self.alert_bar)
+        header_layout.addWidget(self.alert_bar)
+
+        outer.addWidget(header)
 
         self.scroll = QScrollArea(self)
+        self.scroll.setObjectName("contentScroll")
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QScrollArea.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.viewport().setAutoFillBackground(False)
         outer.addWidget(self.scroll, 1)
 
+        # 24px 边距移到滚动内容里，滚动条仍贴边
         self.container = QWidget()
         self.list_layout = QVBoxLayout(self.container)
-        self.list_layout.setContentsMargins(0, 0, 0, 0)
+        self.list_layout.setContentsMargins(24, 0, 24, 8)
         self.list_layout.setSpacing(12)
         self.scroll.setWidget(self.container)
 

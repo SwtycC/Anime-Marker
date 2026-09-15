@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QLabel, QScrollArea, QVBoxLayout, QWidget
 
 from app.core.database import Database
@@ -45,22 +45,33 @@ class TimelinePage(QWidget):
         super().__init__(parent)
         self.db = db
 
+        # 外层零边距：滚动条贴住窗口右边缘（同海报墙）
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(24, 24, 24, 24)
-        outer.setSpacing(16)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        title = QLabel("动态", self)
+        # 标题固定在滚动区外
+        header = QWidget(self)
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(24, 24, 24, 12)
+        header_layout.setSpacing(0)
+
+        title = QLabel("动态", header)
         title.setProperty("role", "title")
-        outer.addWidget(title)
+        header_layout.addWidget(title)
+        outer.addWidget(header)
 
         self.scroll = QScrollArea(self)
+        self.scroll.setObjectName("contentScroll")
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QScrollArea.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.viewport().setAutoFillBackground(False)
         outer.addWidget(self.scroll, 1)
 
         self.container = QWidget()
         self.list_layout = QVBoxLayout(self.container)
-        self.list_layout.setContentsMargins(0, 0, 0, 0)
+        self.list_layout.setContentsMargins(24, 0, 24, 8)
         self.list_layout.setSpacing(0)
         self.scroll.setWidget(self.container)
 

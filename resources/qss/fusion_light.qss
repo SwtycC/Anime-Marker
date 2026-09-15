@@ -203,15 +203,19 @@ QListWidget::item:hover, QTreeWidget::item:hover, QTableWidget::item:hover {
 }
 #inProgressCard:hover, #sourceRow:hover { border-color: #111111; }
 
-/* ===== 状态提示条 ===== */
+/* ===== 状态提示条 =====
+   state 属性：idle=未检测(灰) / ok=正常(强调色) / error=异常(灰但左侧加粗) */
 #alertBar {
     background: #FAFAFA;
     border: 1px solid #E5E5E5;
-    border-left: 2px solid #111111;
+    border-left: 2px solid #BBBBBB;
     border-radius: 4px;
     color: #666666;
     padding: 8px 12px;
 }
+#alertBar[state="idle"]  { border-left-color: #CCCCCC; color: #999999; }
+#alertBar[state="ok"]    { border-left-color: #2563EB; color: #111111; }
+#alertBar[state="error"] { border-left-color: #111111; color: #666666; }
 
 /* ===== 滚动条（海报墙 / 设置页 / 在看 / 订阅统一外观）=====
    轨道与两端按钮全部透明，只保留 6px 圆角滑块 */

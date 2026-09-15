@@ -195,7 +195,7 @@ class MainWindow(QMainWindow):
         self.rss_service.api = self.api
         self.rss_service.qb = self.qb
         self.subscription_page.qb = self.qb
-        self.subscription_page.refresh_qb_status()
+        self.subscription_page.refresh_qb_status(silent=True)
         self.subscription_page.reload()
 
     # ---------- 导航 ----------
@@ -214,6 +214,8 @@ class MainWindow(QMainWindow):
             self.timeline_page.reload()
         elif index == 3:
             self.subscription_page.reload()
+            # 进入订阅页时才检测 qBittorrent（静默：失败只更新状态条，不弹窗）
+            self.subscription_page.refresh_qb_status(silent=True)
 
     def _open_detail(self, subject_id: int) -> None:
         self.detail_page.show_subject(subject_id)
