@@ -41,6 +41,15 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "auto_download": "false",
         "poll_on_start": "true",
     },
+    "scanner": {
+        # 季数识别模式：cn=第X季/第X部/S1/Season 1；all=额外启用罗马数字
+        "season_patterns": "cn",
+        # 多季展示：flat=平铺（默认）；grouped=按系列聚合
+        "season_display": "flat",
+        # 自动匹配的最低分与最小差距（调高更保守）
+        "accept_score": "60",
+        "accept_gap": "20",
+    },
     "launcher": {
         "enable_ls": "true",
         "ls_shortcut": "ctrl+alt+l",

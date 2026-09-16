@@ -85,11 +85,11 @@ class QbClient:
                 port=self.port,
                 username=self.username,
                 password=self.password,
-                REQUESTS_ARGS={
-                    "timeout": self.timeout,
-                    # 不重试：本机 Web UI 未开时立即失败，避免启动/操作被拖慢数秒
-                    "adapter_kwargs": {"max_retries": 0},
-                },
+                REQUESTS_ARGS={"timeout": self.timeout},
+                # 不重试：本机 Web UI 未开时立即失败，避免操作被拖慢数秒。
+                # 注意参数名是 HTTPADAPTER_ARGS（不是 adapter_kwargs，后者会被
+                # 透传给 Session.request 而报 TypeError）。
+                HTTPADAPTER_ARGS={"max_retries": 0},
             )
             client.auth_log_in()
         except Exception as e:

@@ -65,6 +65,9 @@ class SubscriptionPage(QWidget):
         self.rss_service = rss_service
         self.qb = qb
 
+        # qBittorrent 正在下载任务数的缓存（避免频繁连接）
+        self._downloading_cache: dict[str, int] = {}
+
         # 外层零边距：滚动条贴住窗口右边缘（同海报墙）
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -156,7 +159,9 @@ class SubscriptionPage(QWidget):
                 item.widget().deleteLater()
 
         sources = self.db.list_rss_sources()
-        downloading = self._downloading_count_by_tag()
+        # 复用上一次检测结果（避免每次 reload 都连 qBittorrent）：
+        # 仅在「进入页面」或用户点「重新检测」时才真正查询
+        downloading = self._downloading_cache
 
         if not sources:
             self.list_layout.addWidget(
@@ -208,7 +213,11 @@ class SubscriptionPage(QWidget):
         self.list_layout.addStretch(1)
 
     def _downloading_count_by_tag(self) -> dict[str, int]:
-        """按订阅名标签统计 qBittorrent 中正在下载的任务数。"""
+        """按订阅名标签统计 qBittorrent 中正在下载的任务数。
+
+        这是可选功能的探测：qBittorrent 未运行属正常情况（用户可能只用
+        媒体库功能），故失败只记 DEBUG，不刷 WARNING 日志。
+        """
         if self.qb is None:
             return {}
         try:
@@ -222,7 +231,7 @@ class SubscriptionPage(QWidget):
                         counts[tag] = counts.get(tag, 0) + 1
             return counts
         except QbError as e:
-            log.warning("读取 qBittorrent 任务失败：%s", e)
+            log.debug("读取 qBittorrent 任务失败（qB 未运行属正常）：%s", e)
             return {}
 
     # ---------- qB 状态 ----------
@@ -252,9 +261,12 @@ class SubscriptionPage(QWidget):
             version = self.qb.test_connection()
             self.qb_bar.setText(f"qBittorrent 已连接（v{version}）")
             self.qb_bar.setProperty("state", "ok")
+            # 连接成功时顺带刷新下载中任务数（与检测共用一次连接）
+            self._downloading_cache = self._downloading_count_by_tag()
         except QbError as e:
             self.qb_bar.setText(f"qBittorrent 未连接：{e}")
             self.qb_bar.setProperty("state", "error")
+            self._downloading_cache = {}
         self.qb_bar.show()
         self.qb_bar.style().unpolish(self.qb_bar)
         self.qb_bar.style().polish(self.qb_bar)

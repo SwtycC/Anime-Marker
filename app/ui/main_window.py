@@ -25,8 +25,10 @@ from app.core.rss_service import RssService
 from app.core.scanner import ScanWorker
 from app.ui.detail_page import DetailPage
 from app.ui.inprogress_page import InProgressPage
+from app.ui.match_dialog import MatchDialog
 from app.ui.poster_wall import PosterWallPage
 from app.ui.settings_page import SettingsPage
+from app.ui.status_bar import AppStatusBar
 from app.ui.subscription_page import SubscriptionPage
 from app.ui.timeline_page import TimelinePage
 from app.ui.widgets import nav_icon
@@ -68,7 +70,7 @@ class MainWindow(QMainWindow):
         self.inprogress_service = InProgressService(self.db, self.api, self.config)
         self.rss_service = RssService(self.db, self.config, self.api, self.qb, parent=self)
         self.rss_service.progress.connect(
-            lambda msg: self.statusBar().showMessage(msg, 3000)
+            lambda msg: self.status_bar.set_message(msg, 3000)
         )
         self.rss_service.poll_finished.connect(self._on_rss_poll_finished)
 
@@ -109,7 +111,12 @@ class MainWindow(QMainWindow):
         self._reposition_nav()
 
         poster_width = config.getint("ui", "poster_width", 200)
-        self.wall_page = PosterWallPage(self.db, poster_width=poster_width, parent=self)
+        self.wall_page = PosterWallPage(
+            self.db,
+            poster_width=poster_width,
+            display_mode=config.get("scanner", "season_display", "flat"),
+            parent=self,
+        )
         self.detail_page = DetailPage(self.db, parent=self)
         self.inprogress_page = InProgressPage(self.inprogress_service, parent=self)
         self.timeline_page = TimelinePage(self.db, parent=self)
@@ -139,7 +146,7 @@ class MainWindow(QMainWindow):
         self.inprogress_page.goto_settings.connect(lambda: self._switch(4))
         self.timeline_page.subject_clicked.connect(self._open_detail_from_timeline)
         self.subscription_page.status_message.connect(
-            lambda msg: self.statusBar().showMessage(msg, 5000)
+            lambda msg: self.status_bar.set_message(msg, 5000)
         )
         self.detail_page.back_clicked.connect(self._back_to_wall)
         self.detail_page.play_episode.connect(self._play_episode)
@@ -147,8 +154,10 @@ class MainWindow(QMainWindow):
         self.settings_page.scan_requested.connect(self._start_scan)
         self.settings_page.save_requested.connect(self._rebuild_services)
 
-        # 状态栏
-        self.statusBar().showMessage("就绪")
+        # 状态栏（版本号 | 进度条 + 日志）
+        self.status_bar = AppStatusBar(self)
+        self.setStatusBar(self.status_bar)
+        self.status_bar.set_message("就绪")
 
         # 初次加载
         self.wall_page.reload()
@@ -232,7 +241,7 @@ class MainWindow(QMainWindow):
         self._open_detail(subject_id)
 
     def _on_rss_poll_finished(self, summary) -> None:
-        self.statusBar().showMessage(
+        self.status_bar.set_message(
             f"轮询完成：新 {summary.new_entries} / 已推送 {summary.pushed}"
             f" / 待确认 {summary.pending} / 跳过 {summary.skipped}",
             8000,
@@ -263,7 +272,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "播放失败", str(e))
             return
         self.monitor.start(ep)
-        self.statusBar().showMessage(f"正在监控：{ep.title}")
+        self.status_bar.set_message(f"正在监控：{ep.title}")
 
     def _find_episode(self, episode_id: int) -> Optional[Episode]:
         for s in self.db.list_subjects():
@@ -274,12 +283,12 @@ class MainWindow(QMainWindow):
 
     # ---------- 监控 ----------
     def _on_episode_watched(self, episode_id: int) -> None:
-        self.statusBar().showMessage(f"已自动标记看过：episode_id={episode_id}", 5000)
+        self.status_bar.set_message(f"已自动标记看过：episode_id={episode_id}", 5000)
         if self.detail_page._subject_id is not None:
             self.detail_page.show_subject(self.detail_page._subject_id)
 
     def _on_monitor_error(self, msg: str) -> None:
-        self.statusBar().showMessage(msg, 5000)
+        self.status_bar.set_message(msg, 5000)
 
     # ---------- 扫描 ----------
     def _start_scan(self) -> None:
@@ -295,35 +304,57 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "扫描", "请先配置媒体库根目录")
             return
 
-        self._scanner = ScanWorker(paths, self.api, self.db)
-        self._scanner.progress_changed.connect(
-            lambda cur, total: self.statusBar().showMessage(f"扫描中 {cur}/{total}")
+        self._scanner = ScanWorker(
+            paths, self.api, self.db,
+            season_mode=self.config.get("scanner", "season_patterns", "cn"),
+            season_display=self.config.get("scanner", "season_display", "flat"),
+            accept_score=self.config.getint("scanner", "accept_score", 60),
+            accept_gap=self.config.getint("scanner", "accept_gap", 20),
         )
-        self._scanner.item_matched.connect(
-            lambda sid, name: self.statusBar().showMessage(f"已匹配：{name}", 3000)
-        )
-        self._scanner.log_message.connect(
-            lambda msg: self.statusBar().showMessage(msg, 3000)
-        )
+        self._scanner.progress_changed.connect(self._on_scan_progress)
+        self._scanner.item_matched.connect(self._on_scan_matched)
+        self._scanner.log_message.connect(self._on_scan_log)
         self._scanner.finished_ok.connect(self._on_scan_finished)
         self._scanner.failed.connect(self._on_scan_failed)
         self._scanner.start()
-        self.statusBar().showMessage("开始扫描…")
+        self.status_bar.start_progress(0, 100)
+        self.status_bar.set_message("开始扫描…")
+
+    # ---------- 扫描进度回调 ----------
+    def _on_scan_progress(self, current: int, total: int) -> None:
+        self.status_bar.set_progress(current, total)
+
+    def _on_scan_matched(self, subject_id: int, name: str) -> None:
+        # 匹配成功只更新日志文字，不打断进度条
+        self.status_bar.set_message(f"✓ 已匹配：{name}")
+
+    def _on_scan_log(self, msg: str) -> None:
+        self.status_bar.set_message(msg)
 
     def _on_scan_finished(self) -> None:
-        self.statusBar().showMessage("扫描完成", 5000)
+        self.status_bar.stop_progress()
+        self.status_bar.set_message("扫描完成", 5000)
         self.wall_page.reload()
 
     def _on_scan_failed(self, msg: str) -> None:
+        self.status_bar.stop_progress()
         QMessageBox.critical(self, "扫描失败", msg)
-        self.statusBar().showMessage("扫描失败", 5000)
+        self.status_bar.set_message("扫描失败", 5000)
 
-    # ---------- 重新匹配 ----------
+    # ---------- 重新匹配（F11） ----------
     def _rematch_subject(self, subject_id: int) -> None:
-        QMessageBox.information(
-            self, "重新匹配",
-            "此功能在 M6 提供（弹 Bangumi 搜索框选条目）。当前版本请删除数据库后重扫。",
-        )
+        subj = self.db.get_subject(subject_id)
+        if subj is None:
+            QMessageBox.warning(self, "重新匹配", "条目不存在")
+            return
+
+        dialog = MatchDialog(self.db, self.api, subj, parent=self)
+        if dialog.exec() == MatchDialog.Accepted:
+            self.status_bar.set_message(
+                f"已手动匹配：{subj.folder_path}", 5000
+            )
+            self.detail_page.show_subject(subject_id)
+            self.wall_page.reload()
 
     def _fit_to_screen(self) -> None:
         """初始宽度 = 刚好放下 5 列海报卡片；高度取屏幕 85%。

@@ -20,7 +20,7 @@ from app.utils.paths import database_path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS subjects (
     cover_path   TEXT,
     total_eps    INTEGER,
     folder_path  TEXT,
-    match_state  TEXT DEFAULT 'auto',
+    series_name  TEXT,                       -- 所属系列（用于聚合展示）
+    match_state  TEXT DEFAULT 'auto',        -- auto / manual / pending
     updated_at   TEXT
 );
 
@@ -110,13 +111,14 @@ CREATE INDEX IF NOT EXISTS idx_download_hash ON download_history(torrent_hash);
 @dataclass
 class Subject:
     id: int
-    bangumi_id: int
+    bangumi_id: Optional[int]
     name: str
     name_cn: str
     cover_url: str
     cover_path: str
     total_eps: int
     folder_path: str
+    series_name: str
     match_state: str
     updated_at: str
 
@@ -218,12 +220,27 @@ class Database:
             )
             row = cur.fetchone()
             old = int(row["value"]) if row and str(row["value"]).isdigit() else 0
+            self._migrate(old)
             if old != SCHEMA_VERSION:
-                log.info("schema 版本 %s → %s（增量建表，无破坏性变更）", old, SCHEMA_VERSION)
+                log.info("schema 版本 %s → %s", old, SCHEMA_VERSION)
             self._conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
+
+    def _migrate(self, old_version: int) -> None:
+        """增量迁移：只做加法（新增列），不破坏既有数据。"""
+        if old_version >= SCHEMA_VERSION:
+            return
+        # v3：subjects 新增 series_name（聚合展示用）
+        cols = {
+            r["name"] for r in self._conn.execute("PRAGMA table_info(subjects)")
+        }
+        if "series_name" not in cols:
+            log.info("迁移：subjects 增加 series_name 列")
+            self._conn.execute("ALTER TABLE subjects ADD COLUMN series_name TEXT")
+        # v3：subjects.bangumi_id 允许为空（pending 条目无 Bangumi ID）
+        # SQLite 无法直接改列约束，旧库保持原样即可（NULL 仍可插入）
 
     def close(self) -> None:
         with self._lock:
@@ -320,6 +337,25 @@ class Database:
                 (episode_id, float(progress), _now()),
             )
 
+    def update_episode_title(
+        self,
+        episode_id: int,
+        title: str,
+        bangumi_ep_id: Optional[int] = None,
+    ) -> None:
+        """更新集标题与 Bangumi 集 ID（手动匹配后回填，不改本地文件）。"""
+        with self._cursor() as cur:
+            if bangumi_ep_id is not None:
+                cur.execute(
+                    "UPDATE episodes SET title=?, bangumi_ep_id=? WHERE id=?",
+                    (title, bangumi_ep_id, episode_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE episodes SET title=? WHERE id=?",
+                    (title, episode_id),
+                )
+
     def mark_watched(self, episode_id: int) -> None:
         with self._cursor() as cur:
             cur.execute(
@@ -359,6 +395,101 @@ class Database:
             cur.execute("SELECT id FROM subjects WHERE bangumi_id=?", (bangumi_id,))
             row = cur.fetchone()
             return int(row["id"]) if row else None
+
+    # ---------- 匹配状态与手动匹配 ----------
+    def find_subject_by_folder(self, folder_path: str) -> Optional[Subject]:
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT * FROM subjects WHERE folder_path=? ORDER BY id LIMIT 1",
+                (folder_path,),
+            )
+            row = cur.fetchone()
+            return Subject(**dict(row)) if row else None
+
+    def find_manual_subject_by_folder(self, folder_path: str) -> Optional[Subject]:
+        """查该目录下手动匹配的条目（重扫时保护，不覆盖）。"""
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT * FROM subjects WHERE folder_path=? AND match_state='manual'"
+                " ORDER BY id LIMIT 1",
+                (folder_path,),
+            )
+            row = cur.fetchone()
+            return Subject(**dict(row)) if row else None
+
+    def upsert_pending_subject(
+        self,
+        folder_path: str,
+        display_name: str,
+        series_name: str = "",
+    ) -> int:
+        """写入/复用「待手动确认」条目（无 bangumi_id）。
+
+        pending 条目没有 bangumi_id，无法用 ON CONFLICT(bangumi_id)，
+        因此按 folder_path 手工判重。
+        """
+        existing = self.find_subject_by_folder(folder_path)
+        if existing is not None:
+            # 已是 manual 的不动；auto/pending 更新展示名与状态
+            if existing.match_state != "manual":
+                with self._cursor() as cur:
+                    cur.execute(
+                        "UPDATE subjects SET name=?, name_cn=?, series_name=?,"
+                        " match_state='pending', updated_at=? WHERE id=?",
+                        (display_name, display_name, series_name, _now(), existing.id),
+                    )
+            return existing.id
+
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO subjects
+                    (bangumi_id, name, name_cn, cover_url, cover_path, total_eps,
+                     folder_path, series_name, match_state, updated_at)
+                VALUES (NULL,?,?,?,?,?,?,?,'pending',?)
+                """,
+                (display_name, display_name, "", "", 0,
+                 folder_path, series_name, _now()),
+            )
+            return int(cur.lastrowid)
+
+    def set_manual_match(
+        self,
+        subject_id: int,
+        bangumi_id: int,
+        name: str,
+        name_cn: str,
+        cover_url: str = "",
+        cover_path: str = "",
+        total_eps: int = 0,
+    ) -> None:
+        """用户手动指定 Bangumi 条目（match_state='manual'，重扫不覆盖）。"""
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE subjects SET
+                    bangumi_id=?, name=?, name_cn=?, cover_url=?, cover_path=?,
+                    total_eps=?, match_state='manual', updated_at=?
+                WHERE id=?
+                """,
+                (bangumi_id, name, name_cn, cover_url, cover_path,
+                 total_eps, _now(), subject_id),
+            )
+
+    def delete_subject(self, subject_id: int) -> None:
+        """删除条目及其集数（episodes 有 ON DELETE CASCADE，但需开外键）。"""
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM episodes WHERE subject_id=?", (subject_id,))
+            cur.execute("DELETE FROM subjects WHERE id=?", (subject_id,))
+
+    # ---------- 聚合展示 ----------
+    def list_series_groups(self) -> dict[str, list[Subject]]:
+        """按 series_name 分组（空 series_name 视为独立条目）。"""
+        groups: dict[str, list[Subject]] = {}
+        for s in self.list_subjects():
+            key = s.series_name or ""
+            groups.setdefault(key, []).append(s)
+        return groups
 
     def count_locally_watched_eps(self, subject_id: int) -> int:
         """本地已看集数（F19 订阅页「已完成集数」）。"""

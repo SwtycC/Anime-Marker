@@ -126,6 +126,13 @@ QRadioButton::indicator {
 
 /* ===== 数值输入框的加减按钮 =====
    NumberField = QLineEdit + 两个独立 #stepButton，间距由布局控制 */
+/* 详情页「同系列」切换按钮：内边距压缩，配合代码里的宽度计算 */
+#siblingButton {
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
 /* 数值输入的加减按钮（NumberField：输入框 + 独立按钮，两者间距由布局控制） */
 #stepButton {
     background: #1A1A1A;
@@ -272,11 +279,34 @@ QScrollArea {
     border: none;
 }
 
-/* ===== 状态栏 ===== */
+/* ===== 状态栏：版本号 │ 进度条 + 日志 ===== */
 QStatusBar {
     background: #0D0D0D;
     border-top: 1px solid #2A2A2A;
     color: #888888;
+}
+#statusVersion {
+    color: #666666;
+    padding: 0 4px;
+    font-size: 12px;
+}
+#statusSeparator {
+    background: #2A2A2A;
+    border: none;
+}
+#statusMessage {
+    color: #888888;
+    padding-left: 8px;
+}
+/* 进度条：细线风格 */
+#statusProgress {
+    background: #1F1F1F;
+    border: none;
+    border-radius: 3px;
+}
+#statusProgress::chunk {
+    background: #FAFAFA;
+    border-radius: 3px;
 }
 
 /* ===== 菜单 ===== */

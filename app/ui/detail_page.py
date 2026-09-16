@@ -13,8 +13,14 @@ from PySide6.QtWidgets import (
 
 from app.core.database import Database, Episode, Subject
 from app.ui.widgets import EmptyState, EpisodeRow, HLine, _load_cover
+from app.utils.name_utils import short_name
 
 log = logging.getLogger(__name__)
+
+# 「同系列」按钮的最大宽度（超出省略）
+SIBLING_BTN_MAX_WIDTH = 140
+# 按钮左右内边距 + 边框的总预留（与 #siblingButton 的 padding: 4px 10px 对应）
+SIBLING_BTN_PADDING = 24
 
 
 class DetailPage(QWidget):
@@ -72,6 +78,18 @@ class DetailPage(QWidget):
         self.meta_label.setProperty("role", "hint")
         info_col.addWidget(self.meta_label)
 
+        # 同系列其他季切换（聚合模式下从海报墙进入后可见）
+        self.sibling_row = QHBoxLayout()
+        self.sibling_row.setSpacing(6)
+        self.sibling_label = QLabel("同系列：", self)
+        self.sibling_label.setProperty("role", "hint")
+        self.sibling_row.addWidget(self.sibling_label)
+        self.sibling_row.addStretch(1)
+        self.sibling_host = QWidget(self)
+        self.sibling_host.setLayout(self.sibling_row)
+        self.sibling_host.hide()
+        info_col.addWidget(self.sibling_host)
+
         info_col.addWidget(HLine(self))
 
         # 集数列表（滚动）
@@ -95,7 +113,56 @@ class DetailPage(QWidget):
         if subj is None:
             return
         self._render_subject(subj)
+        self._render_siblings(subj)
         self._render_episodes(self.db.list_episodes(subject_id))
+
+    def _render_siblings(self, current: Subject) -> None:
+        """渲染「同系列其他季」快捷切换按钮。"""
+        # 清空旧按钮（保留 label 与末尾 stretch）
+        while self.sibling_row.count() > 2:
+            item = self.sibling_row.takeAt(1)
+            if item.widget():
+                item.widget().deleteLater()
+
+        series = (current.series_name or "").strip()
+        if not series:
+            self.sibling_host.hide()
+            return
+
+        siblings = [
+            s for s in self.db.list_subjects()
+            if (s.series_name or "").strip() == series and s.id != current.id
+        ]
+        if not siblings:
+            self.sibling_host.hide()
+            return
+
+        for s in siblings:
+            full = s.name_cn or s.name or ""
+            # 只显示相对系列名的差异部分（「… 第三季」→「第三季」）
+            label = short_name(full, series)
+            if not label:
+                label = full
+
+            btn = QPushButton(self)
+            btn.setObjectName("siblingButton")     # QSS 控制紧凑内边距
+            btn.setToolTip(f"{full}\n{s.folder_path or ''}")
+
+            # 先按最大宽度省略文字，再把按钮宽度设为「省略后文本宽度 + 内边距」。
+            # 关键：宽度必须 ≥ 文本所需，否则 Qt 会对已省略文本再裁一次，
+            # 从左侧切掉字符（「Re：从零开始…」显示成「e：从零开始…」）。
+            fm = btn.fontMetrics()
+            text_w = fm.horizontalAdvance(label)
+            if text_w + SIBLING_BTN_PADDING > SIBLING_BTN_MAX_WIDTH:
+                available = SIBLING_BTN_MAX_WIDTH - SIBLING_BTN_PADDING
+                label = fm.elidedText(label, Qt.ElideRight, available)
+                text_w = fm.horizontalAdvance(label)
+            btn.setText(label)
+            btn.setFixedWidth(text_w + SIBLING_BTN_PADDING)
+
+            btn.clicked.connect(lambda _=False, sid=s.id: self.show_subject(sid))
+            self.sibling_row.insertWidget(self.sibling_row.count() - 1, btn)
+        self.sibling_host.show()
 
     def _render_subject(self, s: Subject) -> None:
         self.title_label.setText(s.name_cn or s.name)
@@ -106,7 +173,9 @@ class DetailPage(QWidget):
         if s.folder_path:
             meta.append(s.folder_path)
         if s.match_state == "pending":
-            meta.append("匹配待确认")
+            meta.append("⚠ 匹配待确认，请点右上角「重新匹配」")
+        elif s.match_state == "manual":
+            meta.append("已手动指定")
         self.meta_label.setText(" · ".join(meta))
         self.cover_label.setPixmap(_load_cover(s.cover_path, 280))
 

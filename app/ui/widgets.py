@@ -24,6 +24,24 @@ from app.utils.paths import resource_path
 PLACEHOLDER_COVER = resource_path("icons/placeholder_cover.png")
 
 
+def _pixmap_from_file(path: Path) -> QPixmap:
+    """读取图片文件为 QPixmap。
+
+    **不能直接用 QPixmap(str(path))**：Qt 在 Windows 下对含非 ASCII 的路径
+    （如 "D:\\作业\\Code\\..." 中的中文）会静默加载失败，得到一个 null pixmap。
+    这里改为 Python 读取字节后 loadFromData，绕开路径编码问题。
+    """
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return QPixmap()
+    if not data:
+        return QPixmap()
+    pix = QPixmap()
+    pix.loadFromData(data)
+    return pix
+
+
 def _load_cover(path: str | Path, width: int, height: int = 0) -> QPixmap:
     """加载封面；文件不存在回退占位图；等比缩放（不变形）。
 
@@ -31,17 +49,39 @@ def _load_cover(path: str | Path, width: int, height: int = 0) -> QPixmap:
     - height = 0：按宽度等比缩放（用于详情页大封面）
     """
     p = Path(path) if path else PLACEHOLDER_COVER
-    if not p.exists():
-        p = PLACEHOLDER_COVER
-    pix = QPixmap(str(p))
+    pix = _pixmap_from_file(p)
     if pix.isNull():
-        pix = QPixmap(str(PLACEHOLDER_COVER))
+        pix = _pixmap_from_file(PLACEHOLDER_COVER)
     if pix.isNull():
-        return pix
+        # 占位图也缺失时，现场画一张灰底图，保证永不空白
+        pix = _make_placeholder(max(width, 1), max(height or int(width * 1.4), 1))
     if height > 0:
         return pix.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
     if width > 0:
         return pix.scaledToWidth(width, Qt.SmoothTransformation)
+    return pix
+
+
+def _make_placeholder(width: int, height: int) -> QPixmap:
+    """生成灰底占位图（1px 边框 + 居中短横线），用于封面缺失时。"""
+    pix = QPixmap(width, height)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+
+    pal = QApplication.palette()
+    bg = pal.color(QPalette.AlternateBase)
+    line = pal.color(QPalette.Mid)
+
+    p.fillRect(0, 0, width, height, bg)
+    pen = QPen(line)
+    pen.setWidthF(1.0)
+    p.setPen(pen)
+    p.drawRect(0, 0, width - 1, height - 1)
+    # 居中的短横线（极简"无图"暗示）
+    cy = height // 2
+    p.drawLine(int(width * 0.3), cy, int(width * 0.7), cy)
+    p.end()
     return pix
 
 

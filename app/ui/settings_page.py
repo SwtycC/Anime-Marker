@@ -197,6 +197,42 @@ class SettingsPage(QWidget):
         )
         form.addRow("触发阈值", _indent(self.threshold_spin))
 
+        # ---- 扫描与匹配 ----
+        form.addRow(_section_divider())
+        scan_title = QLabel("扫描与匹配", self)
+        scan_title.setProperty("role", "subtitle")
+        form.addRow(scan_title)
+
+        self.season_mode_combo = NoWheelComboBox(self)
+        current_mode = self.config.get("scanner", "season_patterns", "cn")
+        for label, key in [
+            ("第X季 / 第X部 / S1 / Season 1（默认）", "cn"),
+            ("额外识别罗马数字（II / III）", "all"),
+        ]:
+            self.season_mode_combo.addItem(label, userData=key)
+            if key == current_mode:
+                self.season_mode_combo.setCurrentIndex(
+                    self.season_mode_combo.count() - 1
+                )
+        form.addRow("季数识别", _indent(self.season_mode_combo))
+
+        self.season_display_combo = NoWheelComboBox(self)
+        current_display = self.config.get("scanner", "season_display", "flat")
+        for label, key in [
+            ("平铺（每季一张卡片，默认）", "flat"),
+            ("聚合（同系列合并为一张）", "grouped"),
+        ]:
+            self.season_display_combo.addItem(label, userData=key)
+            if key == current_display:
+                self.season_display_combo.setCurrentIndex(
+                    self.season_display_combo.count() - 1
+                )
+        form.addRow("多季展示", _indent(self.season_display_combo))
+
+        display_hint = QLabel("改动展示方式需重新扫描或重启生效", self)
+        display_hint.setProperty("role", "hint")
+        form.addRow("", _indent(display_hint))
+
         # ---- qBittorrent（F19）----
         form.addRow(_section_divider())          # 分隔线
         qb_title = QLabel("qBittorrent（订阅下载）", self)
@@ -317,6 +353,8 @@ class SettingsPage(QWidget):
         c.set("qbittorrent", "port", str(self.qb_port_spin.value()))
         c.set("qbittorrent", "username", self.qb_user_edit.text().strip())
         c.set("qbittorrent", "password", self.qb_pass_edit.text())
+        c.set("scanner", "season_patterns", self.season_mode_combo.currentData())
+        c.set("scanner", "season_display", self.season_display_combo.currentData())
         c.set("rss", "poll_interval", str(self.rss_poll_spin.value()))
         c.set("rss", "rule", self.rss_rule_combo.currentData())
         c.set("rss", "auto_download",
