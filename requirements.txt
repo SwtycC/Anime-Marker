@@ -1,4 +1,6 @@
 PySide6>=6.6
+# QML 界面所需模块（QtQuick / QtQml / QtQuickControls2）已包含在 PySide6 中，
+# 无需额外安装；此处仅作说明，不引入新依赖。
 requests>=2.31
 pywin32>=306
 pyautogui>=0.9.54

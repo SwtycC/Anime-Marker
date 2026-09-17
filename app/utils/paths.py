@@ -84,3 +84,18 @@ def resource_path(rel: str) -> Path:
     else:
         base = project_root()
     return base / "resources" / rel
+
+
+def qml_dir() -> Path:
+    """QML 界面文件目录。
+
+    - 开发态：<project_root>/app/qml
+    - 打包态：<sys._MEIPASS>/qml（见 anime_marker.spec 的 datas 映射）
+
+    注意：QML 引擎加载**目录**（而非单个文件）才能让 qmldir 生效，
+    因此这里返回目录本身，由调用方用 addImportPath() 注册。
+    """
+    if is_frozen():
+        base = Path(getattr(sys, "_MEIPASS", os.path.abspath(".")))
+        return base / "qml"
+    return project_root() / "app" / "qml"

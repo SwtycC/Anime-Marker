@@ -16,11 +16,18 @@ a = Analysis(
     binaries=[],
     datas=[
         ('resources/icons', 'resources/icons'),
-        ('resources/qss', 'resources/qss'),
+        # QML 界面文件：映射到 _MEIPASS/qml，与 paths.qml_dir() 的契约一致。
+        # .qml 是运行时加载的，PyInstaller 静态分析发现不了，必须显式打包。
+        ('app/qml', 'qml'),
+        # 注：全量迁移到 QML 后已不再需要样式表资源
+        #（旧 QWidget 界面连同样式一起归档在 _legacy/）。
     ],
     hiddenimports=[
         'PySide6.QtSvg',
         'PySide6.QtSvgWidgets',
+        'PySide6.QtQml',
+        'PySide6.QtQuick',
+        'PySide6.QtQuickControls2',
         'sqlite3',
         'win32gui',
         'win32con',

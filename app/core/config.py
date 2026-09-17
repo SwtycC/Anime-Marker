@@ -64,6 +64,13 @@ DEFAULTS: dict[str, dict[str, str]] = {
     "ui": {
         "style": "fusion_dark",
         "poster_width": "200",
+        # 初始窗口恰好容纳的列数（QmlApp._fit_window_to_columns 据此反推窗口宽度）
+        "poster_columns": "5",
+        # QML 界面主题（§5.12）：
+        #   theme_mode   = light / dark
+        #   accent_color = 主题色（#RRGGBB），设置页可切换
+        "theme_mode": "light",
+        "accent_color": "#2F6FEB",
     },
 }
 

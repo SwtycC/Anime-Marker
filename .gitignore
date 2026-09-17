@@ -243,3 +243,7 @@ data/
 
 # 打包配置属于项目代码，需上传（覆盖上方 PyInstaller 段的 *.spec 规则）
 !anime_marker.spec
+
+# ===== 旧 QWidget 界面归档（QML 全量迁移后不再使用）=====
+# 保留在本地便于回溯，不进版本库。确认无需回溯后可手动删除。
+_legacy/
