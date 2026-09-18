@@ -153,6 +153,24 @@ Item {
         settingsBridge.requestScan()
     }
 
+    /// 用「当前输入框里的 Token」解析 username 并回填到「用户 ID」栏。
+    ///
+    /// 必要性：`/v0/users/{username}` 要的是 username 而不是昵称，
+    /// 用户在设置页很难分辨该填哪个；一键解析能直接给出正确值。
+    ///
+    /// 注意传的是**输入框里的 Token** 而不是已保存的 Token ——
+    /// 否则用户改了 Token 但还没保存时会解析出旧账号。
+    function detectUsername() {
+        if (typeof inprogress === "undefined" || !inprogress) {
+            root.statusMessage("桥接不可用，无法检测")
+            return
+        }
+        var r = inprogress.resolveUsername(tokenField.text.trim())
+        if (r.ok)
+            usernameField.text = r.username
+        root.statusMessage(r.message)
+    }
+
     Flickable {
         id: flick
         anchors.fill: parent
@@ -278,25 +296,75 @@ Item {
                 FormRow {
                     width: parent.width
                     label: "Access Token"
-                    AppTextField {
-                        id: tokenField
-                        objectName: "tokenField"
-                        text: root.getValue("bangumi.token", "")
+                    // ---- 帮助按钮「浮在输入框左外侧」----
+                    //
+                    // 布局意图：输入框**严格占满内容列**（左边与其它栏对齐，
+                    // 右边也齐平），按钮用负 x 伸进左侧的**标签区**。
+                    //
+                    // 可行性：FormRow 的标签列固定 132px，而标签文字
+                    // 「Access Token」只占约 90px，右侧留有约 40px 空档 ——
+                    // 足够放一个 20px 的小圆。这样既不占用输入框的宽度，
+                    // 也不影响任何一栏的对齐。
+                    //
+                    // 踩坑记录（前两版都因此返工）：
+                    //   ① 按钮放左侧**并参与布局**（输入框 left: 按钮.right）
+                    //      → Token 输入框比其它栏右移「按钮宽 + 间距」，
+                    //        四栏左边缘参差不齐（实测偏差 28px）。
+                    //   ② 按钮放输入框右侧 → 左侧对齐了，但按钮与「检测」
+                    //      按钮挤在右侧同一列，视觉上"操作区"偏重，且
+                    //      Token 输入框比其它栏窄了 28px。
+                    // 本版把按钮**移出布局流**（负偏移 + 绝对定位），
+                    // 因此四个输入框的 x 完全一致（实测偏差 0px）。
+                    Item {
                         width: parent.width
-                        echoPassword: true
-                        placeholder: "从 next.bgm.tv/demo/access-token 生成"
+                        height: 34
+
+                        AppTextField {
+                            id: tokenField
+                            objectName: "tokenField"
+                            text: root.getValue("bangumi.token", "")
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            echoPassword: true
+                            placeholder: "从 next.bgm.tv/demo/access-token 生成"
+                        }
+
+                        // 负偏移伸到标签区。按钮宽 20 + 间距 8 = 28px，
+                        // 而标签右侧空档约 40px，因此不会压到 "Access Token" 文字。
+                        HelpButton {
+                            id: tokenHelpBtn
+                            objectName: "tokenHelpBtn"
+                            x: -width - Theme.spacingSm
+                            anchors.verticalCenter: parent.verticalCenter
+                            tooltip: "如何获取 Access Token"
+                            onClicked: tokenDialog.open()
+                        }
                     }
                 }
 
                 FormRow {
                     width: parent.width
-                    label: "用户名"
-                    AppTextField {
-                        id: usernameField
-                        objectName: "usernameField"
-                        text: root.getValue("bangumi.username", "")
+                    label: "用户 ID"
+                    hint: "username，不是昵称"
+                    Row {
                         width: parent.width
-                        placeholder: "在看列表需要；留空则尝试用 Token 解析"
+                        spacing: Theme.spacingSm
+
+                        AppTextField {
+                            id: usernameField
+                            objectName: "usernameField"
+                            text: root.getValue("bangumi.username", "")
+                            width: parent.width - detectBtn.width - Theme.spacingSm
+                            placeholder: "留空则自动从 Token 解析（推荐）"
+                        }
+
+                        AppButton {
+                            id: detectBtn
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "检测"
+                            onClicked: root.detectUsername()
+                        }
                     }
                 }
 
@@ -662,6 +730,93 @@ Item {
                         checked: root.getBool("rss.auto_download", false)
                         text: "启用自动下载（关闭时命中新集仅入库为待确认）"
                     }
+                }
+            }
+        }
+    }
+
+    // ==================== Token 获取说明弹窗 ====================
+    Dialog {
+        id: tokenDialog
+        modal: true
+        anchors.centerIn: parent
+        width: 520
+        padding: Theme.spacingXl
+        title: "如何获取 Access Token"
+
+        background: Rectangle {
+            color: Theme.surfaceBg
+            border.width: Theme.lineThin
+            border.color: Theme.border
+            radius: Theme.radiusMd
+        }
+
+        contentItem: Column {
+            width: parent.width
+            spacing: Theme.spacingMd
+
+            Text {
+                width: parent.width
+                text: "在浏览器中打开以下地址，登录 Bangumi 后即可生成个人 Access Token："
+                color: Theme.textPrimary
+                font.pixelSize: Theme.fontMd
+                wrapMode: Text.WordWrap
+            }
+
+            // 可点击的地址（选中复制 + 一键打开）
+            Rectangle {
+                width: parent.width
+                height: 38
+                radius: Theme.radiusSm
+                color: Theme.surfaceAlt
+                border.width: Theme.lineThin
+                border.color: Theme.border
+
+                Text {
+                    id: tokenUrl
+                    anchors.left: parent.left
+                    anchors.leftMargin: Theme.spacingMd
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width - openTokenBtn.width - Theme.spacingLg
+                    text: "https://next.bgm.tv/demo/access-token"
+                    color: Theme.accent
+                    font.pixelSize: Theme.fontSm
+                    elide: Text.ElideRight
+                    // 允许鼠标选中复制（TextEdit 才有 selectByMouse）
+                    // 这里用 Text + 一键打开按钮，更省事
+                }
+
+                AppButton {
+                    id: openTokenBtn
+                    anchors.right: parent.right
+                    anchors.rightMargin: 4
+                    anchors.verticalCenter: parent.verticalCenter
+                    height: 30
+                    text: "打开"
+                    onClicked: Qt.openUrlExternally(
+                                   "https://next.bgm.tv/demo/access-token")
+                }
+            }
+
+            Text {
+                width: parent.width
+                text: "注意事项：\n"
+                      + "1. 生成时必须勾选「读取收藏」权限，否则无法拉取在看列表。\n"
+                      + "2. 生成的 Token 只显示一次，请及时复制保存。\n"
+                      + "3. 下方「用户 ID」栏留空即可 —— 程序会用 Token 自动解析。"
+                color: Theme.textSecondary
+                font.pixelSize: Theme.fontSm
+                lineHeight: 1.5
+                wrapMode: Text.WordWrap
+            }
+
+            Row {
+                anchors.right: parent.right
+
+                AppButton {
+                    text: "知道了"
+                    variant: "primary"
+                    onClicked: tokenDialog.close()
                 }
             }
         }

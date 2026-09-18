@@ -1,7 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 
-// 在看页（阶段 7）：Bangumi「动画 · 在看」列表 + 本地关联。
+// 收藏页（阶段 7）：Bangumi「动画 · 看过」列表 + 本地关联。
 //
 // 数据来源：`library.inProgress`（读本地缓存表 inprogress_cache）。
 // 拉取动作由 `inprogress.refresh()` 触发（QThread + 信号），
@@ -57,7 +57,7 @@ Item {
                     spacing: 2
 
                     Text {
-                        text: "在看"
+                        text: "看过"
                         color: Theme.textPrimary
                         font.pixelSize: Theme.fontXl
                         font.weight: Font.DemiBold
@@ -264,7 +264,7 @@ Item {
 
                 Text {
                     anchors.horizontalCenter: parent.horizontalCenter
-                    text: root.busy ? "正在拉取…" : "暂无在看条目"
+                    text: root.busy ? "正在拉取…" : "暂无看过条目"
                     color: Theme.textSecondary
                     font.pixelSize: Theme.fontLg
                 }
@@ -273,7 +273,7 @@ Item {
                     anchors.horizontalCenter: parent.horizontalCenter
                     text: root.busy
                           ? ""
-                          : "点右上角「刷新」从 Bangumi 拉取在看列表"
+                          : "点右上角「刷新」从 Bangumi 拉取看过列表"
                     color: Theme.textTertiary
                     font.pixelSize: Theme.fontMd
                 }

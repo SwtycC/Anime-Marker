@@ -143,7 +143,7 @@ Item {
                         AppTextField {
                             id: nameField
                             width: parent.width
-                            placeholderText: "留空则用域名（如 dmhy）"
+                            placeholder: "留空则用域名（如 dmhy）"
                         }
                     }
 
@@ -153,7 +153,7 @@ Item {
                         AppTextField {
                             id: urlField
                             width: parent.width
-                            placeholderText: "https://example.com/rss.xml"
+                            placeholder: "https://example.com/rss.xml"
                         }
                     }
 

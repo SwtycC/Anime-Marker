@@ -24,8 +24,8 @@ from PySide6.QtWidgets import QApplication
 
 from app import __version__
 from app.bridges import (
-    InProgressBridge, LibraryBridge, MatchBridge, PlayerBridge, ScannerBridge,
-    SettingsBridge,
+    InProgressBridge, LibraryBridge, MatchBridge, PlayerBridge, RssBridge,
+    ScannerBridge, SettingsBridge,
 )
 from app.core.bangumi_api import BangumiClient
 from app.core.config import Config
@@ -121,6 +121,7 @@ class QmlApp:
         self.inprogress_bridge = InProgressBridge(self.db, self.config, self.api)
         # 在看列表拉取完成后，让 QML 侧的 library.inProgress 重新取数
         self.inprogress_bridge.set_done_hook(self.library_bridge.reloadInProgress)
+        self.rss_bridge = RssBridge(self.db)
 
         # 配置保存后重建依赖配置的服务
         self.settings_bridge.saved.connect(self._rebuild_services)
@@ -195,6 +196,7 @@ class QmlApp:
         ctx.setContextProperty("player", self.player_bridge)
         ctx.setContextProperty("matcher", self.match_bridge)
         ctx.setContextProperty("inprogress", self.inprogress_bridge)
+        ctx.setContextProperty("rss", self.rss_bridge)
 
         # ---- 加载主界面 ----
         main_qml = qml_root / "Main.qml"

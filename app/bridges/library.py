@@ -92,12 +92,16 @@ class LibraryBridge(QObject):
         self._inprogress_dirty = True
         self.inProgressChanged.emit()
 
-    # ---------- 在看列表（阶段 7）----------
+    # ---------- Bangumi 收藏列表（阶段 7）----------
     @Property("QVariantList", notify=inProgressChanged)
     def inProgress(self) -> list[dict]:
-        """在看列表（来自 `inprogress_cache`，由 InProgressBridge 拉取写入）。
+        """Bangumi「看过」收藏（来自 `inprogress_cache`，由 InProgressBridge 写入）。
 
-        缓存表由 F18 引入，字段：bangumi_id / name / name_cn / cover_url /
+        > 命名说明：表名/属性名沿用 F18 的 `inprogress*`，但**语义是「看过」**
+        > （`collect_type = 2`）。改名要动整条链路而收益仅是"名字好看"，
+        > 故保留并在文档中标注。
+
+        缓存表字段：bangumi_id / name / name_cn / cover_url /
         ep_status / total_eps / collect_type / updated_at。
         这里额外补两个 QML 侧要用的字段：
           - `localSubjectId`：本地是否有对应条目（用于「播放/详情」按钮）
@@ -140,7 +144,8 @@ class LibraryBridge(QObject):
                 "coverUrl": local_cover or (it.cover_url or ""),
                 "epStatus": int(it.ep_status or 0),
                 "totalEps": int(it.total_eps or 0),
-                "collectType": int(it.collect_type or 3),
+                # 2 = 看过（当前唯一使用的类型，见 InProgressBridge）
+                "collectType": int(it.collect_type or 2),
                 "updatedAt": it.updated_at or "",
                 "localSubjectId": local_id,
                 "inLibrary": local_id > 0,

@@ -1,29 +1,141 @@
 import QtQuick
 import QtQuick.Controls
 
-// 动态页（阶段 7）：按时间倒序的观看记录。
+// 动态页：按时间倒序的观看记录，支持两种内容来源。
 //
-// 数据来源：`library.timeline()`（episodes JOIN subjects，取 watched=1）。
-// 纯本地查询，无需网络，因此直接同步取数（不走 QThread）。
+// 内容来源由页面内的分段按钮控制（**不放在设置页**）：
+//   local  —— 只显示本地观看记录（`library.timeline()`，纯离线）
+//   merged —— 本地记录 + Bangumi「看过」收藏（单独归组排在末尾）
 //
-// 呈现方式（对应旧版 timeline_page.py）：
-// - 按「日期」分组：今天 / 昨天 / 具体日期，组间有分隔标题
-// - 每条显示：集序号 + 动漫名 + 集标题 + 相对时间
-// - 点击跳详情页
+// 为什么不放设置页：这是"看当前页面"的临时视图偏好，切换后应立刻见效。
+// 放设置页需要"改完→点保存→切页"，多两步且容易让人以为按钮没生效。
 //
-// 分组实现：QML 侧用一次遍历把扁平列表切成 [[组名, [条目...]], ...]。
-// 之所以放 QML 而不是 Python，是因为分组规则纯属展示逻辑，
-// 以后想改成「按周分组」不必动后端。
+// 呈现规则：
+// - **按动漫聚合**：同一部动漫即使看了多集，也只占一行，
+//   行内显示「已看 N 集」，并按"最近看的那一集的时间"排序。
+//   这样"看过的动漫"一眼可见，不会被同一部的多集记录淹没。
+// - Bangumi 条目（merged 模式）不参与聚合，也不按日期分组。
+//
+// 分组/聚合实现放在 QML 侧：纯展示逻辑，调整规则不必动后端。
 Item {
     id: root
 
-    property var entries: typeof library !== "undefined" && library
-                          ? library.timeline(500) : []
+    // 内容来源：local | merged（页面内切换，不持久化）
+    property string source: "local"
+
+    // 本地观看记录（原始，按集）
+    property var localEntries: typeof library !== "undefined" && library
+                               ? library.timeline(500) : []
+    // Bangumi「看过」收藏（merged 模式下使用）
+    property var bangumiItems: typeof library !== "undefined" && library
+                               ? library.inProgress : []
 
     signal subjectClicked(int subjectId)
 
-    // 懒计算的分组结果：entries 变化时重算
+    /// 按动漫聚合后的条目列表（含 merged 模式的 Bangumi 条目）
+    ///
+    /// **踩坑（重要）：这个属性必须是「绑定」，不能被外部赋值。**
+    /// 早期 Main.qml 在切到动态页时写了
+    ///     `timelinePage.entries = library.timeline(500)`
+    /// 以为是在"刷新数据"，实际上 QML 里给一个有绑定的属性赋值会
+    /// **永久断开该绑定**，导致后续数据源变化不再触发重算。
+    /// 正确做法：外部只改 `localEntries`（数据源），见 reload()。
+    property var entries: buildEntries()
+
+    /// 分组后的结果（按日期 + 可选的「Bangumi 看过」组）
     property var groups: buildGroups(entries)
+
+    /// 是否正在拉取 Bangumi 看过列表（merged 模式下刷新时）
+    readonly property bool busy: typeof inprogress !== "undefined" && inprogress
+                                 ? inprogress.running : false
+
+    /// 重新拉取本地观看记录（由外部调用，不碰 entries 本身）
+    function reload() {
+        if (typeof library !== "undefined" && library)
+            localEntries = library.timeline(500)
+    }
+
+    /// 切换内容来源。切到 merged 且缓存为空时自动拉一次，
+    /// 避免用户切过来看到空白还得再点一次刷新。
+    function setSource(v) {
+        if (v !== "local" && v !== "merged")
+            return
+        var changed = (source !== v)
+        source = v
+        if (v === "merged" && changed && bangumiItems.length === 0)
+            pullBangumi()
+    }
+
+    /// 触发一次 Bangumi 收藏拉取（QThread，完成后
+    /// InProgressBridge 回调 library.reloadInProgress()，
+    /// 进而让 bangumiItems 的绑定重算）
+    function pullBangumi() {
+        if (typeof inprogress !== "undefined" && inprogress && !inprogress.running)
+            inprogress.refresh()
+    }
+
+    /// 点「刷新」按钮：
+    /// - local 模式：只重读本地记录（瞬时完成）
+    /// - merged 模式：额外拉一次 Bangumi 看过列表
+    function requestRefresh() {
+        reload()
+        if (source === "merged")
+            pullBangumi()
+    }
+
+    /// 把「按集」的原始记录**按动漫聚合**，merged 时再追加 Bangumi 条目。
+    ///
+    /// 聚合规则：
+    /// - 同一 subjectId 只保留一条
+    /// - `watchedAt` 取该动漫**最近一次**观看时间（决定排序位置）
+    /// - `epIndex` 取最近看的那一集序号（展示"看到第几集"）
+    /// - `watchedEpCount` 为该动漫的已看集数（展示"已看 N 集"）
+    ///
+    /// 原始列表已按 watchedAt 倒序，因此首次遇到某部动漫时
+    /// 那一条就是它最新的记录，直接采信即可。
+    function buildEntries() {
+        var seen = {}
+        var out = []
+        for (var i = 0; i < localEntries.length; i++) {
+            var e = localEntries[i]
+            var key = String(e.subjectId)
+            if (seen[key] !== undefined) {
+                // 已收录：只累加集数，保留首条（最新）的时间与集号
+                out[seen[key]].watchedEpCount += 1
+                continue
+            }
+            seen[key] = out.length
+            out.push({
+                "subjectId": e.subjectId,
+                "subjectName": e.subjectName,
+                "epIndex": e.epIndex,
+                "epTitle": e.epTitle,
+                "watchedAt": e.watchedAt,
+                "watchedEpCount": 1,
+                "isInProgress": false
+            })
+        }
+
+        // merged：追加 Bangumi 看过条目（不聚合，每条独立）
+        if (source === "merged") {
+            for (var j = 0; j < bangumiItems.length; j++) {
+                var it = bangumiItems[j]
+                out.push({
+                    // 未入库时没有本地条目可跳，subjectId = 0
+                    "subjectId": it.localSubjectId,
+                    "subjectName": it.title,
+                    "epIndex": it.epStatus,
+                    "epTitle": "",
+                    "watchedAt": "",
+                    "watchedEpCount": 0,
+                    "isInProgress": true,
+                    "totalEps": it.totalEps,
+                    "inLibrary": it.inLibrary
+                })
+            }
+        }
+        return out
+    }
 
     Flickable {
         id: flick
@@ -48,24 +160,53 @@ Item {
                    - (vbar.visible ? vbar.width : 0)
             spacing: Theme.spacingMd
 
-            // ---- 标题 ----
-            Column {
+            // ---- 标题行：标题 + 状态 + 来源切换 + 刷新 ----
+            Row {
                 width: parent.width
-                spacing: 2
+                spacing: Theme.spacingMd
 
-                Text {
-                    text: "动态"
-                    color: Theme.textPrimary
-                    font.pixelSize: Theme.fontXl
-                    font.weight: Font.DemiBold
+                Column {
+                    width: parent.width - sourceSeg.width - refreshBtn.width
+                           - Theme.spacingMd * 2
+                    spacing: 2
+
+                    Text {
+                        text: "动态"
+                        color: Theme.textPrimary
+                        font.pixelSize: Theme.fontXl
+                        font.weight: Font.DemiBold
+                    }
+
+                    Text {
+                        width: parent.width
+                        text: root.headerText()
+                        color: Theme.textTertiary
+                        font.pixelSize: Theme.fontSm
+                        elide: Text.ElideRight
+                    }
                 }
 
-                Text {
-                    text: root.entries.length > 0
-                          ? "共 " + root.entries.length + " 条观看记录"
-                          : "暂无观看记录"
-                    color: Theme.textTertiary
-                    font.pixelSize: Theme.fontSm
+                // 内容来源切换（页面内即时生效，不写配置）
+                SegmentedControl {
+                    id: sourceSeg
+                    objectName: "timelineSourceSeg"
+                    anchors.verticalCenter: parent.verticalCenter
+                    options: [
+                        { "label": "仅本地", "value": "local" },
+                        { "label": "本地 + Bangumi 看过", "value": "merged" }
+                    ]
+                    currentValue: root.source
+                    onSelected: function (value) {
+                        root.setSource(value)
+                    }
+                }
+
+                AppButton {
+                    id: refreshBtn
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.busy ? "刷新中…" : "刷新"
+                    enabled: !root.busy
+                    onClicked: root.requestRefresh()
                 }
             }
 
@@ -119,19 +260,28 @@ Item {
                                     anchors.rightMargin: Theme.spacingMd
                                     spacing: Theme.spacingSm
 
-                                    // 集序号徽标
+                                    // 序号徽标：
+                                    // 已看记录显示最近看的那一集「EP11」，
+                                    // Bangumi 条目显示「看过」（ep_status 可能为 0，
+                                    // 显示「EP0」没有意义）
                                     Rectangle {
                                         anchors.verticalCenter: parent.verticalCenter
                                         width: Math.max(28, epLabel.implicitWidth + 10)
                                         height: 20
                                         radius: Theme.radiusSm
-                                        color: Theme.accentSoft
+                                        color: modelData.isInProgress
+                                               ? Theme.warningColor
+                                               : Theme.accentSoft
 
                                         Text {
                                             id: epLabel
                                             anchors.centerIn: parent
-                                            text: "EP" + root.fmtIndex(modelData.epIndex)
-                                            color: Theme.accent
+                                            text: modelData.isInProgress
+                                                  ? "看过"
+                                                  : "EP" + root.fmtIndex(modelData.epIndex)
+                                            color: modelData.isInProgress
+                                                   ? "#FFFFFF"
+                                                   : Theme.accent
                                             font.pixelSize: Theme.fontXs
                                         }
                                     }
@@ -146,22 +296,29 @@ Item {
                                         elide: Text.ElideRight
                                     }
 
-                                    // 集标题（可能为空）
+                                    // 中列：
+                                    // - 已看记录 → 已看集数
+                                    // - Bangumi 条目 → 总集数 + 是否入库
                                     Text {
+                                        id: epCountLabel
                                         anchors.verticalCenter: parent.verticalCenter
-                                        width: parent.width - 40 - Math.round((parent.width - 40) * 0.42)
-                                               - timeLabel.width - Theme.spacingSm * 2
-                                        text: modelData.epTitle
-                                        color: Theme.textTertiary
+                                        width: Math.max(implicitWidth, 56)
+                                        text: modelData.isInProgress
+                                              ? root.inProgressCaption(modelData)
+                                              : "已看 " + modelData.watchedEpCount + " 集"
+                                        color: Theme.textSecondary
                                         font.pixelSize: Theme.fontSm
-                                        elide: Text.ElideRight
                                     }
 
-                                    // 相对时间
+                                    // 右列：
+                                    // - 已看记录 → 相对时间
+                                    // - Bangumi 条目 → 看到第几集
                                     Text {
                                         id: timeLabel
                                         anchors.verticalCenter: parent.verticalCenter
-                                        text: root.fmtTime(modelData.watchedAt)
+                                        text: modelData.isInProgress
+                                              ? root.inProgressProgress(modelData)
+                                              : root.fmtTime(modelData.watchedAt)
                                         color: Theme.textTertiary
                                         font.pixelSize: Theme.fontSm
                                     }
@@ -179,8 +336,17 @@ Item {
                                     id: rowMouse
                                     anchors.fill: parent
                                     hoverEnabled: true
-                                    cursorShape: Qt.PointingHandCursor
-                                    onClicked: root.subjectClicked(modelData.subjectId)
+                                    // Bangumi 条目未入库时（subjectId == 0）无处可跳，
+                                    // 用箭头光标提示"这一行不可点"
+                                    readonly property bool clickable:
+                                        modelData.isInProgress
+                                        ? modelData.subjectId > 0 : true
+                                    cursorShape: clickable ? Qt.PointingHandCursor
+                                                           : Qt.ArrowCursor
+                                    onClicked: {
+                                        if (clickable)
+                                            root.subjectClicked(modelData.subjectId)
+                                    }
                                 }
                             }
                         }
@@ -206,7 +372,9 @@ Item {
 
                 Text {
                     anchors.horizontalCenter: parent.horizontalCenter
-                    text: "播放剧集并在 PotPlayer 中看完后，这里会留下记录"
+                    text: root.source === "merged"
+                          ? "暂无内容 —— 可点右上角「刷新」拉取 Bangumi 看过列表"
+                          : "播放剧集并在 PotPlayer 中看完后，这里会留下记录"
                     color: Theme.textTertiary
                     font.pixelSize: Theme.fontMd
                 }
@@ -214,25 +382,38 @@ Item {
         }
     }
 
-    // ---- 分组：把扁平列表按日期切成 [ {label, items}, ... ] ----
+    // ---- 分组：按「最近观看日期」切分，Bangumi 条目单独成组排最后 ----
+    //
+    // Bangumi 条目没有 watchedAt，无法按日期归组；统一放进
+    // 「Bangumi 看过」组并置于末尾，符合「本地已看在前、
+    // Bangumi 收藏在后」的阅读顺序。
     function buildGroups(list) {
         if (!list || list.length === 0)
             return []
         var out = []
         var curLabel = ""
         var curItems = []
+        var ipItems = []
+
         for (var i = 0; i < list.length; i++) {
-            var label = dayLabel(list[i].watchedAt)
+            var item = list[i]
+            if (item.isInProgress) {
+                ipItems.push(item)
+                continue
+            }
+            var label = dayLabel(item.watchedAt)
             if (label !== curLabel) {
                 if (curItems.length > 0)
                     out.push({ "label": curLabel, "items": curItems })
                 curLabel = label
                 curItems = []
             }
-            curItems.push(list[i])
+            curItems.push(item)
         }
         if (curItems.length > 0)
             out.push({ "label": curLabel, "items": curItems })
+        if (ipItems.length > 0)
+            out.push({ "label": "Bangumi 看过", "items": ipItems })
         return out
     }
 
@@ -291,6 +472,39 @@ Item {
 
     function fmtIndex(v) {
         return (Math.round(v * 100) / 100).toString()
+    }
+
+    /// 标题下的说明文字
+    ///
+    /// 已看记录部分同时说明「部数」与「原始记录条数」：因为列表按动漫
+    /// 聚合，只说"条"会让人误以为同一部的其他集被漏掉了。
+    function headerText() {
+        var localCount = entries.length - (source === "merged" ? bangumiItems.length : 0)
+        var parts = []
+        if (localCount > 0)
+            parts.push("已看 " + localCount + " 部（原始 "
+                       + localEntries.length + " 条记录）")
+        else
+            parts.push("暂无观看记录")
+        if (source === "merged")
+            parts.push("Bangumi 看过 " + bangumiItems.length + " 部")
+        return parts.join(" · ")
+    }
+
+    /// Bangumi 条目的中列文案：总集数 + 是否已入库
+    function inProgressCaption(item) {
+        var parts = []
+        if (item.totalEps > 0)
+            parts.push("共 " + item.totalEps + " 集")
+        parts.push(item.inLibrary ? "本地已有" : "未入库")
+        return parts.join(" · ")
+    }
+
+    /// Bangumi 条目的右列文案：看到第几集
+    function inProgressProgress(item) {
+        if (!item.epIndex || item.epIndex <= 0)
+            return "尚未开始"
+        return "看到第 " + fmtIndex(item.epIndex) + " 集"
     }
 
     /// 滚动到指定位置（截图/诊断用）

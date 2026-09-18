@@ -81,13 +81,23 @@ ApplicationWindow {
 
             TimelinePage {
                 id: timelinePage
+                objectName: "timelinePage"
                 onSubjectClicked: function (subjectId) {
+                    if (subjectId <= 0)
+                        return
                     detailPage.load(subjectId)
                     browseStack.currentIndex = 1
                 }
             }
-            SubscriptionPage { }
-            SettingsPage     { id: settingsPage }
+
+            SubscriptionPage {
+                id: subscriptionPage
+                onStatusMessage: function (text) {
+                    statusBar.setMessage(text, 5000)
+                }
+            }
+
+            SettingsPage     { id: settingsPage; objectName: "settingsPage" }
         }
 
         // ============ 底部状态栏（真正占布局）============
@@ -100,10 +110,41 @@ ApplicationWindow {
         }
     }
 
-    // 切到设置页时重新读取配置（避免外部改动后显示旧值）
+    // 切页时的按需刷新
+    //
+    // 页面索引：0=海报墙/详情  1=收藏  2=动态  3=订阅  4=设置
+    //
+    // 所有跨上下文调用都做存在性判断：`library` / `rss` 等是 Python 注入的
+    // 上下文属性，单独加载本文件（组件预览、静态检查、诊断脚本）时并不存在，
+    // 直接调用会抛 TypeError 并中断整个 onCurrentPageChanged 的后续逻辑。
     onCurrentPageChanged: {
-        if (currentPage === 4)
+        // 设置页：重新读取配置（避免外部改动后显示旧值）
+        if (currentPage === 4) {
             settingsPage.refresh()
+            return
+        }
+        // 动态页：时间线不是 Property（library.timeline() 是普通 Slot），
+        // 不会自动通知，因此每次进入都重取一次，保证刚看完的集能立刻出现。
+        //
+        // 注意：**必须调 timelinePage.reload()**，不能写
+        // `timelinePage.entries = ...` —— 后者会断开 entries 的绑定
+        // （详见 TimelinePage.qml 的注释）。
+        if (currentPage === 2) {
+            timelinePage.reload()
+            return
+        }
+        // 订阅页：刷新订阅源列表（可能在别处改动过）
+        if (currentPage === 3) {
+            if (typeof rss !== "undefined" && rss)
+                rss.reload()
+            return
+        }
+        // 收藏页：切进来时刷新一下缓存状态（不自动联网，
+        // 拉取仍需用户点「刷新」按钮 —— 避免进页面就发请求）
+        if (currentPage === 1) {
+            if (typeof library !== "undefined" && library)
+                library.reloadInProgress()
+        }
     }
 
     // 详情页返回海报墙
@@ -165,9 +206,9 @@ ApplicationWindow {
             // 自动标记成功后刷新详情页集数列表（打勾状态）
             if (detailPage.subjectId > 0)
                 detailPage.load(detailPage.subjectId)
-            // 动态页的数据源是 library.timeline()，不是 Property，
-            // 因此这里显式重取一次（本次新增了一条观看记录）。
-            timelinePage.entries = library.timeline(500)
+            // 动态页的数据源不是 Property，这里显式重取一次
+            // （本次新增了一条观看记录）。注意用 reload() 而不是赋值 entries。
+            timelinePage.reload()
         }
 
         function onProgressChanged(episodeId, progress) {

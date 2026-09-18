@@ -43,14 +43,32 @@ Item {
 
         Flow {
             id: content
-            x: Theme.pagePadding
+            // ---- 水平居中 ----
+            //
+            // Flow 自身**没有对齐属性**（不像 Row 有 layoutDirection），
+            // 它总是从 x 开始左对齐排布。窗口宽度不是「列宽整数倍」时，
+            // 右侧会留下一条空白，视觉上整片网格偏左（实测明显）。
+            //
+            // 解决办法：算出这一行实际有几列，再把这行卡片的总宽度
+            // 相对可用宽度居中，用 x 偏移补偿。Flow 内所有行共用同一个
+            // x，因此只需算一次（按满行算，末行卡片数少时也一起居中）。
+            //
+            // 注意：不能直接把 Flow 的 width 改成内容宽度然后居中 ——
+            // Flow 依赖给定宽度来决定在哪换行，改窄会导致换行点变化。
+            readonly property int _cardW: Theme.posterWidth
+            readonly property int _spacing: Theme.posterSpacing
+            readonly property int _avail: flick.width - Theme.pagePadding * 2
+                                          - (vbar.visible ? vbar.width : 0)
+            // 这一行最多能放几列（至少 1 列，避免除零/负宽度）
+            readonly property int _cols: Math.max(1, Math.floor(
+                (_avail + _spacing) / (_cardW + _spacing)))
+            // 满行总宽 = N 张卡 + (N-1) 段间距
+            readonly property int _rowW: _cols * _cardW + (_cols - 1) * _spacing
+
+            x: Theme.pagePadding + Math.max(0, Math.round((_avail - _rowW) / 2))
             y: Theme.pagePadding
-            // 宽度必须扣掉滚动条 + 底部留白，否则：
-            // ① 卡片会排到滚动条底下（被遮住最右一列）
-            // ② 最后一行会被悬浮导航压住
-            width: flick.width - Theme.pagePadding * 2
-                   - (vbar.visible ? vbar.width : 0)
-            spacing: Theme.posterSpacing
+            width: _avail
+            spacing: _spacing
 
             Repeater {
                 model: root.subjects
