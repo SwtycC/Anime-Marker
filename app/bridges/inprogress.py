@@ -107,8 +107,8 @@ class _FetchWorker(QThread):
             # （看起来像"接口挂了"或"用户没数据"）。
             #
             # 实测（GET /v0/me）：
-            #     username: '933287'   ← API 要的是这个（可能也是数字）
-            #     nickname: 'swtyc'    ← 界面上显示的名字，填它必 404
+            #     username: '123456'     ← API 要的是这个（可能也是数字）
+            #     nickname: 'your-name'  ← 界面上显示的名字，填它必 404
             #
             # 因此策略是：**只要 Token 可用就优先自动解析**，配置里那一栏
             # 仅作兜底（Token 无效时的离线场景）。这样用户填了昵称也不会出错。

@@ -19,6 +19,11 @@ a = Analysis(
         # QML 界面文件：映射到 _MEIPASS/qml，与 paths.qml_dir() 的契约一致。
         # .qml 是运行时加载的，PyInstaller 静态分析发现不了，必须显式打包。
         ('app/qml', 'qml'),
+        # 许可证：PySide6 是 LGPL-3.0，分发二进制时必须随附许可信息与全文；
+        # MIT / Apache / BSD 等也要求保留各自的版权声明。详见 THIRD_PARTY_LICENSES.md。
+        ('LICENSE', '.'),
+        ('THIRD_PARTY_LICENSES.md', '.'),
+        ('licenses', 'licenses'),
         # 注：界面已全量迁移到 QML，不再需要样式表资源。
     ],
     hiddenimports=[
