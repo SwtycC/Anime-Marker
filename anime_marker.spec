@@ -19,8 +19,7 @@ a = Analysis(
         # QML 界面文件：映射到 _MEIPASS/qml，与 paths.qml_dir() 的契约一致。
         # .qml 是运行时加载的，PyInstaller 静态分析发现不了，必须显式打包。
         ('app/qml', 'qml'),
-        # 注：全量迁移到 QML 后已不再需要样式表资源
-        #（旧 QWidget 界面连同样式一起归档在 _legacy/）。
+        # 注：界面已全量迁移到 QML，不再需要样式表资源。
     ],
     hiddenimports=[
         'PySide6.QtSvg',

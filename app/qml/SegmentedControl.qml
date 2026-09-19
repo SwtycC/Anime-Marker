@@ -38,7 +38,7 @@ Item {
 
                 color: active ? Theme.accentSoft
                      : hovered ? Theme.hoverFill
-                     : "transparent"
+                     : Theme.fade(Theme.hoverFill)
                 border.width: Theme.lineThin
                 border.color: active ? Theme.accent : Theme.border
 

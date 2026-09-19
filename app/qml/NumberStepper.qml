@@ -104,7 +104,7 @@ Item {
             radius: Theme.radiusSm
             color: minusMouse.pressed ? Theme.pressedFill
                  : minusMouse.containsMouse ? Theme.hoverFill
-                 : "transparent"
+                 : Theme.fade(Theme.hoverFill)
             border.width: Theme.lineThin
             border.color: Theme.border
 
@@ -169,7 +169,7 @@ Item {
             radius: Theme.radiusSm
             color: plusMouse.pressed ? Theme.pressedFill
                  : plusMouse.containsMouse ? Theme.hoverFill
-                 : "transparent"
+                 : Theme.fade(Theme.hoverFill)
             border.width: Theme.lineThin
             border.color: Theme.border
 

@@ -108,6 +108,7 @@ Item {
         v["bangumi.username"] = usernameField.text.trim()
         v["bangumi.api_base"] = apiBaseField.text.trim() || "https://api.bgm.tv"
         v["bangumi.proxy"] = proxyField.text.trim()
+        v["bangumi.ep_timeline_count"] = epTimelineField.value
         // 路径
         v["general.library_path"] = libraryField.text.trim()
         v["general.player_path"] = playerField.text.trim()
@@ -383,12 +384,50 @@ Item {
                 FormRow {
                     width: parent.width
                     label: "代理"
+                    // 留空时应用会用**系统代理**（requests 会读 Windows 的
+                    // Internet 设置），所以"没填"不等于"没走代理"。
+                    // 直连失败最常见的原因是：代理客户端的**分流规则**把
+                    // bgm.tv 判给了直连（它是国内域名，常被国内规则集收录），
+                    // 此时换节点无用 —— 要让 bgm.tv 走隧道的规则才管用。
+                    hint: "留空则用系统代理；若拉取失败，请确认代理客户端把 bgm.tv 走了代理而非直连"
                     AppTextField {
                         id: proxyField
                         objectName: "proxyField"
                         text: root.getValue("bangumi.proxy", "")
                         width: parent.width
                         placeholder: "http://127.0.0.1:7890（可选）"
+                    }
+                }
+
+                FormRow {
+                    width: parent.width
+                    label: "动态显示条数"
+                    // 这个数**只管显示**：动态页（本地 + Bangumi）最多显示
+                    // 最近 N 条。抓取范围由程序按需决定 —— 集级接口是每部
+                    // 一次请求，程序从最近看过的部开始逐批拉，凑够 N 条就停
+                    // （实测平均 8.6 条/部，N=40 约 5 部即够，比固定拉 40 部
+                    // 省约 87% 请求）。因此 hint 里**不能再写"抓取最近 N 部"**：
+                    // 两个数由同一个设置驱动又含义不同，曾经并排出现在页头，
+                    // 被读成自相矛盾（实测反馈）。
+                    hint: "「动态」页最多显示最近 N 条记录（抓取范围自动确定，凑够即停）"
+                    Row {
+                        spacing: Theme.spacingMd
+                        NumberStepper {
+                            id: epTimelineField
+                            objectName: "epTimelineField"
+                            value: root.getFloat("bangumi.ep_timeline_count", 30)
+                            minimum: 0
+                            maximum: 300
+                            step: 5          // 需求：按一下 ±5
+                            suffix: " 条"
+                            width: 180
+                        }
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "0 = 关闭「动态」页的逐集记录"
+                            color: Theme.textTertiary
+                            font.pixelSize: Theme.fontXs
+                        }
                     }
                 }
             }

@@ -14,6 +14,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from app import USER_AGENT
 from app.utils import bgm_log
 
 log = logging.getLogger(__name__)
@@ -44,6 +45,55 @@ class BangumiAuthError(BangumiError):
     """Token 无效或权限不足（401/403）。"""
 
 
+def describe_connection_error(exc: Exception) -> str:
+    """把连接类异常翻译成一句**能照着做**的提示；认不出来时返回空串。
+
+    为什么需要它：`bgm.tv` 在国内网络下会被 **DNS 污染 + SNI 阻断**
+    （2026-09 实测：DNS 返回 Dropbox / Facebook 段的随机 IP，且每次查询
+    都不同；改用真实 IP 直连时 TLS 握手被 RST，而同一个 IP 换成别的域名
+    能正常返回 200）。这类故障在日志里是一长串 urllib3 堆栈，
+    原样丢到状态栏只会让人以为"软件坏了"，而实际该做的是**开代理**。
+
+    因此按症状分类。**只给症状，不给动作** —— 具体该怎么办取决于
+    "流量有没有走代理"（见 `_network_hint`），在这里猜容易给出错建议。
+    详细原因仍进日志（`_get` / `_post` 里的 `log.warning` 保留原始异常文本）。
+    """
+    text = str(exc)
+    low = text.lower()
+    # 5xx 被重试耗尽：请求**已经到达服务器**，是它对端出错。
+    # 别把用户引去查代理 —— 实测：Bangumi 后端故障期间
+    # `/collections` 稳定 502 而同一秒 `/subjects` 稳定 200，
+    # 响应头带 `CF-RAY`、502 页面是源站 nginx 的默认错误页。
+    m = re.search(r"too many (\d{3}) error responses", text)
+    if m:
+        return f"Bangumi 服务端故障（连续返回 {m.group(1)}）—— 与本地网络无关，稍后重试"
+    if re.search(r"\b5\d\d\b server error", low):
+        return "Bangumi 服务端故障（5xx）—— 与本地网络无关，稍后重试"
+    if "too many 502" in text or "502" in text:
+        return "拿到 502 响应（网关错误）"
+    if "reset" in low or "aborted" in low or "eof occurred" in low:
+        return "连接被重置（疑似被网络阻断）"
+    if "timed out" in low or "timeout" in low:
+        return "连接超时（疑似被阻断或节点不通）"
+    if "ssl" in low or "certificate" in low:
+        return "TLS 握手失败（疑似被中间设备干扰）"
+    if "max retries" in low:
+        return "多次重试仍失败（网络不通）"
+    return ""
+
+
+def is_server_side_error(exc: Exception) -> bool:
+    """这个失败是不是**服务端**的问题（请求已到达服务器，只是它返回了 5xx）。
+
+    用来决定提示里要不要追加"检查代理"：服务端故障时流量明明通了，
+    再让用户去查代理/换节点只会误导（实测踩过）。
+    """
+    text = str(exc)
+    if re.search(r"too many \d{3} error responses", text):
+        return True
+    return bool(re.search(r"\b5\d\d\b", text)) and "server error" in text.lower()
+
+
 class BangumiClient:
     """对 https://api.bgm.tv 的轻量封装。"""
 
@@ -52,7 +102,7 @@ class BangumiClient:
         token: str = "",
         api_base: str = "https://api.bgm.tv",
         proxy: str = "",
-        user_agent: str = "AnimeMarker/1.0",
+        user_agent: str = USER_AGENT,   # 合规 UA 见 app/__init__.py 的说明
         timeout: float = 10.0,
     ) -> None:
         self.api_base = api_base.rstrip("/")
@@ -108,11 +158,20 @@ class BangumiClient:
                 raise BangumiAuthError(
                     "Token 无效或权限不足（请重新生成 Token 并勾选读取收藏）"
                 ) from e
+            if status >= 500:
+                # 单个 5xx（没走重试路径时）：同样是服务端的问题，
+                # 不要让它显示成"网络错误"而把用户引去查代理
+                log.warning("Bangumi GET %s 服务端错误 %s%s: %s",
+                            url, status, label, e)
+                raise BangumiError(
+                    f"Bangumi 服务端故障（HTTP {status}）—— 与本地网络无关，稍后重试"
+                ) from e
             log.warning("Bangumi GET %s 失败%s: %s", url, label, e)
             raise BangumiError(str(e)) from e
         except requests.RequestException as e:
+            # 连接类故障 → 换成能照着做的提示（原始异常已在上面进日志）
             log.warning("Bangumi GET %s 失败%s: %s", url, label, e)
-            raise BangumiError(str(e)) from e
+            raise BangumiError(self._network_hint(e, url)) from e
 
     def _post(self, path: str, json: Any = None) -> Any:
         url = f"{self.api_base}{path}"
@@ -124,7 +183,41 @@ class BangumiClient:
             return resp.json() if resp.content else {}
         except requests.RequestException as e:
             log.warning("Bangumi POST %s 失败%s: %s", url, label, e)
-            raise BangumiError(str(e)) from e
+            raise BangumiError(self._network_hint(e, url)) from e
+
+    def _network_hint(self, exc: Exception, url: str) -> str:
+        """连接失败的用户可读提示，并补一句"流量到底走没走代理"。
+
+        **为什么要补这一句（实测踩坑）**：用户看到网络错误后，跑去代理客户端
+        里**反复换节点**，但问题根本不在节点 —— 代理客户端的**分流规则**把
+        `bgm.tv` 判给了直连（它是国内域名，常被国内规则集收录），于是
+        流量压根没进隧道，换哪个节点都一样。不点明这一点，用户会在错误的
+        方向上试很久。
+
+        `session.proxies` 为空时 requests 会退回环境变量 / 系统代理，
+        所以要用 `get_environ_proxies` 看**实际生效**的代理再下结论
+        （否则会把"用着系统代理"误报成"未走代理"）。
+        """
+        hint = describe_connection_error(exc)
+        if not hint:
+            return str(exc)
+        if is_server_side_error(exc):
+            # 服务端 5xx：流量已经打通了，别再让用户去查代理/换节点
+            return hint
+        proxies = dict(self.session.proxies)
+        if not proxies:
+            try:
+                proxies = requests.utils.get_environ_proxies(url) or {}
+            except Exception:
+                proxies = {}
+        addr = proxies.get("https") or proxies.get("http") or ""
+        if addr:
+            # 去掉 scheme 少占几个字符（状态栏是单行，右端会被省略号截断）
+            shown = addr.split("://")[-1]
+            hint += f" —— 已走代理 {shown}，请确认它没把 bgm.tv 分流成直连"
+        else:
+            hint += " —— 当前未走代理，请在「设置 → Bangumi → 代理」配置"
+        return hint
 
     # ---------- 业务 ----------
     def search_subjects(self, keyword: str, limit: int = 10) -> list[dict]:
@@ -240,7 +333,7 @@ class BangumiClient:
         page_size: int = 50,
         max_items: int = 500,
     ) -> list[dict]:
-        """分页拉取全部在看收藏（带 max_items 上限保护）。"""
+        """分页拉取全部收藏（带 max_items 上限保护）。"""
         out: list[dict] = []
         offset = 0
         while len(out) < max_items:
@@ -254,3 +347,56 @@ class BangumiClient:
                 break
             offset += page_size
         return out[:max_items]
+
+    # ---------- F20：集级观看记录 ----------
+    def get_subject_episode_collections(
+        self,
+        subject_id: int,
+        episode_type: int = 0,
+        limit: int = 500,
+    ) -> list[dict]:
+        """拉取某条目下**当前用户**的逐集收藏状态。
+
+        端点：`GET /v0/users/-/collections/{subject_id}/episodes`
+        （路径里的 `-` 表示"当前 Token 对应的用户"，无需 username）
+
+        参数 `episode_type`：0=正片、1=SP、2=OP、3=ED、4=预告。
+        默认只取正片，避免 OP/ED 混进「观看记录」时间线。
+
+        返回每项结构（字段名以文档为准）：
+            {
+              "episode": { "id", "ep", "sort", "name", "name_cn", "airdate", ... },
+              "type": 2,               # 2 = 看过
+              "updated_at": 1786707528 # 该集被标记「看过」的时间（Unix 秒）
+            }
+
+        **注意（实测记录，两次结论不同）**：
+        - 早期实测：服务端**未填充** `updated_at`，多部动漫（含 11/24/25 集的
+          条目）全部返回 0 —— 因此不能直接拿它当观看时间。
+        - 2026-09-19 复查：当前数据里该字段**是有值的**（本账号 30/30 行都与
+          收藏级时间不同，精确到秒），走的是真实单集时间戳。
+
+        结论：**保留两级兜底**（单集 `updated_at` → 动漫收藏级 `updated_at`），
+        见 `bridges/inprogress.py`。真实时间戳缺失时若没有兜底，整批记录
+        会因"无时间"被丢弃（早期版本正是如此，表现为动态页一片空白）。
+        """
+        out: list[dict] = []
+        offset = 0
+        while len(out) < limit:
+            page_size = min(limit - len(out), 100)
+            data = self._get(
+                f"/v0/users/-/collections/{subject_id}/episodes",
+                episode_type=episode_type,
+                limit=page_size,
+                offset=offset,
+            )
+            if not isinstance(data, dict):
+                break
+            page = data.get("data", [])
+            if not page:
+                break
+            out.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
+        return out[:limit]

@@ -40,6 +40,18 @@ ApplicationWindow {
     // ---- 当前页索引（供外部桥接层读写）----
     property int currentPage: 0
 
+    // 详情页的「来源页」：从哪进来，退出时就退回哪
+    //
+    // 详情页在**内层** browseStack 的第 1 格，而海报墙 / 收藏页 / 动态页是外层
+    // pageStack 的平级页。所以"返回"要恢复**两处位置**：
+    //   内层 browseStack → 0（回到海报墙那一格）
+    //   外层 currentPage → 当初进来的那一页
+    // 早期只写了内层，于是无论从哪进详情，退出后都落到海报墙（实测反馈）。
+    //
+    // 入口处统一写 `detailOriginPage = window.currentPage`（而不是写死 0/1/2），
+    // 这样以后新增入口也不用改返回逻辑。
+    property int detailOriginPage: 0
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
@@ -47,6 +59,19 @@ ApplicationWindow {
         // ============ 内容区 ============
         // 海报墙与详情页共用一层子栈：详情不是独立的一级导航页，
         // 从海报墙点进去、返回后仍回到海报墙（与旧版 MainWindow.browse_stack 一致）。
+        //
+        // **踩坑（两层栈：改了内层却看不见）**：详情页在**内层** `browseStack` 里，
+        // 而动态页 / 收藏页是外层 `pageStack` 的**平级页**。从它们那里只写
+        //     browseStack.currentIndex = 1
+        // 是**完全没有反应**的 —— 外层还停在原来的页面，内层切到哪都看不见。
+        // 海报墙不受影响（外层本来就在 browseStack 上），所以这个 bug 只在
+        // "从动态页 / 收藏页进详情"时暴露（实测反馈："入库的动漫点击没反应"）。
+        // 正确写法是两句一起写：
+        //     browseStack.currentIndex = 1   // 内层：显示详情页
+        //     window.currentPage = 0         // 外层：切回 browseStack 所在的那一层
+        // 之所以赋给 `window.currentPage` 而不是 `pageStack.currentIndex`：
+        // 后者本身是 `currentIndex: window.currentPage` 的绑定，
+        // 直接赋值会**永久断开该绑定**（同类坑见 TimelinePage 里 entries 的注释）。
         StackLayout {
             id: pageStack
             objectName: "pageStack"
@@ -62,6 +87,7 @@ ApplicationWindow {
                 PosterWallPage {
                     id: wallPage
                     onSubjectClicked: function (subjectId) {
+                        detailOriginPage = window.currentPage    // 记住来源页
                         detailPage.load(subjectId)
                         browseStack.currentIndex = 1
                     }
@@ -74,8 +100,11 @@ ApplicationWindow {
                 id: inProgressPage
                 // 在看页「详情」按钮 → 复用海报墙的详情页
                 onSubjectClicked: function (subjectId) {
+                    detailOriginPage = window.currentPage    // 必须在切页**之前**记
                     detailPage.load(subjectId)
                     browseStack.currentIndex = 1
+                    // **必须同时把外层栈切到 browseStack**（见下方踩坑）
+                    window.currentPage = 0
                 }
             }
 
@@ -85,8 +114,15 @@ ApplicationWindow {
                 onSubjectClicked: function (subjectId) {
                     if (subjectId <= 0)
                         return
+                    detailOriginPage = window.currentPage    // 必须在切页**之前**记
                     detailPage.load(subjectId)
                     browseStack.currentIndex = 1
+                    // **必须同时把外层栈切到 browseStack**（见下方踩坑）
+                    window.currentPage = 0
+                }
+                // 未入库的行点不出详情 —— 由页面发提示（"未入库，无法打开详情"）
+                onStatusMessage: function (text) {
+                    statusBar.setMessage(text, 5000)
                 }
             }
 
@@ -159,6 +195,7 @@ ApplicationWindow {
         target: detailPage
         function onBackRequested() {
             browseStack.currentIndex = 0
+            window.currentPage = detailOriginPage   // 回到当初进来的那一页
         }
     }
 
@@ -228,6 +265,7 @@ ApplicationWindow {
         onClicked: {
             // 同上：不调 library.reload()，避免重建全部卡片
             browseStack.currentIndex = 0
+            window.currentPage = detailOriginPage   // 同 onBackRequested
         }
     }
 

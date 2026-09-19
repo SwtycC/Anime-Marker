@@ -10,6 +10,7 @@ import configparser
 from pathlib import Path
 from typing import Any
 
+from app import USER_AGENT
 from app.utils.paths import config_path
 
 DEFAULTS: dict[str, dict[str, str]] = {
@@ -23,8 +24,16 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "username": "",
         "api_base": "https://api.bgm.tv",
         "proxy": "",
-        "user_agent": "AnimeMarker/1.0 (https://github.com/yourname/anime-marker)",
+        "user_agent": USER_AGENT,   # 合规 UA，见 app/__init__.py
         "inprogress_cache_ttl": "300",
+        # 「动态」页集级观看记录的**显示条数上限**（F20）。
+        # 集级接口是每部动漫一次请求（/v0/users/-/collections/{sid}/episodes），
+        # 但**拉几部不用配置**：程序按收藏修改时间从新到旧逐批拉，累计到
+        # N 条就停（实测平均 8.6 条/部，N=40 约 5 部即够；剧场版等 0 条的
+        # 部会被跳过继续往后拉）。抓取部数因此随数据浮动，不是故障。
+        # 0 = 关闭该功能（动态页只剩本地播放记录）。
+        # 设置页用步进 ±5 的加减按钮调整。
+        "ep_timeline_count": "30",
     },
     "qbittorrent": {
         "host": "127.0.0.1",
@@ -62,7 +71,6 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "title_regex": "",
     },
     "ui": {
-        "style": "fusion_dark",
         "poster_width": "200",
         # 初始窗口恰好容纳的列数（QmlApp._fit_window_to_columns 据此反推窗口宽度）
         "poster_columns": "5",

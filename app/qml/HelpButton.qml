@@ -25,7 +25,7 @@ Item {
     Rectangle {
         anchors.fill: parent
         radius: width / 2          // 正圆
-        color: root._hovered ? Theme.hoverFill : "transparent"
+        color: root._hovered ? Theme.hoverFill : Theme.fade(Theme.hoverFill)
         border.width: Theme.lineThin
         border.color: root._hovered ? Theme.accent : Theme.border
 

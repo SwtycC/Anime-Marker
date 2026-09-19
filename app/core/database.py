@@ -20,7 +20,7 @@ from app.utils.paths import database_path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS watch_log (
 );
 
 -- F18：在看列表缓存（离线降级 / 首屏秒开）
+--
+-- 命名遗留：表名/属性名仍带 "inprogress"，但**语义已改为「看过」**
+-- （collect_type = 2）。详见 bridges/inprogress.py 顶部说明。
 CREATE TABLE IF NOT EXISTS inprogress_cache (
     bangumi_id   INTEGER PRIMARY KEY,
     name         TEXT,
@@ -72,8 +75,37 @@ CREATE TABLE IF NOT EXISTS inprogress_cache (
     ep_status    INTEGER,
     total_eps    INTEGER,
     collect_type INTEGER,
-    updated_at   TEXT
+    updated_at   TEXT,   -- **缓存写入时间**（本次拉取的时刻），用于判断缓存新鲜度
+    collection_updated_at TEXT  -- **Bangumi 的收藏最后修改时间**（用户何时看完），
+                                -- 用于「最近 N 部」排序，见 §5.12.11.5
 );
+
+-- F20：Bangumi 集级观看记录（「动态」页的时间线数据源）
+--
+-- 来源：`GET /v0/users/-/collections/{subject_id}/episodes`
+-- 每条对应该用户标记为「看过」的一集，带该集的标记时间。
+--
+-- 为什么要单独一张表（而不是从 inprogress_cache 推）：
+-- `inprogress_cache` 只有**动漫级**的 `updated_at`（最后修改收藏的时间），
+-- 拿不到"第几集是什么时候看的"。而「动态」页要的正是集级粒度
+-- （对应 Bangumi 网页的「看过 ep.5 TV取材 · 5天12小时前」）。
+--
+-- 拉取成本：每部动漫一次请求，因此只对「最近更新的 N 部」拉取
+-- （N 由 `bangumi.ep_timeline_count` 配置，见 §5.12.11.5）。
+CREATE TABLE IF NOT EXISTS watched_episodes (
+    bangumi_ep_id INTEGER PRIMARY KEY,   -- Bangumi 的 episode id
+    subject_id    INTEGER,               -- 本地 subjects.id（可为空，未入库时）
+    bangumi_id    INTEGER,               -- Bangumi 条目 id
+    subject_name  TEXT,                  -- 冗余存名字，避免 JOIN 失败时丢显示
+    ep_index      REAL,                  -- 集序号（sort）
+    ep_name       TEXT,                  -- 集标题
+    watched_at    TEXT                   -- 该集被标记「看过」的时间（ISO）
+);
+
+CREATE INDEX IF NOT EXISTS idx_watched_ep_time
+    ON watched_episodes(watched_at DESC);
+CREATE INDEX IF NOT EXISTS idx_watched_ep_subject
+    ON watched_episodes(bangumi_id);
 
 -- F19：RSS 订阅源
 CREATE TABLE IF NOT EXISTS rss_sources (
@@ -160,6 +192,11 @@ class InProgressItem:
     total_eps: int
     collect_type: int
     updated_at: str
+    # Bangumi 给的最后修改收藏时间（用户何时"看完"）。与 updated_at 不同：
+    # updated_at 是**我们拉取的时刻**（整批相同），本字段逐条不同。
+    # 「最近 N 部」按它排序才有意义，见 bridges/inprogress.py。
+    # 老库迁移后为 NULL，下次拉取补齐。
+    collection_updated_at: Optional[str] = None
     # 运行时填充（不落库）
     local_subject_id: Optional[int] = None
 
@@ -241,6 +278,19 @@ class Database:
             self._conn.execute("ALTER TABLE subjects ADD COLUMN series_name TEXT")
         # v3：subjects.bangumi_id 允许为空（pending 条目无 Bangumi ID）
         # SQLite 无法直接改列约束，旧库保持原样即可（NULL 仍可插入）
+        # v4：inprogress_cache 新增 collection_updated_at（Bangumi 的收藏
+        # 修改时间）。旧库该列为 NULL，下一次拉取会整表重写补齐；
+        # 在此之前排序回落到 updated_at（COALESCE），不会报错。
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(inprogress_cache)")
+        }
+        if "collection_updated_at" not in cols:
+            log.info("迁移：inprogress_cache 增加 collection_updated_at 列")
+            self._conn.execute(
+                "ALTER TABLE inprogress_cache"
+                " ADD COLUMN collection_updated_at TEXT"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -510,7 +560,14 @@ class Database:
 
     # ---------- F18：在看缓存 ----------
     def replace_inprogress_cache(self, items: list[dict]) -> None:
-        """整体替换在看缓存（先清后插，保证与线上一致）。"""
+        """整体替换在看缓存（先清后插，保证与线上一致）。
+
+        **两个时间字段别搞混**（v4 起分列存储）：
+            updated_at            —— 本次写入时刻（整批相同），供 TTL 判断
+            collection_updated_at —— Bangumi 的收藏修改时间（逐条不同），
+                                     供「最近 N 部」排序
+        早期版本只存前者，导致「最近 N 部」实际退化成「按名字排序的前 N 部」。
+        """
         now = _now()
         with self._cursor() as cur:
             cur.execute("DELETE FROM inprogress_cache")
@@ -518,8 +575,9 @@ class Database:
                 """
                 INSERT OR REPLACE INTO inprogress_cache
                     (bangumi_id, name, name_cn, cover_url,
-                     ep_status, total_eps, collect_type, updated_at)
-                VALUES (?,?,?,?,?,?,?,?)
+                     ep_status, total_eps, collect_type, updated_at,
+                     collection_updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
@@ -531,15 +589,42 @@ class Database:
                         int(it.get("total_eps") or 0),
                         int(it.get("collect_type") or 3),
                         now,
+                        it.get("collection_updated_at") or "",
                     )
                     for it in items
                     if it.get("bangumi_id")
                 ],
             )
 
-    def load_inprogress_cache(self) -> list[InProgressItem]:
+    def load_inprogress_cache(
+        self, collect_type: Optional[int] = None
+    ) -> list[InProgressItem]:
+        """按「Bangumi 收藏修改时间」倒序列出。
+
+        `collect_type` 给定时只取该状态（2 = 看过，3 = 在看）。
+        **表里两类都有**：收藏页要 `collect_type=2`（页面标题就是「看过」），
+        动态页的候选则要全部（见 `InProgressBridge`）—— 所以调用方必须
+        按用途明确传参，别默认拿全量。
+
+        排序用 COALESCE 兜住老库迁移后的 NULL/空值（回落到缓存写入时间），
+        这样迁移当天也不会把顺序打乱成"未知"。
+        """
+        where, params = "", ()
+        if collect_type is not None:
+            # COALESCE 兜住迁移前写入的行（collect_type 为 NULL 时按"看过"）
+            where = "WHERE COALESCE(collect_type, 2) = ?"
+            params = (int(collect_type),)
         with self._cursor() as cur:
-            cur.execute("SELECT * FROM inprogress_cache ORDER BY updated_at DESC, name_cn")
+            cur.execute(
+                f"""
+                SELECT * FROM inprogress_cache
+                {where}
+                ORDER BY COALESCE(NULLIF(collection_updated_at, ''), updated_at)
+                         DESC,
+                         name_cn
+                """,
+                params,
+            )
             return [InProgressItem(**dict(r)) for r in cur.fetchall()]
 
     def inprogress_cache_age(self) -> Optional[float]:
@@ -554,6 +639,112 @@ class Database:
             except ValueError:
                 return None
             return (datetime.now(dt.tzinfo) - dt).total_seconds()
+
+    # ---------- F20：集级观看记录 ----------
+    def replace_watched_episodes(self, items: list[dict]) -> None:
+        """整体替换集级观看记录（先清后插，保证与线上一致）。
+
+        入参每项：
+            { "bangumi_ep_id", "bangumi_id", "subject_id",
+              "subject_name", "ep_index", "ep_name", "watched_at" }
+
+        **注意**：入参为空时**不清表**。调用方（`_EpisodeWorker`）在整批
+        请求都失败时会传空列表，此时保留旧数据比清空更合理 —— 否则一次
+        网络抖动就会把用户的时间线抹掉，还得等下一次刷新才能恢复。
+        """
+        rows = [
+            (
+                int(it.get("bangumi_ep_id") or 0),
+                int(it.get("subject_id") or 0),
+                int(it.get("bangumi_id") or 0),
+                it.get("subject_name") or "",
+                float(it.get("ep_index") or 0),
+                it.get("ep_name") or "",
+                it.get("watched_at") or "",
+            )
+            for it in items
+            if it.get("bangumi_ep_id")
+        ]
+        if not rows:
+            # 空结果视为"本次没拉到"，不清表（见上方说明）
+            return
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM watched_episodes")
+            cur.executemany(
+                """
+                INSERT OR REPLACE INTO watched_episodes
+                    (bangumi_ep_id, subject_id, bangumi_id, subject_name,
+                     ep_index, ep_name, watched_at)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                rows,
+            )
+
+    def list_watched_episodes(self, limit: int = 500) -> list[dict]:
+        """按标记时间倒序列出集级观看记录。"""
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT bangumi_ep_id, subject_id, bangumi_id, subject_name,
+                       ep_index, ep_name, watched_at
+                FROM watched_episodes
+                WHERE watched_at IS NOT NULL AND watched_at != ''
+                ORDER BY watched_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def clear_watched_episodes(self) -> None:
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM watched_episodes")
+
+    def trim_watched_episodes(self, limit: int) -> int:
+        """只保留**最近 limit 条**集级记录（按 watched_at 倒序），返回删除行数。
+
+        用途：用户把「集级记录条数」改**小**之后，表里多出来的记录成了脏数据
+        —— 它们会被动态页读到（表现为"改成 5 条后还显示 40 条"）。
+        配置保存时裁一次即可。`limit <= 0` 视为清空。
+
+        **按条数裁而不是按部数裁**：抓取范围是"凑够 N 条即停"算出来的，
+        部数与 N 不再一一对应，只有条数口径稳定（早期按部数裁，
+        与拉取端的名单口径一旦不一致就会误删本次要用的数据）。
+
+        注意：这里只裁剪、不补拉。补拉由配置保存后的 applyEpisodeCount
+        或用户点「刷新」触发。
+        """
+        n = max(0, int(limit))
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM watched_episodes
+                WHERE bangumi_ep_id NOT IN (
+                    SELECT bangumi_ep_id FROM watched_episodes
+                    ORDER BY watched_at DESC LIMIT ?
+                )
+                """,
+                (n,),
+            )
+            return cur.rowcount
+
+    def count_watched_episodes(self) -> int:
+        with self._cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM watched_episodes")
+            return int(cur.fetchone()["n"])
+
+    def watched_episodes_age(self) -> Optional[float]:
+        """集级记录距今秒数（用最新一条的时间戳）；无数据返回 None。"""
+        with self._cursor() as cur:
+            cur.execute("SELECT MAX(watched_at) AS t FROM watched_episodes")
+            row = cur.fetchone()
+            if not row or not row["t"]:
+                return None
+        try:
+            dt = datetime.fromisoformat(row["t"])
+        except ValueError:
+            return None
+        return (datetime.now(dt.tzinfo) - dt).total_seconds()
 
     # ---------- F19：订阅源 ----------
     def add_rss_source(

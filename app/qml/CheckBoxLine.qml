@@ -19,7 +19,8 @@ Item {
         width: 18
         height: 18
         radius: Theme.radiusSm
-        color: root.checked ? Theme.accent : "transparent"
+        // 未勾选时用同色透明：勾选/取消时不再扫过一段深色（见 Theme.fade）
+        color: root.checked ? Theme.accent : Theme.fade(Theme.accent)
         border.width: Theme.lineThin
         border.color: root.checked ? Theme.accent
                     : boxMouse.containsMouse ? Theme.borderStrong

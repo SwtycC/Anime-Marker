@@ -22,7 +22,7 @@ from PySide6.QtCore import QObject, QUrl, Slot
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtWidgets import QApplication
 
-from app import __version__
+from app import USER_AGENT, __version__
 from app.bridges import (
     InProgressBridge, LibraryBridge, MatchBridge, PlayerBridge, RssBridge,
     ScannerBridge, SettingsBridge,
@@ -119,8 +119,11 @@ class QmlApp:
         self.player_bridge = PlayerBridge(self.db, self.config, self.api)
         self.match_bridge = MatchBridge(self.db, self.api)
         self.inprogress_bridge = InProgressBridge(self.db, self.config, self.api)
-        # 在看列表拉取完成后，让 QML 侧的 library.inProgress 重新取数
+        # 收藏列表拉取完成后，让 QML 侧的 library.inProgress 重新取数
         self.inprogress_bridge.set_done_hook(self.library_bridge.reloadInProgress)
+        # 集级观看记录（第二阶段）拉完后，刷新动态页数据源
+        self.inprogress_bridge.set_episode_done_hook(
+            self.library_bridge.reloadWatchedEpisodes)
         self.rss_bridge = RssBridge(self.db)
 
         # 配置保存后重建依赖配置的服务
@@ -140,6 +143,9 @@ class QmlApp:
         self.library_bridge.set_display_mode(
             self.config.get("scanner", "season_display", "flat")
         )
+        # 「集级记录条数」可能被改小 —— 立即裁剪多余的旧记录，
+        # 否则界面仍会显示上一次拉取的更多部内容（见 applyEpisodeCount）
+        self.inprogress_bridge.applyEpisodeCount()
         log.info("配置已应用，服务已重建")
 
     def _on_scan_requested(self) -> None:
@@ -155,9 +161,7 @@ class QmlApp:
             api_base=self.config.get("bangumi", "api_base", "https://api.bgm.tv"),
             proxy=self.config.get("bangumi", "proxy", ""),
             user_agent=self.config.get(
-                "bangumi", "user_agent",
-                "AnimeMarker/1.0 (https://github.com/yourname/anime-marker)",
-            ),
+                "bangumi", "user_agent", USER_AGENT),
         )
 
     # ---------- 启动 ----------
@@ -304,7 +308,7 @@ class QmlApp:
         try:
             self.inprogress_bridge.cancel()
         except Exception as e:  # pragma: no cover - 防御性
-            log.warning("等待在看列表拉取结束失败：%s", e)
+            log.warning("等待收藏/集级拉取结束失败：%s", e)
         try:
             self.db.close()
         except Exception as e:  # pragma: no cover - 防御性

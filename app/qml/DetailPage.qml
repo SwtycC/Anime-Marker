@@ -135,7 +135,8 @@ Item {
                             width: sibLabel.implicitWidth + Theme.spacingMd * 2
                             height: 26
                             radius: Theme.radiusSm
-                            color: sibMouse.containsMouse ? Theme.accentSoft : "transparent"
+                            color: sibMouse.containsMouse ? Theme.accentSoft
+                                                          : Theme.fade(Theme.accentSoft)
                             border.width: Theme.lineThin
                             border.color: sibMouse.containsMouse ? Theme.accent : Theme.border
 
@@ -190,7 +191,8 @@ Item {
 
                                 width: epColumn.width
                                 height: 40
-                                color: epMouse.containsMouse ? Theme.hoverFill : "transparent"
+                                color: epMouse.containsMouse ? Theme.hoverFillStrong
+                                                             : Theme.fade(Theme.hoverFillStrong)
 
                                 Behavior on color { ColorAnimation { duration: Theme.durFast } }
 

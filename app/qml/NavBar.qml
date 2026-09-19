@@ -74,9 +74,10 @@ Item {
                     Rectangle {
                         anchors.fill: parent
                         radius: width / 2
+                        // 静止态用同色透明：用 "transparent"（黑色透明）淡出时会扫过深灰
                         color: btnHost.selected ? Theme.accent
                              : btnHost.hovered  ? Theme.hoverFill
-                             : "transparent"
+                             : Theme.fade(Theme.hoverFill)
 
                         // 选中 / 悬停切换时轻微缩放，增强反馈
                         scale: btnHost.selected ? 1.0

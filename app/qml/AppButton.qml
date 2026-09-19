@@ -38,16 +38,19 @@ Rectangle {
     readonly property color _primaryColor: root.pressed ? Theme.accentPressed
                                          : root.hovered ? Theme.accentHover
                                          : Theme.accent
+    // 静止态的"无色"一律用 Theme.fade(同色)，不要用 "transparent"：
+    // 后者是黑色透明，ColorAnimation 逐分量插值时会先扫过一段深色（见 Theme.fade）
     readonly property color _normalColor: root.pressed ? Theme.pressedFill
                                         : root.hovered ? Theme.hoverFill
-                                        : "transparent"
+                                        : Theme.fade(Theme.hoverFill)
 
     color: root._isPrimary ? _primaryColor
-         : root._isGhost   ? (root.hovered ? Theme.hoverFill : "transparent")
+         : root._isGhost   ? (root.hovered ? Theme.hoverFill
+                                           : Theme.fade(Theme.hoverFill))
          : _normalColor
 
     border.width: root._isGhost ? 0 : Theme.lineThin
-    border.color: root._isPrimary ? "transparent" : Theme.border
+    border.color: root._isPrimary ? Theme.fade(Theme.border) : Theme.border
 
     Behavior on color { ColorAnimation { duration: Theme.durFast } }
     Behavior on border.color { ColorAnimation { duration: Theme.durFast } }

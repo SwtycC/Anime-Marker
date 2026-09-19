@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 ALLOWED_KEYS = {
     # Bangumi
     "bangumi.token", "bangumi.username", "bangumi.api_base", "bangumi.proxy",
+    "bangumi.ep_timeline_count",
     # 路径
     "general.library_path", "general.player_path", "general.ls_path",
     # 启动器
@@ -52,6 +53,7 @@ FALLBACKS: dict[str, str] = {
     "bangumi.username": "",
     "bangumi.api_base": "https://api.bgm.tv",
     "bangumi.proxy": "",
+    "bangumi.ep_timeline_count": "30",
     "general.library_path": "",
     "general.player_path": r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
     "general.ls_path": r"C:\Program Files\Lossless Scaling\LosslessScaling.exe",

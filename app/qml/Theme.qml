@@ -92,6 +92,27 @@ QtObject {
     property color hoverFill:     dark ? "#2A3140" : "#EEF1F6"
     property color pressedFill:   dark ? "#333C4D" : "#E3E8F0"
 
+    // 密集文字列表（动态页的整行）专用的悬停填充：比 hoverFill 深一档。
+    // hoverFill 在白底上几乎分辨不出来 —— 卡片那种大目标够用，
+    // 整行文字列表则显得"没反应"（实测反馈"浅灰不明显"）。
+    property color hoverFillStrong: dark ? "#39414F" : "#CDD3DC"
+
+    /// 取一个颜色的"同色全透明"版本，专供 `Behavior on color` 的淡入淡出用。
+    ///
+    /// **为什么不能用 `"transparent"`**：它是 `rgba(0,0,0,0)` —— **黑色**透明，
+    /// 而 ColorAnimation 对 QColor 是**逐分量插值（含 alpha）**。从
+    /// `rgba(0,0,0,0)` 渐变到 `rgba(238,241,246,255)` 的中间帧，RGB 被黑色
+    /// 拉低、alpha 又没到 1，合成出来会**先扫过一段深灰**再到目标浅色
+    /// （实测：行悬停 t≈0.25 时约 #C8C9CB，用户看到的就是"闪一下中灰再变浅灰"）。
+    ///
+    /// 换成本函数后 RGB 恒定、只有 alpha 在变 → 干净的淡入淡出，
+    /// 且**不依赖元素坐在什么背景上**（不必去查父容器是白底还是页面底色）。
+    ///
+    /// 用法：`color: hovered ? Theme.hoverFillStrong : Theme.fade(Theme.hoverFillStrong)`
+    function fade(color) {
+        return Qt.rgba(color.r, color.g, color.b, 0)
+    }
+
     // ================= 7. 圆角 =================
     // 简约线性：整体取较小圆角，避免"圆润感"
     property int radiusSm: 4      // 小控件：输入框、标签

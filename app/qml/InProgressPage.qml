@@ -105,8 +105,8 @@ Item {
 
                         width: listColumn.width
                         height: 76
-                        color: mouse.containsMouse ? Theme.hoverFill
-                                                   : "transparent"
+                        color: mouse.containsMouse ? Theme.hoverFillStrong
+                                                   : Theme.fade(Theme.hoverFillStrong)
 
                         Behavior on color { ColorAnimation { duration: Theme.durFast } }
 

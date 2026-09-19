@@ -149,8 +149,8 @@ Window {
                     width: resultList.width
                     height: 64
                     color: isSelected ? Theme.accentSoft
-                         : rowMouse.containsMouse ? Theme.hoverFill
-                         : "transparent"
+                         : rowMouse.containsMouse ? Theme.hoverFillStrong
+                         : Theme.fade(Theme.hoverFillStrong)
 
                     Behavior on color { ColorAnimation { duration: Theme.durFast } }
 

@@ -22,6 +22,7 @@ from urllib.parse import quote
 
 from PySide6.QtCore import QObject, Property, Signal, Slot
 
+from app.core.bangumi_api import COLLECT_TYPE_DONE
 from app.core.database import Database, Episode, Subject
 
 log = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ class LibraryBridge(QObject):
     subjectsChanged = Signal()
     episodesChanged = Signal()
     inProgressChanged = Signal()
+    watchedEpsChanged = Signal()
 
     def __init__(self, db: Database, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -68,6 +70,8 @@ class LibraryBridge(QObject):
         self._dirty = True
         self._inprogress_cache: list[dict] = []
         self._inprogress_dirty = True
+        self._eps_cache: list[dict] = []
+        self._eps_dirty = True
 
     # ---------- 配置 ----------
     def set_display_mode(self, mode: str) -> None:
@@ -83,8 +87,10 @@ class LibraryBridge(QObject):
         """标记缓存失效并通知 QML 重新取数。"""
         self._dirty = True
         self._inprogress_dirty = True
+        self._eps_dirty = True
         self.subjectsChanged.emit()
         self.inProgressChanged.emit()
+        self.watchedEpsChanged.emit()
 
     @Slot()
     def reloadInProgress(self) -> None:
@@ -100,12 +106,21 @@ class LibraryBridge(QObject):
         > 命名说明：表名/属性名沿用 F18 的 `inprogress*`，但**语义是「看过」**
         > （`collect_type = 2`）。改名要动整条链路而收益仅是"名字好看"，
         > 故保留并在文档中标注。
+        >
+        > **只取「看过」**：同一张表里还存着「在看」的番（那是给动态页当
+        > 候选用的，见 `InProgressBridge`），本属性显式过滤掉它们 ——
+        > 本页标题就是「看过」，混进正在追的番会改变页面语义。
 
         缓存表字段：bangumi_id / name / name_cn / cover_url /
-        ep_status / total_eps / collect_type / updated_at。
+        ep_status / total_eps / collect_type / updated_at /
+        collection_updated_at。
         这里额外补两个 QML 侧要用的字段：
           - `localSubjectId`：本地是否有对应条目（用于「播放/详情」按钮）
           - `coverUrl`：本地缓存的封面（`cover_path`）优先，否则在线 URL
+
+        **`updatedAt` 对外给的是 `collection_updated_at`**（Bangumi 的收藏
+        修改时间），而不是表里的 `updated_at`（那是缓存写入时刻，整批相同，
+        对界面没有意义）。老库该列为空时回落到缓存写入时间。
         """
         if self._inprogress_dirty:
             self._inprogress_cache = self._load_inprogress()
@@ -114,7 +129,10 @@ class LibraryBridge(QObject):
 
     def _load_inprogress(self) -> list[dict]:
         try:
-            items = self._db.load_inprogress_cache()
+            # 只取「看过」（type=2）：缓存表里还存着「在看」的番，那是给
+            # 动态页当候选用的（见 InProgressBridge）。本页标题就是「看过」，
+            # 混进正在追的番会改变这个页面的语义。
+            items = self._db.load_inprogress_cache(collect_type=COLLECT_TYPE_DONE)
         except Exception as e:
             log.exception("读取在看缓存失败: %s", e)
             return []
@@ -146,18 +164,82 @@ class LibraryBridge(QObject):
                 "totalEps": int(it.total_eps or 0),
                 # 2 = 看过（当前唯一使用的类型，见 InProgressBridge）
                 "collectType": int(it.collect_type or 2),
-                "updatedAt": it.updated_at or "",
+                # 收藏的最后修改时间（见上方说明：不是缓存写入时刻）
+                "updatedAt": it.collection_updated_at or it.updated_at or "",
                 "localSubjectId": local_id,
                 "inLibrary": local_id > 0,
             })
         return out
 
+    # ---------- F20：集级观看记录（动态页时间线）----------
+    @Property("QVariantList", notify=watchedEpsChanged)
+    def watchedEpisodes(self) -> list[dict]:
+        """集级观看记录，按标记时间倒序（动态页 merged 模式的数据源）。
+
+        数据来自 `watched_episodes` 表，由 InProgressBridge 的第二阶段
+        拉取写入（见 §5.12.11.5）。字段与 `timeline()` 对齐，
+        便于动态页复用同一套聚合逻辑。
+        """
+        if self._eps_dirty:
+            self._eps_cache = self._load_watched_eps()
+            self._eps_dirty = False
+        return self._eps_cache
+
+    def _load_watched_eps(self) -> list[dict]:
+        try:
+            rows = self._db.list_watched_episodes(limit=800)
+        except Exception as e:
+            log.exception("读取集级观看记录失败: %s", e)
+            return []
+        out: list[dict] = []
+        for r in rows:
+            # 本地关联：优先用表里存的 subject_id，其次按 bangumi_id 现查
+            local_id = int(r.get("subject_id") or 0)
+            if not local_id:
+                try:
+                    local_id = self._db.find_subject_by_bangumi_id(
+                        int(r.get("bangumi_id") or 0)) or 0
+                except Exception:
+                    pass
+            out.append({
+                "episodeId": int(r.get("bangumi_ep_id") or 0),
+                "subjectId": local_id,
+                "subjectName": r.get("subject_name") or "",
+                "epIndex": float(r.get("ep_index") or 0),
+                "epTitle": r.get("ep_name") or "",
+                "watchedAt": r.get("watched_at") or "",
+                "bangumiId": int(r.get("bangumi_id") or 0),
+                "inLibrary": local_id > 0,
+                "isInProgress": False,   # 复用动态页既有字段
+                "isBangumi": True,        # 标记来源是 Bangumi（非本地播放记录）
+            })
+        return out
+
+    @Slot()
+    def reloadWatchedEpisodes(self) -> None:
+        """标记集级记录缓存失效并通知 QML。"""
+        self._eps_dirty = True
+        self.watchedEpsChanged.emit()
+
+    @Slot(result="QVariantMap")
+    def watchedEpisodesMeta(self) -> dict:
+        """集级记录的元信息（条数 + 数据年龄），页面标题区展示用。"""
+        try:
+            count = self._db.count_watched_episodes()
+        except Exception:
+            return {"count": 0, "ageSeconds": -1}
+        return {"count": count, "ageSeconds": -1}
+
     @Slot(result="QVariantMap")
     def inProgressMeta(self) -> dict:
-        """在看列表的元信息（缓存年龄 + 条数），页面标题区展示用。"""
+        """收藏页的元信息（缓存年龄 + 条数），页面标题区展示用。
+
+        条数只算「看过」—— 与 `inProgress` 的过滤保持一致，
+        否则页头数字会比列表实际条数大（差额是在看的那几部）。
+        """
         try:
             age = self._db.inprogress_cache_age()
-            count = len(self._db.load_inprogress_cache())
+            count = len(self._db.load_inprogress_cache(collect_type=COLLECT_TYPE_DONE))
         except Exception as e:
             log.exception("读取在看缓存元信息失败: %s", e)
             return {"count": 0, "ageSeconds": -1, "stale": True}
