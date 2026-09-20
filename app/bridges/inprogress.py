@@ -1,11 +1,13 @@
 """Bangumi 收藏列表桥接（阶段 7 · F18 的 QML 版本）。
 
-职责：从 Bangumi 拉取「当前用户 · **看过 + 在看**」收藏，写入
+职责：从 Bangumi 拉取「当前用户 · **全部收藏状态**」收藏，写入
 `inprogress_cache`，然后通知 `LibraryBridge` 刷新（QML 侧读 `library.inProgress`）。
 
-> 两类都拉，但两个消费方口径不同：
-> **收藏页只读「看过」**（`library.inProgress` → `collect_type=2`），
-> **动态页的候选是两类之和**（逐集记录主要产生于追番期间）。
+> 一次拉全部状态（**不传 `type`**，见 `BangumiClient.get_user_collections`），
+> 但消费方口径各不相同：
+> **在看页只读「在看」**（`library.inProgress` → `collect_type=3`），
+> **动态页的候选是全部状态**（逐集记录主要产生于追番期间，但看过/搁置的
+> 条目同样可能有逐集标记）。
 
 > **命名说明**：表名、Property 名都还叫 `inprogress*`（沿用 F18 的旧实现），
 > 但**语义已改为「看过」**。之所以不改名，是因为要动 `inprogress_cache` 表、
@@ -20,6 +22,9 @@
    （注意**不是昵称**，详见 `resolveUsername()` 的说明）。
 4. **本地关联**：只按 `bangumi_id` 查本地条目，不做模糊匹配 ——
    关联结果用于「跳详情」按钮，宁可没有也不要指错。
+5. **集级记录增量同步**：一部的逐集记录只在"没同步过 / 收藏变过 /
+   在看 / 超期"时才重新请求，判据集中在 `sync_candidates()`（纯函数）。
+   详见该函数与 `_EpisodeWorker` 的说明。
 """
 
 from __future__ import annotations
@@ -31,20 +36,32 @@ from typing import Optional
 
 import requests
 from requests.adapters import HTTPAdapter
-from PySide6.QtCore import QObject, Property, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Property, QThread, QTimer, Signal, Slot
 
 from app.core.bangumi_api import (
-    COLLECT_TYPE_DOING, COLLECT_TYPE_DONE, BangumiAuthError, BangumiClient,
+    COLLECT_TYPE_DOING, COLLECT_TYPE_DONE, COLLECT_TYPE_DROPPED,
+    COLLECT_TYPE_ON_HOLD, COLLECT_TYPE_WISH, BangumiAuthError, BangumiClient,
     BangumiError,
 )
 from app.core.config import Config
-from app.core.database import Database
+from app.core.database import Database, EpSyncState
 
 log = logging.getLogger(__name__)
 
-# **每类**的拉取上限（看过 / 在看 各算各的）。实测「看过」149 条、
-# 「在看」11 条，600 对个人用户足够，同时避免异常账号把内存打爆。
-MAX_ITEMS = 600
+# 收藏分页上限。**注意口径变了**：以前是"每类各 600"（看过 600 + 在看 600），
+# 现在一次拉全部状态，600 变成**所有状态共用**的额度 —— 触顶会在尾部静默
+# 截断（`iter_user_collections` 会记 warning）。实测本账号 160 条，
+# 2000 对个人用户足够，同时避免异常账号把内存打爆。
+MAX_ITEMS = 2000
+
+# 收藏状态的中文名（只用于日志）。枚举取值见 bangumi_api 的 COLLECT_TYPE_*。
+_COLLECT_TYPE_NAMES = {
+    COLLECT_TYPE_WISH: "想看",
+    COLLECT_TYPE_DONE: "看过",
+    COLLECT_TYPE_DOING: "在看",
+    COLLECT_TYPE_ON_HOLD: "搁置",
+    COLLECT_TYPE_DROPPED: "抛弃",
+}
 
 
 def _collection_time(item: dict) -> str:
@@ -54,10 +71,8 @@ def _collection_time(item: dict) -> str:
     `collection_updated_at` 逐条不同（真正决定"最近看的是哪几部"），
     `updated_at` 是本次拉取时刻（整批相同，只能当兜底）。
 
-    只用于**抓取端的排序**（`_start_episode_fetch`：从最新看过的部开始拉，
-    才可能用最少请求凑够 N 条）。裁剪端（`_trim_only` /
-    `trim_watched_episodes`）按 `watched_at` 条数口径裁 —— 两者不必同键，
-    因为抓取是**整表覆盖写**，裁剪只影响"拉取完成前临时显示什么"。
+    **只用于排序与时间兜底，绝不可用于同步水位比较** —— 兜底值每次都变，
+    会让该部每次刷新都重拉。水位比较用 `sync_key()`。
     """
     return item.get("collection_updated_at") or item.get("updated_at") or ""
 
@@ -75,6 +90,115 @@ def _iso_from_epoch(ts) -> str:
             timespec="seconds")
     except (ValueError, OSError, OverflowError, TypeError):
         return ""
+
+
+# ---- 集级记录的增量同步判定（纯函数，无 DB、无网络）----
+#
+# 这两个函数是整个增量逻辑的**唯一判据**，刻意写成模块级纯函数：
+# 它们能脱离网络和数据库直接验（见 技术文档 的验证章节），
+# 也是"某部为什么每次刷新都重拉"这类问题的第一现场。
+
+def _field(item, name: str, default=None):
+    """兼容两种行形态取值：缓存行是 dataclass（`InProgressItem`），
+    拉取阶段的候选项是 dict（`_FetchWorker` 产出的）。
+
+    纯函数要能被两边复用，又要在测试里能直接喂 dict，所以这里统一入口。
+    """
+    if isinstance(item, dict):
+        return item.get(name, default)
+    return getattr(item, name, default)
+
+
+def sync_key(item) -> tuple[str, int]:
+    """水位比较键：**(原始 collection_updated_at, ep_status)**。
+
+    用 `item` 里的原始字段，**不要走 `_collection_time()`** —— 那个函数在
+    字段缺失时会回落到"本次拉取时刻"，那个值每次都变，会让该部被判成
+    "收藏变了"从而每次刷新都重拉。
+    """
+    return (_field(item, "collection_updated_at") or "",
+            int(_field(item, "ep_status") or 0))
+
+
+# 超期兜底的期限（天）。见 `sync_candidates` 的说明。
+RESYNC_AFTER_DAYS = 30
+
+
+def sync_candidates(
+    collections: list[dict],
+    state: dict[int, EpSyncState],
+    now: Optional[datetime] = None,
+) -> list[tuple[dict, str]]:
+    """挑出**需要重新拉取集级记录**的条目，返回 `[(条目, 原因)]`。
+
+    判定规则（合取的第一项 + 后面任一成立）：
+
+        无水位行                         → "首次"
+        水位.collection_updated_at 变了   → "收藏时间变"
+        水位.ep_status 变了               → "ep_status 变"
+        当前是「在看」                    → "在看"
+        水位.synced_at 超过 30 天          → "超期"
+
+    设计取舍（每条都踩过或差点踩）：
+
+    1. **「在看」永远重拉**：增量依赖"标了集 → 收藏行会变"这个假设。
+       在看番通常只有十几部，全部重拉的成本可忽略，换来"最新动态一定不漏"。
+       这是整套设计里**唯一的兜底假设**。
+    2. **故意没有"该部在 watched_episodes 里一行都没有 → 重拉"这条**：
+       对"请求成功但确实没有逐集标记"的条目（只标了整部状态、剧场版）
+       它会**每次刷新都重拉**，形成死循环。正确做法是"成功就写水位"
+       （含 0 行，那是终态答案），失败不写 → 下次自然重试。
+    3. **没有用 `ep_status > 0` 当门槛**：实测 `ep_status` 与逐集记录条数
+       **不是一回事**（bangumi_id=515594 的 ep_status=16 却只有 11 条记录），
+       它只省十几个请求，却引入一个不可证伪的假设。
+    4. **30 天超期兜底**：覆盖"看过/搁置的番事后补标了几集、而 Bangumi
+       没动整部收藏行"这种漏网情形。150 部摊到每天约 5 个请求。
+    """
+    now = now or datetime.now().astimezone()
+    out: list[tuple[dict, str]] = []
+    for item in collections:
+        bid = int(_field(item, "bangumi_id") or 0)
+        if not bid or not _field(item, "name"):
+            # 没有 bangumi_id 的残行无法请求，跳过（日志由调用方汇总）
+            continue
+        cur = sync_key(item)
+        st = state.get(bid)
+        if st is None:
+            out.append((item, "首次"))
+            continue
+        if st.collection_updated_at != cur[0]:
+            out.append((item, "收藏时间变"))
+            continue
+        if int(st.ep_status or 0) != cur[1]:
+            out.append((item, "ep_status 变"))
+            continue
+        if int(_field(item, "collect_type") or 0) == COLLECT_TYPE_DOING:
+            out.append((item, "在看"))
+            continue
+        synced_at = _parse_iso(st.synced_at)
+        if synced_at is None:
+            out.append((item, "超期"))      # 水位时间不可解析 → 当作超期
+            continue
+        if (now - synced_at).days >= RESYNC_AFTER_DAYS:
+            out.append((item, "超期"))
+    return out
+
+
+def _parse_iso(value: str) -> Optional[datetime]:
+    """ISO 串 → datetime（带时区）；空值/非法返回 None。
+
+    项目里的时间串一律是 `_now()` / `isoformat()` 写出的带偏移格式，
+    但老库里可能有裸格式，故 `fromisoformat` 失败时补一次"按本地时区解释"。
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt
 
 
 class _FetchWorker(QThread):
@@ -124,9 +248,11 @@ class _FetchWorker(QThread):
                 # Token 解析失败 → 用配置里的值兜底
                 username = (self.username or "").strip()
                 if username:
+                    # 失败原因见上一条日志（`get_me` 会分类：401/403 才是 Token 问题，
+                    # 5xx / 连接失败与 Token 无关）。这里不重复猜测原因 ——
+                    # 「填 username 而非昵称」那条提醒已经由 404 分支负责。
                     log.warning(
-                        "Token 无法解析 username，改用配置值：%r"
-                        "（注意：这里要填 username 而非昵称，否则会 404）",
+                        "未能用 Token 解析 username，改用配置值：%r（原因见上一条日志）",
                         username)
 
             if not username:
@@ -134,43 +260,32 @@ class _FetchWorker(QThread):
                     [], "无法确定 Bangumi 用户名，请检查 Token 是否有效")
                 return
 
-            # **拉「看过」+「在看」两类**（都是动画）。
+            # **一次拉全部收藏状态**（subject_type=2 动画 + 不传 type）。
             #
-            # 为什么连「在看」一起拉：动态页要显示"第几集什么时候看的"，
-            # 而**逐集标记恰恰多发生在追番期间** —— 只收看完的番会把最新的
-            # 记录整个过滤掉（实测：用户最近四条 ep 记录全属于在看的新番，
-            # 动态页因此停在几天前，被当成"数据没拉到"反馈过两次）。
+            # 为什么不再分开拉「看过」+「在看」：`collect_type=None` 时
+            # 请求里没有 `type` 参数，官方 API 的语义就是"全部状态"
+            # （想看/在看/看过/搁置/抛弃），一次分页拿全 —— 比原来两次
+            # 调用少一半请求，而且不会再漏掉搁置/抛弃的条目（它们同样可能
+            # 有逐集标记，动态页要用）。
             #
-            # 注意两个"看过"不是一回事：这里筛的是**整部番**的收藏状态，
-            # 单集状态（`/collections/{sid}/episodes` 里每集的 type=2）
-            # 由第二阶段另行筛选。
-            #
-            # 两类都写进 `inprogress_cache`（表里本就有 collect_type 列），
-            # 但**收藏页只读 type=2**（见 LibraryBridge._load_inprogress），
-            # 那个页面的「看过」语义不受影响。
+            # 两个消费方口径不同，都靠 `collect_type` 列区分：
+            # 在看页只读 3（见 LibraryBridge._load_inprogress），
+            # 动态页的候选是全部（再按 sync_candidates 决定拉哪几部）。
             raw = self.api.iter_user_collections(
                 username,
-                collect_type=COLLECT_TYPE_DONE,
+                collect_type=None,
                 max_items=self.max_items,
             )
-            items = [self._to_cache_item(r, COLLECT_TYPE_DONE) for r in raw]
-            log.info("已拉取「看过」收藏 %s 条", len(items))
-
-            # 「在看」失败不算整体失败：拿到看过列表也能正常显示收藏页，
-            # 只是动态页少了一批候选。所以这里单独吞掉异常（AuthError 也吞，
-            # 因为看过那次调用已经能暴露 Token 问题）。
-            try:
-                raw_doing = self.api.iter_user_collections(
-                    username,
-                    collect_type=COLLECT_TYPE_DOING,
-                    max_items=self.max_items,
-                )
-                doing = [self._to_cache_item(r, COLLECT_TYPE_DOING)
-                         for r in raw_doing]
-                log.info("已拉取「在看」收藏 %s 条", len(doing))
-                items.extend(doing)
-            except Exception as e:
-                log.warning("拉取「在看」收藏失败（不影响看过列表）：%s", e)
+            items = [self._to_cache_item(r) for r in raw]
+            # 按状态分组记一条日志 —— 这是"覆盖全部状态"唯一可观测的证据，
+            # 出问题时（比如某种状态全丢了）一眼能看出来
+            dist: dict[int, int] = {}
+            for it in items:
+                dist[int(it.get("collect_type") or 0)] = \
+                    dist.get(int(it.get("collect_type") or 0), 0) + 1
+            log.info("已拉取收藏 %s 条，按状态分布：%s", len(items),
+                     " ".join(f"{_COLLECT_TYPE_NAMES.get(k, k)}={v}"
+                              for k, v in sorted(dist.items())))
 
             self.finished_items.emit(items, "")
         except BangumiAuthError as e:
@@ -192,13 +307,14 @@ class _FetchWorker(QThread):
             self.finished_items.emit([], "拉取失败（详见日志）")
 
     @staticmethod
-    def _to_cache_item(raw: dict, collect_type: int = COLLECT_TYPE_DONE) -> dict:
+    def _to_cache_item(raw: dict) -> dict:
         """把 Bangumi collection 条目转成 `replace_inprogress_cache` 的入参。
 
-        `collect_type` 是**调用方请求的那一类**（2=看过 / 3=在看），用作
-        `type` 字段缺失时的兜底：以"我们请求了什么"为准，而不是赌响应里
-        带没带 `type` —— 万一服务端漏字段，默认值会把「在看」误标成
-        「看过」，直接污染收藏页（那页只读 type=2）。
+        **`collect_type` 只能来自响应里的 `type` 字段**。以前这里有个
+        「调用方请求的那一类」兜底（请求看过就按看过算），现在一次请求
+        拿全部状态，没有"请求的那一类"可退了 —— 缺字段时只能按
+        COLLECT_TYPE_DONE 兜底**并记一条 warning**（会把在看误标成看过，
+        直接影响在看页的过滤，所以必须留痕）。
 
         Bangumi 的返回结构（/v0/users/{u}/collections）：
             { "subject_id": 123, "subject": { "name": ..., "name_cn": ...,
@@ -207,9 +323,10 @@ class _FetchWorker(QThread):
         注意**没有** total_eps 顶层字段，集数在 `subject.eps`。
 
         `updated_at` 是**该收藏的最后修改时间**（ISO 串，逐条不同），
-        必须原样带到 `collection_updated_at` 列 —— 它决定「最近 N 部」
-        选哪几部。早期版本把它丢掉了，排序只能退回"本次拉取时刻"
-        （整批相同），「最近 N 部」实际变成「按名字排序的前 N 部」。
+        必须原样带到 `collection_updated_at` 列 —— 它既决定"最近看的是
+        哪几部"的排序，也是**增量同步的水位依据**（见 sync_key）。
+        早期版本把它丢掉了，排序只能退回"本次拉取时刻"（整批相同），
+        「最近 N 部」实际变成「按名字排序的前 N 部」。
         """
         subject = raw.get("subject") or {}
         images = subject.get("images") or {}
@@ -224,6 +341,13 @@ class _FetchWorker(QThread):
         if not eps and ep_status:
             eps = ep_status
 
+        raw_type = raw.get("type")
+        if raw_type is None:
+            # 见 docstring：一次拉全部状态后这里没有正确的兜底值
+            log.warning("收藏条目 %s（%s）缺少 type 字段，按「看过」处理",
+                        raw.get("subject_id"), subject.get("name_cn")
+                        or subject.get("name"))
+
         return {
             "bangumi_id": raw.get("subject_id") or subject.get("id") or 0,
             "name": subject.get("name") or "",
@@ -231,97 +355,118 @@ class _FetchWorker(QThread):
             "cover_url": cover,
             "ep_status": ep_status,
             "total_eps": eps,
-            # 响应里的 type 优先，缺失时用"调用方请求的那一类"（见 docstring）
-            "collect_type": int(raw.get("type") or collect_type),
-            # 收藏的最后修改时间（ISO 串）——「最近 N 部」的排序依据
+            "collect_type": int(raw_type if raw_type is not None
+                                else COLLECT_TYPE_DONE),
+            # 收藏的最后修改时间（ISO 串）——排序与**增量水位**的依据
             "collection_updated_at": raw.get("updated_at") or "",
         }
 
 
 class _EpisodeWorker(QThread):
-    """并发拉取集级观看记录，**凑够目标条数即停**（F20）。
+    """并发拉取集级观看记录（F20）—— **全量同步 + 按批回传**。
 
     为什么需要并发：集级接口是**每部动漫一次请求**
-    （`/v0/users/-/collections/{sid}/episodes`），串行拉 30 部要好几秒。
-    用线程池 8 并发，30 部约 1~3 秒。
+    （`/v0/users/-/collections/{sid}/episodes`），串行拉 160 部要几十秒。
+    线程池 8 并发，实测 120 个请求约 2 秒。
 
-    **为什么是"凑够即停"而不是"固定拉 N 部"**：设置项只管"动态页显示多少条"，
-    拉几部是**手段**不是目的。一部能产出几条完全取决于用户标记了几集
-    （实测平均 8.6 条/部，但剧场版可能是 0 条），所以事先算不准；
-    按"拉到够为止"办，M=40 时通常 5 部就够 —— 比固定拉 40 部省约 87% 请求。
-    代价是请求数随数据分布浮动，因此 `progress` 报的是**条数**进度
-    （(已凑够条数, 目标条数)）而不是部数进度。
+    **为什么不再"凑够即停"**：`ep_timeline_count` 只管"动态页显示多少条"，
+    而动态页要的是**完整历史** —— 早停会让排在后面的上百部（尤其是"看过"
+    的番，它们按收藏时间排序时排在最近追的番后面）永远拉不到。
+    实测症状：库里有 149 部看过番，`watched_episodes` 却只有 4 部的记录。
+    现在"该不该拉"由 `sync_candidates()` 决定（增量），不看显示条数。
 
-    分批提交（而非一次性把所有部丢进线程池）是早停的前提：
-    只提交当前这批，拉完才知道够不够。
+    **为什么按批发信号**：首次全量约 20 秒，只在结束时发一次会让动态页
+    20 秒白屏。每批（BATCH 部）发一次 `synced`，主线程收一批写一批。
+
+    **worker 不碰数据库**：只负责网络与解析，结果交给主线程写库 ——
+    保持这条边界可以让 SQLite 始终只在主线程被访问，`Database._cursor()`
+    的全局锁也就不必被跨线程争用。
 
     为什么不复用主 `_FetchWorker`：它负责"拉收藏列表"，这是"再拉每部的
     集级明细"，是两阶段任务。拆开还有一个好处 —— 第一阶段失败（列表拿不到）
     时不必进入第二阶段，省掉必然失败的请求。
     """
 
-    finished_eps = Signal(object, str)    # (list[dict], error)
-    progress = Signal(int, int)           # (已凑够条数, 目标条数)
+    finished_eps = Signal(object, str)    # (汇总 dict, error)
+    synced = Signal(object)               # (list[单部结果 dict]，每批一次)
+    progress = Signal(int, int)           # (已完成部数, 总部数)
 
-    # 每批提交的部数由目标条数反推（见 _batch_size）。
-    # 实测每部约 8.6 条标记记录，但**分布很散**（剧场版 1 条、长篇 25 条），
-    # 所以除数取 6 而不是 8.6 —— 留约 40% 余量，让"一轮凑够"成为常态。
-    # 上下限的含义：
-    #   下限 5  —— 批次太小，目标大时要多轮往返（每轮都要等最慢那个请求）
-    #   上限 20 —— 批次太大，早停粒度粗，末批多拉的记录会被截掉（白拉）
-    # 踩坑：① 最初写死 10，实测"目标 40 条"第一批就拉回 10 部（≈86 条），
-    # 多打的请求全被截掉 —— 明明 5 部就够；② 改成"目标 ÷ 8"后，
-    # 目标 40 时首批 5 部只回 38 条（差 2 条），又得多开一轮，
-    # 结果仍是 10 次请求 —— 按平均值卡得太死，反而更亏。
-    @staticmethod
-    def _batch_size(target: int) -> int:
-        return max(5, min(20, (target + 5) // 6))
+    # 每批提交的部数 —— **只决定进度上报与落库的粒度**，不再影响"拉几部"
+    # （以前由目标条数反推是为了早停；现在全量拉，批次与屏幕上的条数无关）。
+    # 10 部 ≈ 1 秒一批，进度够细腻，写库也不会一次写太多。
+    BATCH = 10
 
-    def _next_batch(self, fetched: int, got: int, remaining: int) -> int:
-        """决定下一批拉几部 —— 首轮用静态估计，之后按**实测产出密度**自校准。
-
-        为什么必须自校准：每部产出多少条差异极大（实测同一批里 17 部只回
-        78 条 = 4.6 条/部，而全库平均是 8.6）。静态估计在这种"低产"区
-        会一轮一轮地估多，实测目标 100 条时白拉 34 部（本该 22 部）。
-
-        `fetched` / `got` 都传**累计值**（密度用整体口径，比单批更稳）；
-        密度为 0 时（这批全是没逐集标记的条目）按 0.5 兜底，避免除零，
-        并让批次停在上限附近继续往后找有记录的条目。
-        """
-        if fetched <= 0:
-            return self._batch_size(self.target)
-        density = got / fetched
-        return max(3, min(20, int(remaining / max(density, 0.5)) + 1))
-    # 兜底上限：若最近若干部都是 0 条（剧场版、只标整体状态的番），
-    # "凑够即停"可能一路拉到底，这里限死，避免为一个页面打几百次请求。
-    MAX_SUBJECTS = 200
+    # 兜底上限：防御异常账号（收藏上千部）把请求数与内存打爆。
+    # 正常个人账号远低于此值。
+    MAX_SUBJECTS = 500
 
     def __init__(
         self,
         api: BangumiClient,
-        subjects: list[dict],             # [{bangumi_id, title, local_id}]
-        subject_updated_at: Optional[dict[int, str]] = None,
-        target: int = 30,                 # 目标条数（动态页的显示上限）
+        subjects: list[dict],   # [{bangumi_id, title, local_id, collection_time,
+                                #   collection_updated_at, ep_status}]
         workers: int = 8,
     ) -> None:
         super().__init__()
         self.api = api
         self.subjects = subjects[:self.MAX_SUBJECTS]
         self.workers = max(1, min(workers, 16))
-        self.target = max(1, int(target))
-        # 动漫级收藏的 updated_at（ISO 串）—— 单集时间戳缺失时的兜底，
-        # 见 _fetch_with_session 的说明。
-        self.subject_updated_at = subject_updated_at or {}
-        # 实际发了几部的请求（早停后才知道，供上层在状态栏里说明）
+        # 实际请求了几部（供上层在状态栏里说明）
         self.fetched_subjects = 0
 
     def run(self) -> None:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        planned = len(self.subjects)
+        final: dict[int, dict] = {}       # bangumi_id → 该部**最终**的结果
+        if not self.subjects:
+            self.finished_eps.emit(self._summary(final), "")
+            return
 
-        items: list[dict] = []
-        planned = len(self.subjects)      # 本次最多会碰几部
-        errors = 0
-        no_time = 0
+        try:
+            results = self._sync_batches(self.subjects, planned)
+            final.update({r["bangumi_id"]: r for r in results})
+
+            failed = [r for r in results if not r["ok"]]
+            if failed:
+                # 线程本地 Session 是 max_retries=0（项目惯例：整批失败由外层
+                # 统一处理，不逐条重试），160 个请求下偶发失败几乎必然。
+                # 补跑一轮能明显改善首次全量的完整率 —— 只补一次，不递归。
+                retry_ids = {r["bangumi_id"] for r in failed}
+                retry = [s for s in self.subjects
+                         if int(s["bangumi_id"]) in retry_ids]
+                log.info("集级同步：%s 部失败，补跑一轮", len(retry))
+                results2 = self._sync_batches(retry, planned)
+                final.update({r["bangumi_id"]: r for r in results2})
+        except Exception:
+            log.exception("集级观看记录同步异常")
+            self.finished_eps.emit(self._summary(final),
+                                   "同步集级记录失败（详见日志）")
+            return
+
+        summary = self._summary(final)
+        msg = ""
+        if summary["failed"] and not summary["synced"]:
+            msg = "全部条目的集级记录都拉取失败（可能是网络或 Token 权限）"
+        elif summary["failed"]:
+            msg = (f"{summary['failed']} 部拉取失败（其余成功，"
+                   "下次刷新会自动重试）")
+        if summary["skipped"]:
+            log.warning("有 %s 部返回了原始记录但没有任何可用的逐集记录"
+                        "（未写库、未记水位，下次会重试）", summary["skipped"])
+        if self.fetched_subjects >= self.MAX_SUBJECTS and planned >= self.MAX_SUBJECTS:
+            log.warning("本次同步达到上限 %s 部，剩余条目下次刷新继续",
+                        self.MAX_SUBJECTS)
+        log.info("集级记录同步完成：成功 %s 部 / %s 条，跳过 %s 部，失败 %s 部",
+                 summary["synced"], summary["rows"],
+                 summary["skipped"], summary["failed"])
+        self.finished_eps.emit(summary, msg)
+
+    def _sync_batches(self, subjects: list[dict], planned: int) -> list[dict]:
+        """按批并发拉取，**每批发一次 `synced`**，返回全部单部结果。
+
+        分批提交而不是把所有部一次丢进线程池：这样每批结束就能落库一次，
+        动态页在首次全量的 20 秒里能持续长出记录，而不是最后一起出现。
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         # ---- 每个线程一个独立 Session ----
         #
@@ -332,7 +477,7 @@ class _EpisodeWorker(QThread):
         # 叠加本项目配置的 3 次重试与指数退避，耗时被放大 20 倍以上。
         #
         # 这里为每个线程建一个"精简版" Session：只复制认证与代理配置，
-        # **不带重试适配器**（请求失败由外层统一计入 errors，不必逐条重试）。
+        # **不带重试适配器**（请求失败由上层统一重试/计数，不逐条重试）。
         local = threading.local()
 
         def session_for_thread():
@@ -347,87 +492,110 @@ class _EpisodeWorker(QThread):
                 local.session = s
             return s
 
-        def fetch_one(s: dict) -> list[dict]:
-            bid = s["bangumi_id"]
-            try:
-                rows = self._fetch_with_session(session_for_thread(), bid)
-            except Exception as e:
-                # 单个条目失败不影响整体（网络抖动很常见）
-                log.warning("拉取 %s 集级记录失败: %s", bid, e)
-                raise
-            # 兜底时间：优先用单集自己的时间戳，缺失时退回该动漫收藏级
-            # 的 updated_at（同一部动漫的每集时间都相同，视觉上仍按动漫聚拢）
-            collection_time = self.subject_updated_at.get(int(bid), "")
-            out = []
-            for r in rows:
-                # 只保留"看过"（type=2）。type 枚举与收藏一致。
-                if (r.get("type") or 0) != 2:
-                    continue
-                ep = r.get("episode") or {}
-                watched_at = _iso_from_epoch(r.get("updated_at")) or collection_time
-                if not watched_at:
-                    nonlocal no_time
-                    no_time += 1
-                    continue
-                out.append({
-                    "bangumi_ep_id": int(ep.get("id") or 0),
-                    "bangumi_id": int(bid),
-                    "subject_id": int(s.get("local_id") or 0),
-                    "subject_name": s.get("title") or "",
-                    "ep_index": float(ep.get("sort") or ep.get("ep") or 0),
-                    "ep_name": ep.get("name_cn") or ep.get("name") or "",
-                    "watched_at": watched_at,
-                })
+        results: list[dict] = []
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            for start in range(0, len(subjects), self.BATCH):
+                batch = subjects[start:start + self.BATCH]
+                futures = [pool.submit(self._fetch_one, session_for_thread, s)
+                           for s in batch]
+                batch_out: list[dict] = []
+                for fut in as_completed(futures):
+                    try:
+                        batch_out.append(fut.result())
+                    except Exception:
+                        # `_fetch_one` 内部已把异常转成 ok=False，能到这里
+                        # 说明是它自己出的意外（bug），记全栈别吞
+                        log.exception("集级记录任务异常（不应发生）")
+                self.fetched_subjects += len(batch)
+                results.extend(batch_out)
+                self.synced.emit(batch_out)
+                self.progress.emit(min(self.fetched_subjects, planned), planned)
+        return results
+
+    def _fetch_one(self, session_for_thread, s: dict) -> dict:
+        """拉取**单部**的逐集记录，返回结果字典（异常也转成 ok=False）。
+
+        返回结构（`synced` 信号与主线程写库共用）：
+
+            { "bangumi_id", "ok", "rows", "raw_count", "dropped",
+              "collection_updated_at", "ep_status", "error" }
+
+        `raw_count` 与 `rows` 的差别是**关键的护栏**：`raw_count > 0` 而
+        `rows == 0` 说明服务端返回了记录、但过滤后一条不剩（历史上出现过
+        "`updated_at` 恒为 0 → 整批被丢弃 → 动态页一片空白"的故障）。
+        调用方据此**不写库、不记水位**，下次重试（见 `_on_ep_synced`）。
+
+        `collection_updated_at` / `ep_status` 原样回传给写库方，**不要在
+        写库时再从收藏缓存里查一次** —— 那会让"判断要不要同步"与"写水位"
+        两个口径有机会漂移。
+        """
+        bid = int(s.get("bangumi_id") or 0)
+        out = {
+            "bangumi_id": bid,
+            "ok": False,
+            "rows": [],
+            "raw_count": 0,
+            "dropped": 0,
+            "collection_updated_at": s.get("collection_updated_at") or "",
+            "ep_status": int(s.get("ep_status") or 0),
+            "error": "",
+        }
+        try:
+            raw = self._fetch_with_session(session_for_thread(), bid)
+        except Exception as e:
+            # 单个条目失败不影响整体（网络抖动很常见）
+            log.warning("拉取 %s 集级记录失败: %s", bid, e)
+            out["error"] = str(e)
             return out
 
-        try:
-            with ThreadPoolExecutor(max_workers=self.workers) as pool:
-                idx = 0
-                # 逐批提交，凑够目标条数就停（见类文档）。
-                # 批次大小每轮重算：首轮静态估计，之后按实测密度自校准。
-                while idx < planned and len(items) < self.target:
-                    size = self._next_batch(
-                        idx, len(items), self.target - len(items))
-                    batch = self.subjects[idx:idx + size]
-                    idx += len(batch)
-                    futures = [pool.submit(fetch_one, s) for s in batch]
-                    for fut in as_completed(futures):
-                        try:
-                            items.extend(fut.result())
-                        except Exception:
-                            errors += 1
-                    self.fetched_subjects = idx
-                    self.progress.emit(min(len(items), self.target), self.target)
+        out["raw_count"] = len(raw)
+        # 兜底时间：优先用单集自己的时间戳，缺失时退回该动漫收藏级的
+        # 时间（同一部动漫的每集时间都相同，视觉上仍按动漫聚拢）。
+        # `collection_time` 由上层用 `_collection_time()` 算好传入 ——
+        # 注意那是**排序/兜底**口径，不是水位口径（见 sync_key）。
+        collection_time = s.get("collection_time") or ""
+        rows: list[dict] = []
+        for r in raw:
+            # 只保留"看过"（type=2）。type 枚举与收藏一致。
+            if (r.get("type") or 0) != 2:
+                continue
+            ep = r.get("episode") or {}
+            watched_at = _iso_from_epoch(r.get("updated_at")) or collection_time
+            if not watched_at:
+                continue
+            rows.append({
+                "bangumi_ep_id": int(ep.get("id") or 0),
+                "bangumi_id": bid,
+                "subject_id": int(s.get("local_id") or 0),
+                "subject_name": s.get("title") or "",
+                "ep_index": float(ep.get("sort") or ep.get("ep") or 0),
+                "ep_name": ep.get("name_cn") or ep.get("name") or "",
+                "watched_at": watched_at,
+            })
+        out["rows"] = rows
+        out["dropped"] = len(raw) - len(rows)
+        out["ok"] = True
+        return out
 
-            # 截到目标条数：最后一批是**整批**拉完的，凑够后批内多出来的
-            # 记录要丢掉 —— 保证"页面显示的就是设置的条数"，也免得
-            # 动态页再为这几条弹「另有 X 条未显示」。
-            items.sort(key=lambda it: it.get("watched_at") or "", reverse=True)
-            dropped = max(0, len(items) - self.target)
-            items = items[:self.target]
+    @staticmethod
+    def _summary(final: dict[int, dict]) -> dict:
+        """把"每部的最终结果"汇总成计数（供状态栏文案与日志）。
 
-            msg = ""
-            if errors and errors == self.fetched_subjects:
-                msg = "全部条目的集级记录都拉取失败（可能是网络或 Token 权限）"
-            elif errors:
-                msg = f"{errors}/{self.fetched_subjects} 个条目拉取失败（其余成功）"
-            if dropped:
-                log.info("已凑够 %s 条，末批多拉的 %s 条丢弃", self.target, dropped)
-            if self.fetched_subjects >= self.MAX_SUBJECTS and len(items) < self.target:
-                # 正常不该发生（除非大量条目只标了整体状态、没有逐集标记）
-                log.warning("拉满 %s 部仍只凑到 %s/%s 条，已停止",
-                            self.MAX_SUBJECTS, len(items), self.target)
-            if no_time:
-                # 拿不到时间的记录会被丢弃（时间线必须有时间才排得动）。
-                # 正常不该出现（有收藏级 updated_at 兜底），出现即说明
-                # 收藏缓存里的 updated_at 也是空的，值得记一笔。
-                log.warning("有 %s 条集级记录缺少时间，已跳过", no_time)
-            log.info("集级记录拉取完成：%s 条（实际请求 %s 部）",
-                     len(items), self.fetched_subjects)
-            self.finished_eps.emit(items, msg)
-        except Exception:
-            log.exception("集级观看记录拉取异常")
-            self.finished_eps.emit([], "拉取集级记录失败（详见日志）")
+        三类口径：
+        - `synced`  —— 成功且可写库（含"成功但没有记录"的终态）
+        - `skipped` —— 服务端返回了记录但过滤后一条不剩（不写库、不记水位）
+        - `failed`  —— 请求失败（不写库、不记水位）
+        """
+        summary = {"synced": 0, "rows": 0, "skipped": 0, "failed": 0}
+        for r in final.values():
+            if not r["ok"]:
+                summary["failed"] += 1
+            elif r["raw_count"] and not r["rows"]:
+                summary["skipped"] += 1
+            else:
+                summary["synced"] += 1
+                summary["rows"] += len(r["rows"])
+        return summary
 
     def _fetch_with_session(self, session, subject_id: int) -> list[dict]:
         """用指定 Session 拉某条目的逐集收藏（线程安全版）。
@@ -497,6 +665,9 @@ class InProgressBridge(QObject):
         self._running = False
         self._worker: Optional[_FetchWorker] = None
         self._ep_worker: Optional[_EpisodeWorker] = None
+        # 界面刷新节流：首次全量会写十几批，合并到最多 1 次/秒
+        # （见 _schedule_ui_refresh）
+        self._ui_refresh_pending = False
         # 拉取成功后由 QmlApp 接上，用来刷新 QML 的 library.inProgress
         self._done_hook = None
         # 集级记录拉完后额外通知（让动态页重算）
@@ -582,118 +753,190 @@ class InProgressBridge(QObject):
         # ---- 第二阶段：拉「最近 N 部」的集级观看记录 ----
         self._start_episode_fetch(items)
 
-    def _start_episode_fetch(self, collections: list[dict]) -> None:
-        """拉取集级观看记录，**凑够「集级记录条数」即停**（F20）。
+    def _start_episode_fetch(self, collections: list) -> None:
+        """**增量**同步集级观看记录（F20）。
 
-        配置 `bangumi.ep_timeline_count` 现在只管"动态页显示多少条"（M）。
-        **拉几部由 `_EpisodeWorker` 按需决定**：按收藏修改时间从新到旧逐批拉，
-        累计到 M 条就停。理由见 `_EpisodeWorker` 的类文档 —— 一部产出几条
-        取决于用户标记了几集，事先算不准，平均 8.6 条/部（M=40 约 5 部即够）。
+        与旧版的区别（一句话）：**该拉哪几部由 `sync_candidates()` 决定，
+        不再由"动态页显示多少条"决定**。旧版按收藏时间从新到旧拉、凑够
+        `ep_timeline_count` 条就停，导致排在后面的上百部（尤其"看过"的番）
+        永远拉不到 —— 实测 149 部看过番只有 4 部留下了逐集记录。
 
-        M <= 0 时**跳过**这一步（用户想省流量时可用）。
+        `ep_timeline_count` 现在**只管显示**（首屏条数 + 加载更多的页大小），
+        与拉取无关；`<= 0` 时跳过同步（用户关闭了集级记录，见 applyEpisodeCount）。
 
-        排序依据：收藏接口给的 `updated_at`（已存进
-        `inprogress_cache.collection_updated_at`）就是该收藏的最后修改时间，
-        按它倒序即可，无需额外请求。
+        排序：仍按收藏修改时间倒序，这样**分批落库时最新的记录先出现**，
+        用户在首次全量的十几秒里能立刻看到最近的内容。
+        截断（MAX_SUBJECTS）**必须在过滤之后**，否则排在尾部、需要同步的
+        条目会被永久饿死（每次刷新都从头截同一批）。
         """
         try:
-            target = self._config.getint("bangumi", "ep_timeline_count", 30)
+            n = self._config.getint("bangumi", "ep_timeline_count", 30)
         except Exception:
-            target = 30
-        if target <= 0:
-            log.info("集级时间线已关闭（ep_timeline_count=0），跳过")
+            n = 30
+        if n <= 0:
+            log.info("集级时间线已关闭（ep_timeline_count=0），跳过同步")
             self.message.emit("集级时间线已关闭")
             return
 
-        # collections 已按收藏修改时间倒序（load_inprogress_cache 的顺序），
-        # 这里再显式排一次，避免上游顺序变化导致静默失效。
-        # **不预截断部数** —— 拉几部由 worker 按"凑够 M 条"决定，
-        # 预截断会让"设置 40 条"在平均 8.6 条/部时只够 344 条里的一小截。
         ordered = sorted(collections, key=_collection_time, reverse=True)
+        try:
+            state = self._db.load_ep_sync_state()
+        except Exception as e:
+            log.exception("读取同步水位失败: %s", e)
+            state = {}
+
+        cands = sync_candidates(ordered, state)
+        if not cands:
+            log.info("集级记录已是最新，无需同步（候选 %s 部）", len(collections))
+            self.message.emit("集级观看记录已是最新")
+            return
+
+        # 本地关联：一次建映射，别在循环里逐部查库（160 次 SELECT）
+        try:
+            local_map = {s.bangumi_id: s.id for s in self._db.list_subjects()
+                         if s.bangumi_id}
+        except Exception as e:
+            log.exception("读取本地条目失败（本地关联将为空）: %s", e)
+            local_map = {}
 
         subjects = [
             {
-                "bangumi_id": int(c.get("bangumi_id") or 0),
-                "title": c.get("name_cn") or c.get("name") or "",
-                "local_id": self._db.find_subject_by_bangumi_id(
-                    int(c.get("bangumi_id") or 0)) or 0,
+                "bangumi_id": int(_field(c, "bangumi_id") or 0),
+                "title": _field(c, "name_cn") or _field(c, "name") or "",
+                "local_id": local_map.get(int(_field(c, "bangumi_id") or 0), 0),
+                # 单集时间戳的兜底：集级接口的 `updated_at` 历史上出现过恒为 0
+                # （字段存在但无值，见 _fetch_with_session 的说明），此时用该
+                # 动漫**收藏的最后修改时间**兜底，否则整批记录都会因为"没有
+                # 时间"被丢弃。用收藏时间而不是"本次拉取时刻"：同一部的每集
+                # 拿到同一个时间（视觉上仍按动漫聚拢），且那是用户真的看完
+                # 那部的日子。
+                "collection_time": _collection_time(c),
+                # 水位口径的原始值（**不是** collection_time，见 sync_key）
+                "collection_updated_at": _field(c, "collection_updated_at") or "",
+                "ep_status": int(_field(c, "ep_status") or 0),
             }
-            for c in ordered
-            if c.get("bangumi_id")
+            for c, _reason in cands
+            if _field(c, "bangumi_id")
         ]
         if not subjects:
-            log.info("没有可用于拉取集级记录的条目")
+            log.info("没有可用于同步集级记录的条目")
             return
 
-        log.info("开始拉取集级观看记录：目标 %s 条（候选 %s 部，按需拉取）",
-                 target, len(subjects))
-        self.message.emit(f"正在拉取集级观看记录（目标 {target} 条）…")
+        planned = len(subjects)
+        trimmed = planned > _EpisodeWorker.MAX_SUBJECTS
+        subjects = subjects[:_EpisodeWorker.MAX_SUBJECTS]
+        dist: dict[str, int] = {}
+        for _c, reason in cands:
+            dist[reason] = dist.get(reason, 0) + 1
+        log.info("开始同步集级记录：需同步 %s 部（%s）%s",
+                 planned,
+                 " ".join(f"{k} {v}" for k, v in sorted(dist.items())),
+                 f"，本次先做 {len(subjects)} 部" if trimmed else "")
+        self.message.emit(f"正在同步集级记录（{len(subjects)} 部）…")
         self._set_running(True)
 
-        # 单集时间戳的兜底：集级接口的 `updated_at` 历史上出现过恒为 0
-        # （字段存在但无值，见 _fetch_with_session 的说明），此时用该动漫
-        # **收藏的最后修改时间**兜底，否则整批记录都会因为"没有时间"被丢弃
-        # —— 早于本修复的版本就是因此出现「改了 N 之后一条都不显示」。
-        #
-        # 用收藏时间而不是"本次拉取时刻"：同一部的每集都会拿到同一个时间
-        # （视觉上仍按动漫聚拢），且这个时间是用户真的看完那部的日子。
-        # 早期用拉取时刻，导致动态页所有兜底记录都显示成"刚刚"。
-        fallback = {
-            int(c.get("bangumi_id") or 0): _collection_time(c)
-            for c in ordered
-            if c.get("bangumi_id")
-        }
-        self._ep_worker = _EpisodeWorker(
-            self._api, subjects, fallback, target=target)
+        self._ep_worker = _EpisodeWorker(self._api, subjects)
         self._ep_worker.progress.connect(self._on_ep_progress)
+        self._ep_worker.synced.connect(self._on_ep_synced)
         self._ep_worker.finished_eps.connect(self._on_ep_finished)
         self._ep_worker.finished.connect(self._ep_worker.deleteLater)
         self._ep_worker.start()
 
     def _on_ep_progress(self, done: int, total: int) -> None:
-        """进度是**条数**（不是部数）：拉几部由数据决定，条数才是用户关心的。"""
+        """进度是**部数**。全量同步的每一步都是"又搞定了一部"，
+        报部数才对得上用户的直观感受（旧版报条数是因为当时按条数早停）。"""
         # 只在整数百分比变化时报一次，避免刷屏
         if total and (done == total or done % max(1, total // 10) == 0):
-            self.message.emit(f"拉取集级记录… {done}/{total} 条")
+            self.message.emit(f"正在同步集级记录… {done}/{total} 部")
 
-    def _on_ep_finished(self, items: list, error: str) -> None:
-        self._set_running(False)
+    @Slot(object)
+    def _on_ep_synced(self, batch: list) -> None:
+        """收到**一批**单部结果就落库（不必等全部拉完）。
 
-        if error and not items:
-            log.warning("集级记录拉取失败: %s", error)
-            self.failed.emit(error)
+        这里是与旧版最大的行为差别：旧版整表覆盖写在最后一次性完成，
+        首次全量的十几秒里动态页一直是旧的。现在每批 10 部就写一次。
+
+        三条分支（护栏的实现在这里，不在 worker）：
+        - `ok=False`             → 不写、不记水位，下次刷新自动重试
+        - `raw_count>0, rows=0`  → 服务端给了记录但过滤后一条不剩（历史故障：
+                                   `updated_at` 恒为 0 → 整批被弃 → 页面空白）。
+                                   **不写、不记水位**，下次重试。
+        - 其余（含"成功且确实 0 条"）→ 写库 + 记水位，那是终态。
+        """
+        written = 0
+        for r in batch or []:
+            try:
+                if not r.get("ok"):
+                    continue
+                if r.get("raw_count") and not r.get("rows"):
+                    log.warning(
+                        "条目 %s 返回 %s 条原始记录但没有可用的逐集记录，"
+                        "本次不写库、不记水位（下次重试）",
+                        r.get("bangumi_id"), r.get("raw_count"))
+                    continue
+                self._db.replace_subject_watched_episodes(
+                    int(r["bangumi_id"]),
+                    r.get("rows") or [],
+                    r.get("collection_updated_at") or "",
+                    int(r.get("ep_status") or 0),
+                )
+                written += 1
+            except Exception:
+                # 一部写库失败不该中断其余条目；也不该杀掉槽函数
+                log.exception("写入条目 %s 的集级记录失败", r.get("bangumi_id"))
+        if written:
+            self._schedule_ui_refresh()
+
+    def _schedule_ui_refresh(self) -> None:
+        """把"写库完成 → 通知界面"合并到最多 1 次/秒。
+
+        首次全量会写十几批，每批都 `reloadWatchedEpisodes()` 会让 QML 反复
+        重建列表；节流后用户看到的仍是"持续长出新记录"，只是不抖。
+        """
+        if self._ui_refresh_pending:
             return
+        self._ui_refresh_pending = True
+        QTimer.singleShot(1000, self._flush_ui_refresh)
 
-        try:
-            self._db.replace_watched_episodes(items)
-        except Exception as e:
-            log.exception("写入集级记录失败: %s", e)
-            self.failed.emit(f"写入集级记录失败：{e}")
-            return
+    def _flush_ui_refresh(self) -> None:
+        self._ui_refresh_pending = False
+        self._refresh_ep_view()
 
-        # 实际请求了几部 —— 抓取范围现在是自动的，报出来用户才知道
-        # "设了 40 条为什么只请求了 5 次"（不是故障，是凑够就停）
-        try:
-            fetched = int(self._ep_worker.fetched_subjects) if self._ep_worker else 0
-        except RuntimeError:
-            fetched = 0        # C++ 对象已被 deleteLater 销毁（线程早已结束）
-
-        log.info("集级观看记录已更新：%s 条（来自 %s 部）", len(items), fetched)
+    def _refresh_ep_view(self) -> None:
         if self._ep_done_hook is not None:
             try:
                 self._ep_done_hook()
             except Exception:
                 log.exception("刷新集级观看记录失败")
 
-        # 文案用"请求 N 部"而不是"N 部"：截取后真正贡献这 N 条的部数
-        # 通常更少（末批多拉的会被丢掉），说"请求"才不引起歧义
-        if error:
-            # 部分失败：数据已写入，只提示
-            self.message.emit(
-                f"集级记录部分完成（{len(items)} 条，请求 {fetched} 部）：{error}")
-        else:
-            self.message.emit(
-                f"集级观看记录已更新（{len(items)} 条，请求 {fetched} 部）")
+    def _on_ep_finished(self, summary: dict, error: str) -> None:
+        """同步收尾。数据已在 `_on_ep_synced` 里逐批落库，这里只做汇总与提示。"""
+        self._set_running(False)
+
+        summary = summary or {}
+        synced = int(summary.get("synced") or 0)
+        rows = int(summary.get("rows") or 0)
+        failed = int(summary.get("failed") or 0)
+        skipped = int(summary.get("skipped") or 0)
+
+        if summary and not synced and failed:
+            # 全军覆没才算失败（此时一条都没写进去）
+            log.warning("集级记录同步失败: %s", error)
+            self.failed.emit(error)
+            return
+
+        # 结束时强制刷一次，保证节流窗口内最后那批也上屏
+        self._ui_refresh_pending = False
+        self._refresh_ep_view()
+
+        log.info("集级记录同步收尾：成功 %s 部 / %s 条，跳过 %s 部，失败 %s 部",
+                 synced, rows, skipped, failed)
+        parts = [f"成功 {synced} 部 / {rows} 条"]
+        if skipped:
+            parts.append(f"跳过 {skipped} 部")
+        if failed:
+            parts.append(f"失败 {failed} 部")
+        self.message.emit("集级观看记录已同步（" + "，".join(parts) + "）")
 
     def _refresh_library(self) -> None:
         if self._done_hook is not None:
@@ -756,99 +999,65 @@ class InProgressBridge(QObject):
     # ---------- 配置变更 ----------
     @Slot()
     def applyEpisodeCount(self) -> None:
-        """配置保存后调用：按新的「集级记录条数」（M 条）重建集级记录。
+        """配置保存后调用：`ep_timeline_count` 变了，通知界面重算显示。
 
-        **为什么需要它**：`watched_episodes` 表是**整体替换**的。
-        用户改了 M 之后，表里的旧数据既可能**过多**（改小后仍显示原来的条数），
-        也可能**过少/为空**（改大后不够显示）。
+        **这里既不拉取、也不裁剪数据表** —— 与旧版最大的差别：
 
-        只裁剪是不够的 —— 早期实现按"最近 N 部"裁，遇到刚更新收藏但还没
-        逐集标记的条目，裁剪后表会变成空的，用户看到空白会以为功能坏了。
-        因此这里**直接重新拉取**（若已有收藏缓存），一次到位。
+        - **不拉取**：该配置现在只管"动态页显示多少条"，与"要同步哪几部"
+          彻底解耦（同步范围由 `sync_candidates()` 决定）。旧版在这里重新
+          拉取，于是**保存任意设置**（哪怕改的是主题色）都会触发一轮
+          上百个请求的全量同步。
+        - **不裁剪**：表里要保留**完整历史**。调小显示条数只是少显示几条，
+          而不是把数据删掉 —— 删了再调大又得重新联网拉一遍。
+          （被截掉的条数会由 QML 的「加载更多」提示体现。）
 
-        M=0 时清空并跳过拉取（等于关闭该功能）。
-        没有收藏缓存时不拉（避免无谓请求），只清空并提示先刷新。
+        QML 侧 `epLimit()` 每次都现读这个值并重新 slice，所以这里只要
+        通知界面重算即可。
         """
         try:
             n = self._config.getint("bangumi", "ep_timeline_count", 30)
         except Exception:
             n = 30
-
-        # N=0：关闭功能，清空即可
+        log.info("动态页显示条数改为 %s 条（同步范围不受影响，数据保留）", n)
+        self._refresh_ep_view()
         if n <= 0:
-            try:
-                self._db.clear_watched_episodes()
-                log.info("集级时间线已关闭，清空已有记录")
-            except Exception as e:
-                log.exception("清空集级记录失败: %s", e)
-                return
-            self._after_change()
-            self.message.emit("集级时间线已关闭")
-            return
+            self.message.emit("集级时间线已关闭（下次刷新起不再同步）")
 
-        # 没有收藏缓存 → 先裁剪（清掉越界数据）并提示用户刷新
-        try:
-            rows = self._db.load_inprogress_cache()
-        except Exception as e:
-            log.exception("读取收藏缓存失败: %s", e)
-            return
+    @Slot(result=bool)
+    def epSyncNeeded(self) -> bool:
+        """是否从未同步过集级记录（供动态页决定要不要提示"首次同步"）。
 
-        if not rows:
-            try:
-                self._db.clear_watched_episodes()
-            except Exception:
-                pass
-            self._after_change()
-            self.message.emit("尚无收藏缓存，请先点「刷新」拉取")
-            return
-
-        # 有缓存 → 直接按新的 M 重新拉取（覆盖式写入，天然处理多与少）
-        if self._running:
-            log.info("拉取进行中，配置变更将在本次完成后生效")
-            # 先裁剪，避免本次拉取完成前界面仍显示越界数据
-            self._trim_only(n)
-            return
-
-        log.info("集级记录条数改为 %s 条，开始重新拉取", n)
-        self._trim_only(n)                 # 先清掉越界的，界面立刻正确
-        self._start_episode_fetch(
-            [self._cache_row_to_dict(r) for r in rows])
-
-    @staticmethod
-    def _cache_row_to_dict(row) -> dict:
-        """InProgressItem → `_start_episode_fetch` 需要的 dict 形态。"""
-        return {
-            "bangumi_id": int(row.bangumi_id or 0),
-            "name": row.name or "",
-            "name_cn": row.name_cn or "",
-            "updated_at": row.updated_at or "",
-            "collection_updated_at": getattr(row, "collection_updated_at", None) or "",
-        }
-
-    def _trim_only(self, n: int) -> None:
-        """把表裁到最近 n 条（不联网），让界面立刻不再显示越界数据。
-
-        **按"条数"裁而不是按"部数"裁**：抓取范围已改成"凑够 N 条即停"，
-        部数与 N 不再有一一对应关系，只有条数口径是稳定的。
-        早先按部数裁时，裁剪保留的名单与重新拉取的名单一旦对不上，
-        就等于在拉取前先删掉本次要用的数据（实测表现：改完 N 后一条都不显示）。
+        "有收藏缓存但一条水位都没有"= 首次运行这套增量逻辑。
         """
         try:
-            removed = self._db.trim_watched_episodes(n)
+            if self._db.count_ep_sync_state() > 0:
+                return False
+            return bool(self._db.load_inprogress_cache())
         except Exception as e:
-            log.exception("裁剪集级记录失败: %s", e)
-            return
-        if removed:
-            log.info("已裁剪 %s 条越界的集级记录", removed)
-        self._after_change()
+            log.exception("判断是否需要首次同步失败: %s", e)
+            return False
 
-    def _after_change(self) -> None:
-        """通知界面刷新（配置变更后立即生效）。"""
-        if self._ep_done_hook is not None:
-            try:
-                self._ep_done_hook()
-            except Exception:
-                log.exception("刷新集级观看记录失败")
+    @Slot()
+    def resyncAll(self) -> None:
+        """清空同步水位并重跑一次（"重建完整观看记录"的手动入口）。
+
+        什么时候需要：怀疑某部记录缺了、或从旧版本升级上来想强制重建。
+        清水位会让所有条目被判成"首次"，因此下一次刷新会全量重拉一遍
+        （与首次安装同量级，约十几秒）。
+        """
+        if self._running:
+            log.info("正在拉取，忽略重建请求")
+            self.message.emit("正在同步中，请稍后再试")
+            return
+        try:
+            self._db.clear_ep_sync_state()
+            log.info("已清空集级记录同步水位，下次刷新将全量重拉")
+        except Exception as e:
+            log.exception("清空同步水位失败: %s", e)
+            self.message.emit(f"重建失败：{e}")
+            return
+        self.message.emit("已重置同步记录，开始全量重新同步…")
+        self.refresh()
 
     # ---------- 清理 ----------
     @Slot()

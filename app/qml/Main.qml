@@ -98,13 +98,17 @@ ApplicationWindow {
 
             InProgressPage {
                 id: inProgressPage
-                // 在看页「详情」按钮 → 复用海报墙的详情页
+                // 在看页「详情」按钮 / 整行点击 → 复用海报墙的详情页
                 onSubjectClicked: function (subjectId) {
                     detailOriginPage = window.currentPage    // 必须在切页**之前**记
                     detailPage.load(subjectId)
                     browseStack.currentIndex = 1
                     // **必须同时把外层栈切到 browseStack**（见下方踩坑）
                     window.currentPage = 0
+                }
+                // 未入库的行点不出详情 —— 由页面发提示
+                onStatusMessage: function (text) {
+                    statusBar.setMessage(text, 5000)
                 }
             }
 

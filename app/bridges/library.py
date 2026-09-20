@@ -22,7 +22,7 @@ from urllib.parse import quote
 
 from PySide6.QtCore import QObject, Property, Signal, Slot
 
-from app.core.bangumi_api import COLLECT_TYPE_DONE
+from app.core.bangumi_api import COLLECT_TYPE_DOING
 from app.core.database import Database, Episode, Subject
 
 log = logging.getLogger(__name__)
@@ -101,15 +101,15 @@ class LibraryBridge(QObject):
     # ---------- Bangumi 收藏列表（阶段 7）----------
     @Property("QVariantList", notify=inProgressChanged)
     def inProgress(self) -> list[dict]:
-        """Bangumi「看过」收藏（来自 `inprogress_cache`，由 InProgressBridge 写入）。
+        """Bangumi「在看」收藏（来自 `inprogress_cache`，由 InProgressBridge 写入）。
 
-        > 命名说明：表名/属性名沿用 F18 的 `inprogress*`，但**语义是「看过」**
-        > （`collect_type = 2`）。改名要动整条链路而收益仅是"名字好看"，
-        > 故保留并在文档中标注。
+        > 命名说明：表名/属性名一直是 F18 的 `inprogress*`，**语义从一开始就是
+        > 「在看」**，中途一度改成「看过」，现在改回本意（`collect_type = 3`）——
+        > 导航栏那一项也一直写着「在看」。
         >
-        > **只取「看过」**：同一张表里还存着「在看」的番（那是给动态页当
-        > 候选用的，见 `InProgressBridge`），本属性显式过滤掉它们 ——
-        > 本页标题就是「看过」，混进正在追的番会改变页面语义。
+        > **只取「在看」**：同一张表里还存着「看过」的番（那是给动态页当候选
+        > 用的，见 `InProgressBridge`）。「看过」往往上百部，堆在本页既长又
+        > 没用；它们的时间线在「动态」页里更合适。
 
         缓存表字段：bangumi_id / name / name_cn / cover_url /
         ep_status / total_eps / collect_type / updated_at /
@@ -129,10 +129,10 @@ class LibraryBridge(QObject):
 
     def _load_inprogress(self) -> list[dict]:
         try:
-            # 只取「看过」（type=2）：缓存表里还存着「在看」的番，那是给
-            # 动态页当候选用的（见 InProgressBridge）。本页标题就是「看过」，
-            # 混进正在追的番会改变这个页面的语义。
-            items = self._db.load_inprogress_cache(collect_type=COLLECT_TYPE_DONE)
+            # 只取「在看」（type=3）：缓存表里两类都存着（「看过」是给动态页
+            # 当候选用的，见 InProgressBridge），本页显式过滤 —— 页面语义是
+            # "我正在追的番"，与导航栏标签一致。
+            items = self._db.load_inprogress_cache(collect_type=COLLECT_TYPE_DOING)
         except Exception as e:
             log.exception("读取在看缓存失败: %s", e)
             return []
@@ -187,7 +187,9 @@ class LibraryBridge(QObject):
 
     def _load_watched_eps(self) -> list[dict]:
         try:
-            rows = self._db.list_watched_episodes(limit=800)
+            # 上限 5000：全量同步后本表约 1000+ 条（旧上限 800 会截断历史）。
+            # 动态页的"加载更多"在 QML 侧切片，所以这里一次给全。
+            rows = self._db.list_watched_episodes(limit=5000)
         except Exception as e:
             log.exception("读取集级观看记录失败: %s", e)
             return []
@@ -234,12 +236,12 @@ class LibraryBridge(QObject):
     def inProgressMeta(self) -> dict:
         """收藏页的元信息（缓存年龄 + 条数），页面标题区展示用。
 
-        条数只算「看过」—— 与 `inProgress` 的过滤保持一致，
-        否则页头数字会比列表实际条数大（差额是在看的那几部）。
+        条数只算「在看」—— 与 `inProgress` 的过滤保持一致，
+        否则页头数字会比列表实际条数大（差额是"看过"的那批，上百部）。
         """
         try:
             age = self._db.inprogress_cache_age()
-            count = len(self._db.load_inprogress_cache(collect_type=COLLECT_TYPE_DONE))
+            count = len(self._db.load_inprogress_cache(collect_type=COLLECT_TYPE_DOING))
         except Exception as e:
             log.exception("读取在看缓存元信息失败: %s", e)
             return {"count": 0, "ageSeconds": -1, "stale": True}

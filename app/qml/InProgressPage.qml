@@ -1,7 +1,10 @@
 import QtQuick
 import QtQuick.Controls
 
-// 收藏页（阶段 7）：Bangumi「动画 · 看过」列表 + 本地关联。
+// 在看页（阶段 7）：Bangumi「动画 · 在看」列表 + 本地关联。
+//
+// 页面语义是"我正在追的番"（导航栏那一项也写着「在看」）。
+// 「看过」的番不在这里 —— 它们数量多（实测 149 部），时间线在「动态」页更合适。
 //
 // 数据来源：`library.inProgress`（读本地缓存表 inprogress_cache）。
 // 拉取动作由 `inprogress.refresh()` 触发（QThread + 信号），
@@ -23,6 +26,9 @@ Item {
                         ? inprogress.running : false
 
     signal subjectClicked(int subjectId)
+
+    /// 未入库的行点不出详情 —— 由页面发提示（Main.qml 接到状态栏）
+    signal statusMessage(string text)
 
     Flickable {
         id: flick
@@ -57,7 +63,7 @@ Item {
                     spacing: 2
 
                     Text {
-                        text: "看过"
+                        text: "在看"
                         color: Theme.textPrimary
                         font.pixelSize: Theme.fontXl
                         font.weight: Font.DemiBold
@@ -243,9 +249,17 @@ Item {
                             hoverEnabled: true
                             // 让「详情」按钮优先接收点击，避免被整行吃掉
                             propagateComposedEvents: true
+                            // 未入库的行没有本地详情可开，光标明确提示不可点
+                            // （实测 11 部「在看」里通常有 3~4 部未入库）
+                            cursorShape: modelData.inLibrary ? Qt.PointingHandCursor
+                                                             : Qt.ArrowCursor
                             onClicked: function (m) {
                                 if (modelData.inLibrary)
                                     root.subjectClicked(modelData.localSubjectId)
+                                else
+                                    root.statusMessage(
+                                        "「" + modelData.title
+                                        + "」未入库，无法打开详情")
                                 m.accepted = false
                             }
                         }
@@ -264,7 +278,7 @@ Item {
 
                 Text {
                     anchors.horizontalCenter: parent.horizontalCenter
-                    text: root.busy ? "正在拉取…" : "暂无看过条目"
+                    text: root.busy ? "正在拉取…" : "暂无在看条目"
                     color: Theme.textSecondary
                     font.pixelSize: Theme.fontLg
                 }
@@ -273,7 +287,7 @@ Item {
                     anchors.horizontalCenter: parent.horizontalCenter
                     text: root.busy
                           ? ""
-                          : "点右上角「刷新」从 Bangumi 拉取看过列表"
+                          : "点右上角「刷新」从 Bangumi 拉取在看列表"
                     color: Theme.textTertiary
                     font.pixelSize: Theme.fontMd
                 }

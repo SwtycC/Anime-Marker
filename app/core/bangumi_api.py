@@ -290,25 +290,42 @@ class BangumiClient:
 
     # ---------- F18：用户在看列表 ----------
     def get_me(self) -> Optional[dict]:
-        """GET /v0/me，用 Token 解析当前用户（未配置 username 时使用）。"""
+        """GET /v0/me，用 Token 解析当前用户（未配置 username 时使用）。
+
+        **失败原因必须分类记日志**：早期这里把两类失败写成同一句
+        「Token 可能无效」，而实际上一半的情况（5xx / 连接失败）请求
+        根本没到鉴权环节 —— 实测让用户以为 Token 坏了，跑去重新生成
+        （Token 一直是好的）。判据很硬：只有 401/403 才与 Token 有关。
+        """
         try:
             data = self._get("/v0/me")
             return data if isinstance(data, dict) else None
+        except BangumiAuthError as e:
+            # 401/403：这才是 Token 本身的问题
+            log.warning("解析当前用户失败（Token 无效或权限不足）: %s", e)
+            return None
         except BangumiError as e:
-            log.warning("解析当前用户失败（Token 可能无效）: %s", e)
+            # 5xx / 连接失败：与 Token 无关，别让用户去重新生成
+            log.warning("获取当前用户失败（未能验证 Token，与 Token 无关）: %s", e)
             return None
 
     def get_user_collections(
         self,
         username: str,
         subject_type: int = SUBJECT_TYPE_ANIME,
-        collect_type: int = COLLECT_TYPE_DOING,
+        collect_type: Optional[int] = COLLECT_TYPE_DOING,
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict]:
         """GET /v0/users/{username}/collections。
 
         默认取「动画 + 在看」（subject_type=2, type=3）。
+        `collect_type=None` → **不传 `type`** → 官方 OpenAPI 的默认行为
+        「全部收藏状态」（想看/在看/看过/搁置/抛弃 一次拿全）。
+
+        `None` 之所以等价于"不传"：`requests` 在编码查询串时会丢弃值为
+        `None` 的参数（`models._encode_params` 里的 `if v is not None`），
+        所以这里直接把 `None` 透传即可，不必拼两个分支。
         """
         if not username:
             raise BangumiError("未配置 Bangumi 用户名，且无法从 Token 解析")
@@ -329,13 +346,19 @@ class BangumiClient:
         self,
         username: str,
         subject_type: int = SUBJECT_TYPE_ANIME,
-        collect_type: int = COLLECT_TYPE_DOING,
+        collect_type: Optional[int] = COLLECT_TYPE_DOING,
         page_size: int = 50,
         max_items: int = 500,
     ) -> list[dict]:
-        """分页拉取全部收藏（带 max_items 上限保护）。"""
+        """分页拉取收藏（带 max_items 上限保护）。
+
+        `collect_type=None` 表示全部状态 —— 注意此时 `max_items` 是**所有
+        状态共用一个额度**，触顶会在尾部静默截断（调用方拿到的是不完整
+        名单）。触顶时记一条 warning，避免"收藏变少了"这种无声故障。
+        """
         out: list[dict] = []
         offset = 0
+        truncated = False
         while len(out) < max_items:
             page = self.get_user_collections(
                 username, subject_type, collect_type, page_size, offset
@@ -344,9 +367,17 @@ class BangumiClient:
                 break
             out.extend(page)
             if len(page) < page_size:
-                break
+                break                      # 已翻到底
             offset += page_size
-        return out[:max_items]
+        else:
+            # 循环因 len(out) >= max_items 退出，且上一页是满的 —— 说明
+            # 后面还有数据没取
+            truncated = True
+        if truncated:
+            log.warning("收藏分页达到上限 %s 条，尾部条目被截断"
+                        "（collect_type=%s）", max_items, collect_type)
+            out = out[:max_items]
+        return out
 
     # ---------- F20：集级观看记录 ----------
     def get_subject_episode_collections(

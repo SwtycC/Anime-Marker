@@ -5,16 +5,21 @@ import QtQuick.Controls
 //
 // 内容来源由页面内的分段按钮控制（**不放在设置页**）：
 //   local  —— 只显示本地观看记录（`library.timeline()`，纯离线）
-//   merged —— 本地记录 + Bangumi「看过」收藏（单独归组排在末尾）
+//   merged —— 本地记录 + Bangumi 逐集标记
 //
 // 为什么不放设置页：这是"看当前页面"的临时视图偏好，切换后应立刻见效。
 // 放设置页需要"改完→点保存→切页"，多两步且容易让人以为按钮没生效。
 //
 // 呈现规则：
-// - **按动漫聚合**：同一部动漫即使看了多集，也只占一行，
-//   行内显示「已看 N 集」，并按"最近看的那一集的时间"排序。
-//   这样"看过的动漫"一眼可见，不会被同一部的多集记录淹没。
-// - Bangumi 条目（merged 模式）不参与聚合，也不按日期分组。
+// - `local` 模式**按动漫聚合**：同一部即使看了多集也只占一行，行内显示
+//   「已看 N 集」（本地记录是同一次观看会话产生的，聚合更易读）。
+// - `merged` 模式**逐集一行**：Bangumi 记录的核心价值就是"每集什么时候
+//   看的"，聚合会把这个信息丢掉；本地记录同样逐集展示。
+// - 两个来源都带 `watchedAt`，混在一起**按时间倒序**，并按日期归入
+//   今天 / 昨天 / 本周 / … 等分组。
+// - 列表默认只渲染首屏 N 条（`ep_timeline_count`），其余靠滚动到底或
+//   「加载更多」追加（见 extraPages / pageStep）。**数据是全量同步的**，
+//   显示上限只影响渲染，不影响拉取。
 //
 // 分组/聚合实现放在 QML 侧：纯展示逻辑，调整规则不必动后端。
 Item {
@@ -62,6 +67,17 @@ Item {
         return (item.isBangumi ? "b" : "l") + item.episodeId + "-" + item.subjectId
     }
 
+    /// 已额外加载的页数（0 = 只显示首屏 `epLimit()` 条）。
+    ///
+    /// **为什么记"页数"而不是"已显示条数"**：条数得初始化、还得在设置变化时
+    /// 手工同步，很容易漏（改完设置页面不跟着变）。记页数则每次都由
+    /// `epLimit() + extraPages * pageStep` **现算**，设置一改立刻生效。
+    property int extraPages: 0
+
+    /// 每页追加多少条。至少 50 —— 首屏条数被设成 5 时，一次只加 5 条
+    /// 点起来太累。
+    readonly property int pageStep: Math.max(50, epLimit())
+
     /// 应用条数上限**之前**的完整列表（含 merged 模式的 Bangumi 条目）
     ///
     /// **踩坑（重要）：这个属性必须是「绑定」，不能被外部赋值。**
@@ -72,18 +88,20 @@ Item {
     /// 正确做法：外部只改 `localEntries`（数据源），见 reload()。
     property var allEntries: buildEntries()
 
-    /// 实际渲染的列表 = 完整列表按「集级记录条数」取最近 N 条
+    /// 实际渲染的列表 = 首屏 N 条 + 已加载的页
     ///
-    /// 拆成 `allEntries` + `applyLimit()` 两步，是为了能算出"被截掉几条"
-    /// （见 hiddenByLimit）—— 否则用户看到的只是"条数变少了"，
-    /// 无法判断是设置生效了还是数据没拉到。
+    /// 拆成 `allEntries` + `applyLimit()` 两步，是为了能算出"还有多少条
+    /// 没显示"（见 hasMore）—— 否则用户只看到"条数变少了"，无法判断是
+    /// 设置生效了还是数据没拉到。
     property var entries: applyLimit(allEntries)
 
-    /// 被上限截掉的条数（>0 时列表底部给一句说明）
+    /// 还有多少条没显示（>0 时列表底部出现「加载更多」）
     readonly property int hiddenByLimit: allEntries.length - entries.length
+    readonly property bool hasMore: hiddenByLimit > 0
+    readonly property int totalCount: allEntries.length
 
-    /// 分组后的结果（按日期 + 可选的「Bangumi 看过」组）
-    property var groups: buildGroups(entries)
+    /// 拍平成分组列表（组标题 + 数据行混排），给 ListView 当 model
+    property var flatItems: flattenGroups(entries)
 
     /// 是否正在拉取 Bangumi 看过列表（merged 模式下刷新时）
     readonly property bool busy: typeof inprogress !== "undefined" && inprogress
@@ -91,6 +109,7 @@ Item {
 
     /// 重新拉取本地观看记录（由外部调用，不碰 entries 本身）
     function reload() {
+        extraPages = 0                     // 刷新后回到首屏
         if (typeof library !== "undefined" && library)
             localEntries = library.timeline(500)
         if (typeof library !== "undefined" && library)
@@ -104,9 +123,28 @@ Item {
             return
         var changed = (source !== v)
         source = v
+        extraPages = 0                     // 换数据源 → 收回首屏
         if (v === "merged" && changed
                 && bangumiItems.length === 0 && bangumiEpisodes.length === 0)
             pullBangumi()
+    }
+
+    /// 数据源变化（刷新、同步落库、保存设置）→ 收回首屏。
+    ///
+    /// 为什么挂在 `watchedEpsChanged` 上：`epLimit()` 走的是
+    /// `settingsBridge.getAll()`（Slot 调用，**不构成绑定依赖**），所以
+    /// "设置里把显示条数改小"这件事本身不会让 `entries` 重算 —— 靠的正是
+    /// 保存设置 → `applyEpisodeCount()` → `reloadWatchedEpisodes()` 这条链路。
+    /// 在这里复位，改小之后页面才会立刻从"已加载 200 条"收回到新条数。
+    ///
+    /// 副作用（可接受）：全量同步期间每批都会回调一次，页面若停在很靠下的
+    /// 位置会被拉回首屏；但那时列表本来就只有几十条，用户基本都在顶部。
+    Connections {
+        target: typeof library !== "undefined" && library ? library : null
+
+        function onWatchedEpsChanged() {
+            root.extraPages = 0
+        }
     }
 
     /// 触发一次 Bangumi 拉取（两阶段：收藏列表 → 最近 N 部的集级记录）。
@@ -203,118 +241,134 @@ Item {
         return out
     }
 
-    Flickable {
-        id: flick
-        anchors.fill: parent
+    // ============ 页头（固定，不随列表滚动）============
+    //
+    // 旧版页头放在 Flickable 里，会跟着列表一起滚走。改成 ListView 后特意
+    // 留在外面：列表越长越需要"随时能点刷新 / 切来源"。
+    Column {
+        id: headerBox
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.margins: Theme.pagePadding
+        spacing: Theme.spacingMd
+
+        // ---- 标题行：标题 + 状态 + 来源切换 + 刷新 ----
+        Row {
+            width: parent.width
+            spacing: Theme.spacingMd
+
+            Column {
+                width: parent.width - sourceSeg.width - refreshBtn.width
+                       - Theme.spacingMd * 2
+                spacing: 2
+
+                Text {
+                    text: "动态"
+                    color: Theme.textPrimary
+                    font.pixelSize: Theme.fontXl
+                    font.weight: Font.DemiBold
+                }
+
+                Text {
+                    width: parent.width
+                    text: root.headerText()
+                    color: Theme.textTertiary
+                    font.pixelSize: Theme.fontSm
+                    elide: Text.ElideRight
+                }
+            }
+
+            // 内容来源切换（页面内即时生效，不写配置）
+            SegmentedControl {
+                id: sourceSeg
+                objectName: "timelineSourceSeg"
+                anchors.verticalCenter: parent.verticalCenter
+                options: [
+                    { "label": "仅本地", "value": "local" },
+                    { "label": "本地 + Bangumi", "value": "merged" }
+                ]
+                currentValue: root.source
+                onSelected: function (value) {
+                    root.setSource(value)
+                }
+            }
+
+            AppButton {
+                id: refreshBtn
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.busy ? "刷新中…" : "刷新"
+                enabled: !root.busy
+                onClicked: root.requestRefresh()
+            }
+        }
+
+        Rectangle {
+            width: parent.width
+            height: Theme.lineThin
+            color: Theme.border
+        }
+    }
+
+    // ============ 记录列表 ============
+    //
+    // **为什么用 ListView 而不是 Flickable + Column + Repeater**：Repeater
+    // 不做 delegate 回收，model 一变就把当前全部行销毁重建 —— 每次
+    // 「加载更多」都要重付一遍，行数上千后明显卡（本账号全量同步后约
+    // 1000+ 条）。ListView 的开销只与**可见窗口**成正比。
+    ListView {
+        id: listView
+        objectName: "timelineList"
+        anchors.top: headerBox.bottom
+        anchors.topMargin: Theme.spacingMd
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.leftMargin: Theme.pagePadding
+        anchors.rightMargin: Theme.pagePadding
         clip: true
-        contentWidth: width
-        contentHeight: Math.max(
-            Theme.pagePadding + content.implicitHeight
-                + Theme.navContentGutter, height)
+        model: root.flatItems
+        spacing: Theme.lineThin
         boundsBehavior: Flickable.StopAtBounds
+        // 底部留出导航浮层的高度，否则最后几行会被挡住
+        bottomMargin: Theme.navContentGutter
 
         ScrollBar.vertical: AppScrollBar {
             id: vbar
             policy: ScrollBar.AsNeeded
         }
 
-        Column {
-            id: content
-            x: Theme.pagePadding
-            y: Theme.pagePadding
-            width: flick.width - Theme.pagePadding * 2
-                   - (vbar.visible ? vbar.width : 0)
-            spacing: Theme.spacingMd
+        // 滚到底自动加载下一页（页脚的按钮是显式兜底 —— 自动加载在某些
+        // 触控板/滚轮节奏下可能连触发多次，有个按钮用户心里更有底）
+        onAtYEndChanged: {
+            if (atYEnd && root.hasMore)
+                root.loadMore()
+        }
 
-            // ---- 标题行：标题 + 状态 + 来源切换 + 刷新 ----
-            Row {
-                width: parent.width
-                spacing: Theme.spacingMd
+        delegate: Column {
+            id: cell
+            required property var modelData
 
-                Column {
-                    width: parent.width - sourceSeg.width - refreshBtn.width
-                           - Theme.spacingMd * 2
-                    spacing: 2
+            // modelData = { item, headerLabel }（见 flattenGroups）
+            width: listView.width - (vbar.visible ? vbar.width : 0)
+            spacing: Theme.lineThin
 
-                    Text {
-                        text: "动态"
-                        color: Theme.textPrimary
-                        font.pixelSize: Theme.fontXl
-                        font.weight: Font.DemiBold
-                    }
-
-                    Text {
-                        width: parent.width
-                        text: root.headerText()
-                        color: Theme.textTertiary
-                        font.pixelSize: Theme.fontSm
-                        elide: Text.ElideRight
-                    }
-                }
-
-                // 内容来源切换（页面内即时生效，不写配置）
-                SegmentedControl {
-                    id: sourceSeg
-                    objectName: "timelineSourceSeg"
-                    anchors.verticalCenter: parent.verticalCenter
-                    options: [
-                        { "label": "仅本地", "value": "local" },
-                        { "label": "本地 + Bangumi", "value": "merged" }
-                    ]
-                    currentValue: root.source
-                    onSelected: function (value) {
-                        root.setSource(value)
-                    }
-                }
-
-                AppButton {
-                    id: refreshBtn
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: root.busy ? "刷新中…" : "刷新"
-                    enabled: !root.busy
-                    onClicked: root.requestRefresh()
-                }
+            // 组标题（今天 / 昨天 / 日期）—— 只在该组第一行上方出现
+            Text {
+                width: cell.width
+                visible: modelData.headerLabel !== ""
+                text: modelData.headerLabel
+                topPadding: Theme.spacingSm
+                color: Theme.textSecondary
+                font.pixelSize: Theme.fontSm
+                font.weight: Font.DemiBold
             }
 
+            // 单条记录
             Rectangle {
-                width: parent.width
-                height: Theme.lineThin
-                color: Theme.border
-            }
-
-            // ---- 分组列表 ----
-            Repeater {
-                model: root.groups
-
-                delegate: Column {
-                    required property var modelData
-
-                    width: content.width
-                    spacing: Theme.spacingSm
-
-                    // 组标题（今天 / 昨天 / 日期）
-                    Text {
-                        topPadding: Theme.spacingSm
-                        text: modelData.label
-                        color: Theme.textSecondary
-                        font.pixelSize: Theme.fontSm
-                        font.weight: Font.DemiBold
-                    }
-
-                    // 组内条目
-                    Column {
-                        id: groupCol
-                        width: parent.width
-                        spacing: Theme.lineThin
-
-                        Repeater {
-                            model: modelData.items
-
-                            delegate: Rectangle {
-                                required property var modelData
-
-                                width: groupCol.width
-                                height: 48
+                id: rowRect
+                width: cell.width
+                height: 48
                                 // 高亮 = 两个信号的**或**，缺一不可：
                                 //   containsMouse —— 活着的那一行（鼠标确实在它上面）
                                 //   hoveredKey    —— 跨 delegate 重建的"粘性"状态
@@ -351,7 +405,7 @@ Item {
                                         Text {
                                             id: epLabel
                                             anchors.centerIn: parent
-                                            text: "EP" + root.fmtIndex(modelData.epIndex)
+                                            text: "EP" + root.fmtIndex(modelData.item.epIndex)
                                             color: Theme.accent
                                             font.pixelSize: Theme.fontXs
                                         }
@@ -361,7 +415,7 @@ Item {
                                     Text {
                                         anchors.verticalCenter: parent.verticalCenter
                                         width: Math.round((parent.width - 40) * 0.42)
-                                        text: modelData.subjectName
+                                        text: modelData.item.subjectName
                                         color: Theme.textPrimary
                                         font.pixelSize: Theme.fontMd
                                         elide: Text.ElideRight
@@ -373,9 +427,9 @@ Item {
                                         id: epCountLabel
                                         anchors.verticalCenter: parent.verticalCenter
                                         width: Math.max(implicitWidth, 56)
-                                        text: modelData.isBangumi
-                                              ? (modelData.epTitle || "")
-                                              : "已看 " + modelData.watchedEpCount + " 集"
+                                        text: modelData.item.isBangumi
+                                              ? (modelData.item.epTitle || "")
+                                              : "已看 " + modelData.item.watchedEpCount + " 集"
                                         color: Theme.textTertiary
                                         font.pixelSize: Theme.fontSm
                                         elide: Text.ElideRight
@@ -388,7 +442,7 @@ Item {
 
                                         Rectangle {
                                             anchors.verticalCenter: parent.verticalCenter
-                                            visible: modelData.isBangumi === true
+                                            visible: modelData.item.isBangumi === true
                                             width: bgmLabel.implicitWidth + 8
                                             height: 16
                                             radius: 2
@@ -408,7 +462,7 @@ Item {
                                         Text {
                                             id: timeLabel
                                             anchors.verticalCenter: parent.verticalCenter
-                                            text: root.fmtTime(modelData.watchedAt)
+                                            text: root.fmtTime(modelData.item.watchedAt)
                                             color: Theme.textTertiary
                                             font.pixelSize: Theme.fontSm
                                         }
@@ -428,114 +482,142 @@ Item {
                                     anchors.fill: parent
                                     hoverEnabled: true
 
-                                    onEntered: root.hoveredKey = root.rowKey(modelData)
+                                    onEntered: root.hoveredKey = root.rowKey(modelData.item)
                                     onExited: {
                                         // 只清自己那一行：delegate 重建时可能出现
                                         // "新的 entered 先于旧的 exited" 的次序
-                                        if (root.hoveredKey === root.rowKey(modelData))
+                                        if (root.hoveredKey === root.rowKey(modelData.item))
                                             root.hoveredKey = ""
                                     }
 
                                     // Bangumi 条目未入库时（subjectId == 0）没有本地详情，
                                     // 用箭头光标提示"这一行不可点"
-                                    readonly property bool clickable: modelData.subjectId > 0
+                                    readonly property bool clickable: modelData.item.subjectId > 0
                                     cursorShape: clickable ? Qt.PointingHandCursor
                                                            : Qt.ArrowCursor
                                     onClicked: {
                                         if (clickable)
-                                            root.subjectClicked(modelData.subjectId)
+                                            root.subjectClicked(modelData.item.subjectId)
                                         else
                                             // 未入库 → 没有本地详情页，明确告诉用户
                                             // （早期是静默 return，被当成"点了没反应"的 bug）
                                             root.statusMessage(
-                                                "「" + modelData.subjectName
+                                                "「" + modelData.item.subjectName
                                                 + "」未入库，无法打开详情")
                                     }
                                 }
-                            }
-                        }
-                    }
-                }
+            }
+        }
+
+        // ---- 页脚：加载更多 / 已显示全部 ----
+        //
+        // 用 ListView 的 footer（而不是列表外面另放一块），这样它跟着列表
+        // 一起滚动，最后一行下方不会凭空多出一段空白。
+        footer: Column {
+            width: listView.width
+            spacing: Theme.spacingSm
+
+            Item { width: 1; height: Theme.spacingMd }
+
+            AppButton {
+                anchors.horizontalCenter: parent.horizontalCenter
+                visible: root.hasMore
+                text: "加载更多（还有 " + root.hiddenByLimit + " 条）"
+                onClicked: root.loadMore()
             }
 
-            // ---- 上限提示（被截掉时才出现）----
             Text {
                 width: parent.width
-                topPadding: Theme.spacingSm
-                visible: root.hiddenByLimit > 0
-                text: "仅显示最近 " + root.epLimit() + " 条（另有 "
-                      + root.hiddenByLimit + " 条未显示）"
-                      + " · 可在「设置 → 集级记录条数」调大上限"
+                visible: root.entries.length > 0 && !root.hasMore
+                text: "已显示全部 " + root.totalCount + " 条"
                 color: Theme.textTertiary
                 font.pixelSize: Theme.fontSm
                 horizontalAlignment: Text.AlignHCenter
-                wrapMode: Text.WordWrap
             }
 
-            // ---- 空状态 ----
-            Column {
-                width: parent.width
-                height: 200
-                visible: root.entries.length === 0
-                spacing: Theme.spacingSm
+            Item { width: 1; height: Theme.spacingSm }
+        }
+    }
 
-                Item { width: 1; height: 60 }
+    // ---- 空状态（覆盖在列表区域）----
+    Column {
+        anchors.top: headerBox.bottom
+        anchors.topMargin: Theme.spacingMd
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.leftMargin: Theme.pagePadding
+        anchors.rightMargin: Theme.pagePadding
+        spacing: Theme.spacingSm
+        visible: root.entries.length === 0
 
-                Text {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    text: "还没有观看记录"
-                    color: Theme.textSecondary
-                    font.pixelSize: Theme.fontLg
-                }
+        Item { width: 1; height: 60 }
 
-                Text {
-                    width: parent.width
-                    text: root.emptyHint()
-                    color: Theme.textTertiary
-                    font.pixelSize: Theme.fontMd
-                    horizontalAlignment: Text.AlignHCenter
-                    wrapMode: Text.WordWrap
-                    lineHeight: 1.5
-                }
-            }
+        Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "还没有观看记录"
+            color: Theme.textSecondary
+            font.pixelSize: Theme.fontLg
+        }
+
+        Text {
+            width: parent.width
+            text: root.emptyHint()
+            color: Theme.textTertiary
+            font.pixelSize: Theme.fontMd
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
+            lineHeight: 1.5
         }
     }
 
     /// 空状态说明文案
     ///
-    /// 前提：动态页展示的是**逐集**记录，而 Bangumi 单集的时间戳字段
-    /// （`updated_at`）历史上出现过恒为 0，只能用动漫收藏级的时间兜底 —— 因此
-    /// 「最近 N 部」里**没有标记过任何单集**的条目（剧场版、只标了整体
-    /// 状态的番）不会产生记录。N 设得太小时可能一位都没有，这不是故障，
-    /// 所以给一句解释 + 指引，避免用户以为功能坏了。
+    /// 现在同步范围是**全部收藏状态**（想看 / 在看 / 看过 / 搁置 / 抛弃），
+    /// 所以"空的"只可能是两种情况：还没同步过，或者这个账号确实没标过任何
+    /// 单集。（旧版受"最近 N 部"限制，还会因为"最近几部恰好只有剧场版"
+    /// 而空 —— 那个坑随着早停机制一起消失了。）
     function emptyHint() {
         if (source !== "merged")
             return "播放剧集并在 PotPlayer 中看完后，这里会留下记录"
         if (bangumiItems.length > 0)
-            return "最近看过的几部里没有逐集标记\n"
-                 + "动态页收录的是逐集标记的记录（整部番状态为看过 / 在看的动画），"
-                 + "而最近更新的几部可能只标了整体状态（如剧场版）。\n"
-                 + "可在「设置 → 动态显示条数」调大范围，或点「刷新」重新拉取。"
-        return "暂无内容 —— 点右上角「刷新」拉取 Bangumi 看过记录"
+            return "还没有逐集记录\n"
+                 + "动态页收录的是**逐集**标记（Bangumi 网页上「看过 ep.5」那种）；"
+                 + "只标了整部番状态、没标过单集的条目不会出现在这里。\n"
+                 + "点右上角「刷新」同步一次（首次会拉取全部收藏，约十几秒）。"
+        return "暂无内容 —— 点右上角「刷新」同步 Bangumi 观看记录"
     }
 
-    /// 按「集级记录条数」截取**最近 N 条**（整页口径：本地 + Bangumi 合并后）。
+    /// 首屏条数上限（N = `ep_timeline_count`），超出部分靠「加载更多」展开。
     ///
     /// **为什么整页截取而不是只截 Bangumi 那部分**：设置项叫「条数」，
     /// 用户设 5 时期待页面上一共 5 条；只截 Bangumi 的话，本地记录一叠加
     /// 又会超过 5，等于设置没生效。
     ///
     /// 规则：
-    /// - **仅 merged 模式生效**。「仅本地」是纯离线视图，与 Bangumi 抓取
-    ///   范围无关（否则 N=0 时本地页面会被一并清空）。
-    /// - `N <= 0`（= 关闭逐集记录）时**不截取**，此时页面只剩本地记录，
-    ///   截成 0 条会把本地记录也误伤。
-    /// - 传入的 list 已按时间倒序，`slice(0, n)` 即"最近 N 条"。
+    /// - **仅 merged 模式生效**。「仅本地」是纯离线视图，与 Bangumi 同步
+    ///   范围无关。
+    /// - `N <= 0`（= 关闭逐集记录）时**只藏 Bangumi 那部分**，本地记录
+    ///   照常显示 —— 设成 0 不等于把本地时间线也清掉。
+    /// - 传入的 list 已按时间倒序，`slice(0, cap)` 即"最近的 cap 条"。
+    /// - cap = 首屏 N + 已加载页数 × 每页条数（见 extraPages / pageStep）。
     function applyLimit(list) {
-        var n = epLimit()
-        if (source !== "merged" || n <= 0 || list.length <= n)
+        if (source !== "merged")
             return list
-        return list.slice(0, n)
+        var n = epLimit()
+        if (n <= 0) {
+            // 逐集记录被关闭（N=0）：只藏掉 Bangumi 那部分，本地记录照常显示。
+            // **不删数据** —— 表里的历史要完整保留，用户把 N 调回来就能立刻
+            // 看到（旧版在这里清表，重新开启时得联网重拉一遍才行）。
+            return list.filter(function (e) { return !e.isBangumi })
+        }
+        var cap = n + extraPages * pageStep
+        return list.length <= cap ? list : list.slice(0, cap)
+    }
+
+    /// 追加一页（滚动到底自动触发，也是「加载更多」按钮的动作）
+    function loadMore() {
+        if (hasMore)
+            extraPages += 1
     }
 
     /// 「集级记录条数」的数值形态；取不到或非法时返回 0（= 不设上限）。
@@ -562,38 +644,34 @@ Item {
                 ? v["bangumi.ep_timeline_count"] : "N"
     }
 
-    // ---- 分组：按「最近观看日期」切分，Bangumi 条目单独成组排最后 ----
+    // ---- 分组：按「最近观看日期」切分成组，并拍平成 ListView 的 model ----
     //
-    // Bangumi 条目没有 watchedAt，无法按日期归组；统一放进
-    // 「Bangumi 看过」组并置于末尾，符合「本地已看在前、
-    // Bangumi 收藏在后」的阅读顺序。
-    function buildGroups(list) {
+    // 输出每项 `{item, headerLabel}`：`headerLabel` 非空表示"这一行是某组的
+    // 第一行，上方要画组标题"，其余行为空串。
+    //
+    // 旧版这里还有一个 `isInProgress` → 单独归到末尾「Bangumi 看过」组的
+    // 分支：两个数据源（localEntries / bangumiEpisodes）都写死
+    // `isInProgress: false`，那条路径从未生效过，随本次改造一并清掉
+    // （顺带解决"Bangumi 条目没有时间只能堆末尾"的问题 —— 现在所有记录
+    // 都有真实时间，一律按日期归组）。
+    function flattenGroups(list) {
         if (!list || list.length === 0)
             return []
         var out = []
         var curLabel = ""
-        var curItems = []
-        var ipItems = []
-
         for (var i = 0; i < list.length; i++) {
             var item = list[i]
-            if (item.isInProgress) {
-                ipItems.push(item)
-                continue
-            }
             var label = dayLabel(item.watchedAt)
-            if (label !== curLabel) {
-                if (curItems.length > 0)
-                    out.push({ "label": curLabel, "items": curItems })
-                curLabel = label
-                curItems = []
-            }
-            curItems.push(item)
+            // 组标题并进"该组第一行"，而不是在 model 里插独立的标题项 ——
+            // 后者要用 DelegateChooser / Loader 才能分派两种 delegate，
+            // 而这里的行本来就高度可变，并进来最省事，视觉完全一致。
+            var first = (i === 0 || label !== curLabel)
+            out.push({
+                "item": item,
+                "headerLabel": first ? label : ""
+            })
+            curLabel = label
         }
-        if (curItems.length > 0)
-            out.push({ "label": curLabel, "items": curItems })
-        if (ipItems.length > 0)
-            out.push({ "label": "Bangumi 看过", "items": ipItems })
         return out
     }
 
@@ -720,8 +798,11 @@ Item {
     ///
     /// 按当前模式给出不同口径的统计：
     /// - local：本地记录聚合后的**部数** + 原始条数
-    /// - merged：本地条数 + Bangumi 集级/动漫级条数（区分口径，
-    ///   否则"149 条"会让人以为本地也看了这么多）
+    /// - merged：本地条数 + Bangumi 逐集条数 + "已显示 / 全部"（区分口径，
+    ///   否则"900 条"会让人以为本地也看了这么多）
+    ///
+    /// **不报"同步了多少部"**：那是设置项口径（为什么只有这些条），写在这里
+    /// 会和「显示条数」并排出现两个含义不同的数字，看着像自相矛盾（实测反馈）。
     function headerText() {
         var parts = []
         if (source === "local") {
@@ -734,28 +815,22 @@ Item {
         }
 
         // merged：区分"本地播放"与"Bangumi 逐集"两个来源的条数
-        //
-        // **这里不报"抓取了多少部"**。N 兼作抓取范围（部）与显示上限（条），
-        // 两个数又都由同一个设置决定，一起写会变成
-        //     「Bangumi 逐集 344 条（来自最近 40 部） · 显示最近 40 条」
-        // —— 两个 40 含义不同却并排出现，看着像自相矛盾（实测反馈）。
-        // 抓取部数是"为什么只有 344 条"的解释，属设置项口径，
-        // 写在设置页 hint 与技术文档里即可，页头只报用户看得见的两个数：
-        // 拉到多少条、显示多少条。
         if (localEntries.length > 0)
             parts.push("本地 " + localEntries.length + " 条")
         if (bangumiEpisodes.length > 0)
             parts.push("Bangumi 逐集 " + bangumiEpisodes.length + " 条")
         else
-            parts.push("未拉取逐集记录")
-        // 截取生效时说清口径 —— 否则"只显示 5 条"看起来像数据丢了
+            parts.push("未同步逐集记录")
+        // 列表被截取时说清口径（还有多少条要靠「加载更多」展开）——
+        // 否则"只显示 20 条"看起来像数据丢了
         if (hiddenByLimit > 0)
-            parts.push("显示最近 " + epLimit() + " 条")
+            parts.push("已显示 " + entries.length + " / " + totalCount + " 条")
         return parts.join(" · ")
     }
 
     /// 滚动到指定位置（截图/诊断用）
     function scrollTo(y) {
-        flick.contentY = Math.max(0, Math.min(y, flick.contentHeight - flick.height))
+        listView.contentY = Math.max(
+            0, Math.min(y, listView.contentHeight - listView.height))
     }
 }

@@ -90,8 +90,9 @@ CREATE TABLE IF NOT EXISTS inprogress_cache (
 -- 拿不到"第几集是什么时候看的"。而「动态」页要的正是集级粒度
 -- （对应 Bangumi 网页的「看过 ep.5 TV取材 · 5天12小时前」）。
 --
--- 拉取成本：每部动漫一次请求，因此只对「最近更新的 N 部」拉取
--- （N 由 `bangumi.ep_timeline_count` 配置，见 §5.12.11.5）。
+-- 拉取成本：每部动漫一次请求。因此**按需增量同步** —— 同步过且收藏没变
+-- 的条目不再重复请求，判据见 ep_sync_state 与 bridges/inprogress.py 的
+-- `sync_candidates()`。
 CREATE TABLE IF NOT EXISTS watched_episodes (
     bangumi_ep_id INTEGER PRIMARY KEY,   -- Bangumi 的 episode id
     subject_id    INTEGER,               -- 本地 subjects.id（可为空，未入库时）
@@ -106,6 +107,28 @@ CREATE INDEX IF NOT EXISTS idx_watched_ep_time
     ON watched_episodes(watched_at DESC);
 CREATE INDEX IF NOT EXISTS idx_watched_ep_subject
     ON watched_episodes(bangumi_id);
+
+-- F20：集级记录的**同步水位**（每个条目一行）—— 决定"这次要重新拉哪几部"
+--
+-- 为什么单独一张表、而不是给 inprogress_cache 加列：
+-- `replace_inprogress_cache()` 是**整表 DELETE + INSERT**（每次刷新收藏列表
+-- 都重建），加在那里的水位行会被一起抹掉。水位必须比收藏缓存活得更久。
+--
+-- 为什么不用"该部在 watched_episodes 里一行都没有"来反推待同步：
+-- 那样对"请求成功但确实没有逐集标记"的条目（很常见：只标了整部状态、
+-- 剧场版）会**每次刷新都重拉**，形成死循环。水位行只在**请求成功**时写，
+-- 成功的 0 行也是终态答案；请求失败不写 → 下次自然重试。
+--
+-- 注意 `collection_updated_at` 存的是**原始字段值**，不能用
+-- `_collection_time()` 的兜底值（那个会回落到本次拉取时刻，每次都变，
+-- 会让该部每次刷新都重拉）。详见 bridges/inprogress.py 的 sync_key()。
+CREATE TABLE IF NOT EXISTS ep_sync_state (
+    bangumi_id            INTEGER PRIMARY KEY,
+    collection_updated_at TEXT,     -- 同步时刻 inprogress_cache 里的原始收藏修改时间
+    ep_status             INTEGER,  -- 同步时刻的 ep_status（"看到第几话"）
+    ep_rows               INTEGER,  -- 本次写入的行数（仅诊断，不参与判定）
+    synced_at             TEXT      -- 同步时刻（本地 ISO）
+);
 
 -- F19：RSS 订阅源
 CREATE TABLE IF NOT EXISTS rss_sources (
@@ -199,6 +222,21 @@ class InProgressItem:
     collection_updated_at: Optional[str] = None
     # 运行时填充（不落库）
     local_subject_id: Optional[int] = None
+
+
+@dataclass
+class EpSyncState:
+    """F20：某条目集级记录的同步水位（见 ep_sync_state 表）。
+
+    三个字段都取**上一次成功同步时**的快照值，用于与当前收藏缓存比对，
+    判断"这部要不要重新拉"。`synced_at` 供超期兜底（见 sync_candidates）。
+    """
+
+    bangumi_id: int
+    collection_updated_at: str
+    ep_status: int
+    ep_rows: int
+    synced_at: str
 
 
 @dataclass
@@ -641,18 +679,15 @@ class Database:
             return (datetime.now(dt.tzinfo) - dt).total_seconds()
 
     # ---------- F20：集级观看记录 ----------
-    def replace_watched_episodes(self, items: list[dict]) -> None:
-        """整体替换集级观看记录（先清后插，保证与线上一致）。
+    @staticmethod
+    def _watched_ep_rows(items: list[dict]) -> list[tuple]:
+        """集级记录 dict → executemany 用的元组序列。
 
         入参每项：
             { "bangumi_ep_id", "bangumi_id", "subject_id",
               "subject_name", "ep_index", "ep_name", "watched_at" }
-
-        **注意**：入参为空时**不清表**。调用方（`_EpisodeWorker`）在整批
-        请求都失败时会传空列表，此时保留旧数据比清空更合理 —— 否则一次
-        网络抖动就会把用户的时间线抹掉，还得等下一次刷新才能恢复。
         """
-        rows = [
+        return [
             (
                 int(it.get("bangumi_ep_id") or 0),
                 int(it.get("subject_id") or 0),
@@ -665,23 +700,67 @@ class Database:
             for it in items
             if it.get("bangumi_ep_id")
         ]
-        if not rows:
-            # 空结果视为"本次没拉到"，不清表（见上方说明）
-            return
+
+    def replace_subject_watched_episodes(
+        self,
+        bangumi_id: int,
+        items: list[dict],
+        collection_updated_at: str,
+        ep_status: int,
+    ) -> None:
+        """**按单部**替换集级记录，并写入同步水位（同一个事务）。
+
+        为什么不再整表替换：同步已改成增量的 —— 每次只重拉"收藏变过 +
+        在看 + 超期"的那十几部，整表 DELETE 会把没重拉的部的历史一起抹掉。
+
+        **入参为空也要执行**（与旧的整表版本相反）：调用方只在"请求成功"
+        时调这里，而"成功但这部确实没有逐集标记"是个**终态答案** —— 必须
+        落水位，否则下次还会重拉它（见 ep_sync_state 表的说明）。
+        "请求成功但记录被过滤光了"这种情况由调用方拦下、根本不调这里。
+
+        水位必须与记录在**同一个 `with self._cursor()`** 里：危险方向是
+        "水位写了、记录没写"（该部永远不再同步）；反过来只是下次重拉。
+
+        `ep_rows` 直接用 `len(rows)`，不接受外部传入 —— 避免两处口径不一致。
+        """
+        rows = self._watched_ep_rows(items)
         with self._cursor() as cur:
-            cur.execute("DELETE FROM watched_episodes")
-            cur.executemany(
+            cur.execute(
+                "DELETE FROM watched_episodes WHERE bangumi_id=?",
+                (int(bangumi_id),),
+            )
+            if rows:
+                cur.executemany(
+                    """
+                    INSERT OR REPLACE INTO watched_episodes
+                        (bangumi_ep_id, subject_id, bangumi_id, subject_name,
+                         ep_index, ep_name, watched_at)
+                    VALUES (?,?,?,?,?,?,?)
+                    """,
+                    rows,
+                )
+            cur.execute(
                 """
-                INSERT OR REPLACE INTO watched_episodes
-                    (bangumi_ep_id, subject_id, bangumi_id, subject_name,
-                     ep_index, ep_name, watched_at)
-                VALUES (?,?,?,?,?,?,?)
+                INSERT OR REPLACE INTO ep_sync_state
+                    (bangumi_id, collection_updated_at, ep_status, ep_rows,
+                     synced_at)
+                VALUES (?,?,?,?,?)
                 """,
-                rows,
+                (
+                    int(bangumi_id),
+                    collection_updated_at or "",
+                    int(ep_status or 0),
+                    len(rows),
+                    _now(),
+                ),
             )
 
-    def list_watched_episodes(self, limit: int = 500) -> list[dict]:
-        """按标记时间倒序列出集级观看记录。"""
+    def list_watched_episodes(self, limit: int = 5000) -> list[dict]:
+        """按标记时间倒序列出集级观看记录。
+
+        默认上限 5000：全量同步后本表约 1000+ 行（实测密度 ≈6 条/部 × 160 部），
+        旧默认 500 会静默截断掉历史。动态页的分页在 QML 侧做，这里给足。
+        """
         with self._cursor() as cur:
             cur.execute(
                 """
@@ -700,51 +779,46 @@ class Database:
         with self._cursor() as cur:
             cur.execute("DELETE FROM watched_episodes")
 
-    def trim_watched_episodes(self, limit: int) -> int:
-        """只保留**最近 limit 条**集级记录（按 watched_at 倒序），返回删除行数。
-
-        用途：用户把「集级记录条数」改**小**之后，表里多出来的记录成了脏数据
-        —— 它们会被动态页读到（表现为"改成 5 条后还显示 40 条"）。
-        配置保存时裁一次即可。`limit <= 0` 视为清空。
-
-        **按条数裁而不是按部数裁**：抓取范围是"凑够 N 条即停"算出来的，
-        部数与 N 不再一一对应，只有条数口径稳定（早期按部数裁，
-        与拉取端的名单口径一旦不一致就会误删本次要用的数据）。
-
-        注意：这里只裁剪、不补拉。补拉由配置保存后的 applyEpisodeCount
-        或用户点「刷新」触发。
-        """
-        n = max(0, int(limit))
-        with self._cursor() as cur:
-            cur.execute(
-                """
-                DELETE FROM watched_episodes
-                WHERE bangumi_ep_id NOT IN (
-                    SELECT bangumi_ep_id FROM watched_episodes
-                    ORDER BY watched_at DESC LIMIT ?
-                )
-                """,
-                (n,),
-            )
-            return cur.rowcount
-
     def count_watched_episodes(self) -> int:
         with self._cursor() as cur:
             cur.execute("SELECT COUNT(*) AS n FROM watched_episodes")
             return int(cur.fetchone()["n"])
 
-    def watched_episodes_age(self) -> Optional[float]:
-        """集级记录距今秒数（用最新一条的时间戳）；无数据返回 None。"""
+    # ---------- F20：同步水位 ----------
+    def load_ep_sync_state(self) -> dict[int, EpSyncState]:
+        """读出全部水位，供 `sync_candidates()` 判断哪些部要重拉。
+
+        一次查完（一部一行，量级与收藏数同级），不要在候选循环里逐部查。
+        """
         with self._cursor() as cur:
-            cur.execute("SELECT MAX(watched_at) AS t FROM watched_episodes")
-            row = cur.fetchone()
-            if not row or not row["t"]:
-                return None
-        try:
-            dt = datetime.fromisoformat(row["t"])
-        except ValueError:
-            return None
-        return (datetime.now(dt.tzinfo) - dt).total_seconds()
+            cur.execute("SELECT * FROM ep_sync_state")
+            return {
+                int(r["bangumi_id"]): EpSyncState(**dict(r))
+                for r in cur.fetchall()
+            }
+
+    def clear_ep_sync_state(self) -> None:
+        """清空水位（"强制全量重新同步"的入口）。
+
+        **注意**：单独清水位会让所有条目在下一次刷新时重拉一遍，这是
+        预期行为；但**不要**与 `clear_watched_episodes()` 的语义搞混 ——
+        见 `replace_subject_watched_episodes` 的说明。
+        """
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM ep_sync_state")
+
+    def clear_ep_sync_state_for(self, bangumi_id: int) -> None:
+        """让**单个**条目下次刷新时重拉（本软件自己标记完一集后调用）。"""
+        with self._cursor() as cur:
+            cur.execute(
+                "DELETE FROM ep_sync_state WHERE bangumi_id=?",
+                (int(bangumi_id),),
+            )
+
+    def count_ep_sync_state(self) -> int:
+        with self._cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM ep_sync_state")
+            return int(cur.fetchone()["n"])
 
     # ---------- F19：订阅源 ----------
     def add_rss_source(
