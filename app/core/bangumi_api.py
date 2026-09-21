@@ -112,7 +112,9 @@ class BangumiClient:
             total=3, connect=3, read=3,
             backoff_factor=0.5,
             status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset(["GET", "POST", "PUT", "DELETE"]),
+            # PATCH 也要列进来：标记单集看过用的是 PATCH（见 mark_episode_watched）。
+            # 该操作是幂等的（把某集置为"看过"），重试不会产生副作用。
+            allowed_methods=frozenset(["GET", "POST", "PUT", "PATCH", "DELETE"]),
         )
         adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("https://", adapter)
@@ -171,6 +173,22 @@ class BangumiClient:
         except requests.RequestException as e:
             # 连接类故障 → 换成能照着做的提示（原始异常已在上面进日志）
             log.warning("Bangumi GET %s 失败%s: %s", url, label, e)
+            raise BangumiError(self._network_hint(e, url)) from e
+
+    def _patch(self, path: str, json: Any = None) -> Any:
+        """PATCH 请求（与 `_post` 同形）。
+
+        单独写一个是因为 Bangumi 的"更新"类端点用 PATCH（如章节收藏），
+        复用一个 `_request(method, ...)` 反而更绕。
+        """
+        url = f"{self.api_base}{path}"
+        label = self._subject_label(path, {})
+        try:
+            resp = self.session.patch(url, json=json, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json() if resp.content else {}
+        except requests.RequestException as e:
+            log.warning("Bangumi PATCH %s 失败%s: %s", url, label, e)
             raise BangumiError(self._network_hint(e, url)) from e
 
     def _post(self, path: str, json: Any = None) -> Any:
@@ -277,9 +295,23 @@ class BangumiClient:
         return out[:limit]
 
     def mark_episode_watched(self, subject_id: int, episode_id: int) -> bool:
-        """type=2 表示「看过」。"""
+        """把一集标记为「看过」（`type=2`）。
+
+        **踩坑（方法写错，2026-09 实测）**：端点路径与请求体早期就写对了，
+        但方法写成了 **`POST`** ✗ —— 服务端返回
+        **404 `{"title":"Not Found","details":{"path":...}}`**，
+        这是"**路径/方法不存在**"（和"资源不存在"不是一回事 ✗），
+        表现为"看完的自动标记、以及补传全都失败，却看着像条目 ID 不对"。
+
+        以官方 spec（`https://bangumi.github.io/api/dist.json`）为准：
+            PATCH /v0/users/-/collections/{subject_id}/episodes
+                  body {"episode_id": [<int>...], "type": EpisodeCollectionType}
+        （同路径的 `PUT /v0/users/-/collections/-/episodes/{episode_id}`
+          是单集版，body 只要 `{"type": N}`；本项目用批量版，一次一集。）
+        该文档还说：**PATCH 会顺便重算条目的完成度** ✓
+        """
         body = {"episode_id": [episode_id], "type": 2}
-        self._post(f"/v0/users/-/collections/{subject_id}/episodes", json=body)
+        self._patch(f"/v0/users/-/collections/{subject_id}/episodes", json=body)
         return True
 
     def get_collection(self, subject_id: int) -> Optional[dict]:

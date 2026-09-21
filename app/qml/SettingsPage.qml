@@ -109,6 +109,7 @@ Item {
         v["bangumi.api_base"] = apiBaseField.text.trim() || "https://api.bgm.tv"
         v["bangumi.proxy"] = proxyField.text.trim()
         v["bangumi.ep_timeline_count"] = epTimelineField.value
+        v["bangumi.auto_upload"] = autoUploadBox.checked
         // 路径
         v["general.library_path"] = libraryField.text.trim()
         v["general.player_path"] = playerField.text.trim()
@@ -430,6 +431,22 @@ Item {
                             color: Theme.textTertiary
                             font.pixelSize: Theme.fontXs
                         }
+                    }
+                }
+
+                FormRow {
+                    width: parent.width
+                    label: "自动上传"
+                    // 只管"**看完那一刻是否立即同步**"（实测选定的节点）。
+                    // 关掉之后：本地记录照写（来源 tag 只有「本地」），什么时候
+                    // 上传由「动态 → 上传」小窗决定 —— 差集与幂等由那边保证，
+                    // 所以关掉**不会丢记录**，只是延迟同步。
+                    hint: "看完一集后立即标记到 Bangumi；关闭则只记本地，改用「动态 → 上传」手动补传"
+                    CheckBoxLine {
+                        id: autoUploadBox
+                        objectName: "autoUploadBox"
+                        checked: root.getBool("bangumi.auto_upload", true)
+                        text: "启用（关闭后可在「动态 → 上传」里手动补传）"
                     }
                 }
             }

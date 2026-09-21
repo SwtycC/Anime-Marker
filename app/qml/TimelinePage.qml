@@ -10,11 +10,11 @@ import QtQuick.Controls
 // 为什么不放设置页：这是"看当前页面"的临时视图偏好，切换后应立刻见效。
 // 放设置页需要"改完→点保存→切页"，多两步且容易让人以为按钮没生效。
 //
-// 呈现规则：
-// - `local` 模式**按动漫聚合**：同一部即使看了多集也只占一行，行内显示
-//   「已看 N 集」（本地记录是同一次观看会话产生的，聚合更易读）。
-// - `merged` 模式**逐集一行**：Bangumi 记录的核心价值就是"每集什么时候
-//   看的"，聚合会把这个信息丢掉；本地记录同样逐集展示。
+// 呈现规则（**两种模式都是逐集一行**，区别只在"收不收 Bangumi 的"）：
+// - 一行 = 一集：显示集号（EP7）+ 集名（「妈妈」）+ 来源 tag（本地 / bgm）
+// - `local` 模式：只显示本地播放记录
+// - `merged` 模式：本地 + Bangumi 逐集记录，同一集两边都有时**合并成一行、
+//   两个 tag 同时亮**（表示"本地看过且已同步"）
 // - 两个来源都带 `watchedAt`，混在一起**按时间倒序**，并按日期归入
 //   今天 / 昨天 / 本周 / … 等分组。
 // - 列表默认只渲染首屏 N 条（`ep_timeline_count`），其余靠滚动到底或
@@ -46,6 +46,9 @@ Item {
                                ? library.inProgress : []
 
     signal subjectClicked(int subjectId)
+
+    /// 请求打开「上传」小窗（由 Main.qml 接到 UploadDialog 上）
+    signal uploadRequested()
 
     // 页面内的提示（Main.qml 转成状态栏消息，同 SubscriptionPage / SettingsPage）
     signal statusMessage(string text)
@@ -178,15 +181,16 @@ Item {
         var out = []
         var seen = {}
 
-        // ---- 1. 本地播放记录（按动漫聚合）----
+        // ---- 1. 本地播放记录（**逐集一行，两种视图都一样**）----
+        //
+        // **踩坑（别再聚合成本地视角的"已看 N 集"）**：早期「仅本地」把同一部
+        // 聚合成一行、显示「已看 N 集」，而「本地 + Bangumi」是逐集展开 ——
+        // 同一个页面两种粒度，切换过去像换了个功能 ✗（实测反馈："要和
+        // 本地+bangumi 一样，写清单集名字，不要混在一起写 2 集"）。
+        // 而且聚合后就**没法与 Bangumi 的逐集记录按 (条目, 集号) 合并** ✗。
+        // 现在统一逐集：一行 = 一集，带集号和集名；本地来源打「本地」tag。
         for (var i = 0; i < localEntries.length; i++) {
             var e = localEntries[i]
-            var key = String(e.subjectId)
-            if (seen[key] !== undefined) {
-                out[seen[key]].watchedEpCount += 1
-                continue
-            }
-            seen[key] = out.length
             out.push({
                 // episodeId 必须带上：rowKey() 用它做行的稳定标识（悬停高亮靠它）
                 "episodeId": e.episodeId,
@@ -195,11 +199,15 @@ Item {
                 "epIndex": e.epIndex,
                 "epTitle": e.epTitle,
                 "watchedAt": e.watchedAt,
-                "watchedEpCount": 1,
+                "isLocal": true,        // 本地播放记录（tag「本地」）
                 "isBangumi": false,
                 "isInProgress": false
             })
         }
+        // (条目, 集号) 索引 → 供第 2 步与 Bangumi 逐集记录合并
+        var localIndex = {}
+        for (var li = 0; li < out.length; li++)
+            localIndex[out[li].subjectId + "#" + out[li].epIndex] = li
 
         // ---- 2. Bangumi 集级记录（merged 模式）----
         //
@@ -213,6 +221,23 @@ Item {
         if (source === "merged") {
             for (var j = 0; j < bangumiEpisodes.length; j++) {
                 var be = bangumiEpisodes[j]
+                var mkey = be.subjectId + "#" + be.epIndex
+                var at = localIndex[mkey]
+                if (at !== undefined) {
+                    // **同一集两边都有 → 合并成一行**（不新增行）：
+                    // 打上 isBangumi，于是 tag 变成「本地」+「bgm」两个，
+                    // 表示"这一集既本地看过、也已同步到 Bangumi"。
+                    //
+                    // 时间取 **Bangumi 的**：用户明确要求与 Bangumi 网页一致
+                    // （本地看的时间通常更早，但两处不一致更让人困惑）。
+                    // 中列改成集标题（Bangumi 那边信息更全）。
+                    var row = out[at]
+                    row.isBangumi = true
+                    row.epTitle = be.epTitle || row.epTitle
+                    row.watchedAt = be.watchedAt || row.watchedAt
+                    row.inLibrary = be.inLibrary || row.inLibrary
+                    continue
+                }
                 out.push({
                     // 同上：rowKey() 依赖 episodeId
                     "episodeId": be.episodeId,
@@ -222,6 +247,7 @@ Item {
                     "epTitle": be.epTitle,
                     "watchedAt": be.watchedAt,
                     "watchedEpCount": 1,
+                    "isLocal": false,
                     "isBangumi": true,
                     "isInProgress": false,
                     "inLibrary": be.inLibrary
@@ -259,8 +285,8 @@ Item {
             spacing: Theme.spacingMd
 
             Column {
-                width: parent.width - sourceSeg.width - refreshBtn.width
-                       - Theme.spacingMd * 2
+                width: parent.width - uploadBtn.width - sourceSeg.width
+                       - refreshBtn.width - Theme.spacingMd * 3
                 spacing: 2
 
                 Text {
@@ -277,6 +303,17 @@ Item {
                     font.pixelSize: Theme.fontSm
                     elide: Text.ElideRight
                 }
+            }
+
+            // 「上传」：把**本地看过、Bangumi 还没标**的集补传上去。
+            // 放这里而不是「在看」页：这条时间线才是"看过什么"的完整视图，
+            // 而且补传本身就是"让本地记录变成 bgm"的动作（见 UploadDialog）。
+            AppButton {
+                id: uploadBtn
+                objectName: "timelineUploadBtn"
+                anchors.verticalCenter: parent.verticalCenter
+                text: "上传"
+                onClicked: root.uploadRequested()
             }
 
             // 内容来源切换（页面内即时生效，不写配置）
@@ -421,25 +458,47 @@ Item {
                                         elide: Text.ElideRight
                                     }
 
-                                    // 中列：本地聚合记录显示「已看 N 集」，
-                                    //       Bangumi 集级记录显示集标题
+                                    // 中列：集标题（两种视图、两种来源都一样）。
+                                    // 本地记录没有集名时（扫描时没匹配到 Bangumi
+                                    // 的集数列表）写「本地观看」，不留空列。
                                     Text {
                                         id: epCountLabel
                                         anchors.verticalCenter: parent.verticalCenter
                                         width: Math.max(implicitWidth, 56)
-                                        text: modelData.item.isBangumi
-                                              ? (modelData.item.epTitle || "")
-                                              : "已看 " + modelData.item.watchedEpCount + " 集"
+                                        text: modelData.item.epTitle
+                                              || (modelData.item.isBangumi ? ""
+                                                                           : "本地观看")
                                         color: Theme.textTertiary
                                         font.pixelSize: Theme.fontSm
                                         elide: Text.ElideRight
                                     }
 
-                                    // 右列：相对时间（Bangumi 记录额外标注来源）
+                                    // 右列：来源 tag + 相对时间
                                     Row {
                                         anchors.verticalCenter: parent.verticalCenter
                                         spacing: Theme.spacingXs
 
+                                        // 「本地」tag：本程序播放（或手动标记）留下的记录。
+                                        // 用主题色底，与下面「bgm」的中性描边区分开。
+                                        Rectangle {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            visible: modelData.item.isLocal === true
+                                            width: localLabel.implicitWidth + 8
+                                            height: 16
+                                            radius: 2
+                                            color: Theme.accentSoft
+
+                                            Text {
+                                                id: localLabel
+                                                anchors.centerIn: parent
+                                                text: "本地"
+                                                color: Theme.accent
+                                                font.pixelSize: Theme.fontXs
+                                            }
+                                        }
+
+                                        // 「bgm」tag：来自 Bangumi 的集级记录。
+                                        // 两个 tag 同时出现 = 这一集既本地看过、也已同步到 Bangumi。
                                         Rectangle {
                                             anchors.verticalCenter: parent.verticalCenter
                                             visible: modelData.item.isBangumi === true
@@ -807,8 +866,7 @@ Item {
         var parts = []
         if (source === "local") {
             if (entries.length > 0)
-                parts.push("已看 " + entries.length + " 部（原始 "
-                           + localEntries.length + " 条记录）")
+                parts.push("本地 " + entries.length + " 条")
             else
                 parts.push("暂无观看记录")
             return parts.join(" · ")

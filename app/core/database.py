@@ -775,6 +775,123 @@ class Database:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    def pending_uploads(
+        self, subject_ids: Optional[list[int]] = None
+    ) -> dict[int, list[dict]]:
+        """**本地看过、Bangumi 未标**的集。
+
+        返回 `{subject_id: [{episode_id, bangumi_ep_id, ep_index, ep_title}]}`
+        （`episode_id` 是本地 `episodes.id` —— 小窗的勾选单位）。
+
+        **「待补传」的判据只在这里定义一次**（小窗里的数字、按钮上的数字、
+        实际上传时的筛选，三处都走这一个查询）—— 否则口径一旦分叉，
+        用户会看到"显示 3 条却只传了 1 条"这类对不上的现象 ✗。
+
+        判据三条件（缺一不可）：
+            episodes.watched = 1        —— 本地确实看过
+            episodes.bangumi_ep_id > 0  —— 有对应集号（没有就传不了）
+            watched_episodes 里没有该集 —— Bangumi 上还没标（幂等的依据）
+        """
+        where, params = "", []
+        if subject_ids:
+            ids = [int(i) for i in subject_ids if i]
+            if not ids:
+                return {}
+            where = " AND e.subject_id IN (%s)" % ",".join("?" for _ in ids)
+            params = ids
+        with self._cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT e.subject_id AS sid, e.bangumi_ep_id AS ep_id,
+                       e.id AS episode_id, e.ep_index AS ep_index,
+                       e.title AS ep_title
+                FROM episodes e
+                LEFT JOIN watched_episodes w ON w.bangumi_ep_id = e.bangumi_ep_id
+                WHERE e.watched = 1 AND e.bangumi_ep_id > 0
+                  AND w.bangumi_ep_id IS NULL{where}
+                ORDER BY e.subject_id, e.ep_index
+                """,
+                params,
+            )
+            out: dict[int, list[dict]] = {}
+            for r in cur.fetchall():
+                out.setdefault(int(r["sid"]), []).append(
+                    {"bangumi_ep_id": int(r["ep_id"]),
+                     # 本地集 id：小窗勾选的单位就是它（一行 = 一集）
+                     "episode_id": int(r["episode_id"]),
+                     "ep_index": float(r["ep_index"] or 0),
+                     "ep_title": r["ep_title"] or ""})
+            return out
+
+    def blocked_upload_counts(
+        self, subject_ids: Optional[list[int]] = None
+    ) -> dict[int, int]:
+        """`{subject_id: 本地看过但没有集号、无法补传的集数}`。
+
+        实测本机 1446 集里有 455 集是这个情况（扫描时没拿到集数元数据）——
+        它们必须**被明确告知跳过**，不能静默 ✗。
+        """
+        where, params = "", []
+        if subject_ids:
+            ids = [int(i) for i in subject_ids if i]
+            if not ids:
+                return {}
+            where = " AND subject_id IN (%s)" % ",".join("?" for _ in ids)
+            params = ids
+        with self._cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT subject_id AS sid, COUNT(*) AS n
+                FROM episodes
+                WHERE watched = 1 AND (bangumi_ep_id IS NULL OR bangumi_ep_id = 0){where}
+                GROUP BY subject_id
+                """,
+                params,
+            )
+            return {int(r["sid"]): int(r["n"]) for r in cur.fetchall()}
+
+    def upsert_watched_episodes(self, items: list[dict]) -> int:
+        """按集 upsert 集级记录（**上传成功后立刻写回本地**）。
+
+        为什么需要它：补传成功后，本地 `watched_episodes` 里还没有这一集 ——
+        动态页那一行要等**下一次集级同步**才会多出 `bgm` 标记 ✗。
+        用户刚点完「上传」却看不到任何变化，会以为没生效（实测反馈的同类问题）。
+        这里直接按 `bangumi_ep_id` upsert：不必等同步，界面立刻就是对的 ✓
+        （下一次同步会拉到同一集并覆盖，值一致 ✓）。
+
+        `watched_at` 由调用方给（补传用**上传时刻** —— 与 Bangumi 网页一致，
+        因为服务端记的就是那一刻）。
+        """
+        rows = self._watched_ep_rows(items)
+        if not rows:
+            return 0
+        with self._cursor() as cur:
+            cur.executemany(
+                """
+                INSERT OR REPLACE INTO watched_episodes
+                    (bangumi_ep_id, subject_id, bangumi_id, subject_name,
+                     ep_index, ep_name, watched_at)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                rows,
+            )
+            return len(rows)
+
+    def watched_episode_ids(self, bangumi_id: int) -> set[int]:
+        """该条目在 **Bangumi 上已标记「看过」** 的集 ID 集合。
+
+        用途：「上传」的**幂等判断** —— 只上传"本地看过但 Bangumi 上还没有"的集，
+        重复点按钮不会重复 POST；某几条失败后再点也只补那几条。
+        注意判据是"拉回来的集级记录"（`watched_episodes`），也就是 Bangumi
+        当前的真实状态，而不是本地标记 ✗。
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT bangumi_ep_id FROM watched_episodes WHERE bangumi_id=?",
+                (int(bangumi_id),),
+            )
+            return {int(r["bangumi_ep_id"]) for r in cur.fetchall()}
+
     def clear_watched_episodes(self) -> None:
         with self._cursor() as cur:
             cur.execute("DELETE FROM watched_episodes")

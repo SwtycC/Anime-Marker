@@ -14,6 +14,7 @@ AccentPicker 1.0 AccentPicker.qml
 PosterCard 1.0 PosterCard.qml
 DetailPage 1.0 DetailPage.qml
 MatchDialog 1.0 MatchDialog.qml
+UploadDialog 1.0 UploadDialog.qml
 StatusBar 1.0 StatusBar.qml
 AppScrollBar 1.0 AppScrollBar.qml
 FormRow 1.0 FormRow.qml

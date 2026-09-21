@@ -555,13 +555,20 @@ class _EpisodeWorker(QThread):
         # 注意那是**排序/兜底**口径，不是水位口径（见 sync_key）。
         collection_time = s.get("collection_time") or ""
         rows: list[dict] = []
+        no_time = 0
         for r in raw:
             # 只保留"看过"（type=2）。type 枚举与收藏一致。
+            # 注意：**整部只标了在看/想看、从没标过单集**时，这里会把所有行
+            # 都过滤掉 —— 那是**正常的终态**（这部就是没有逐集记录），
+            # 不是故障，调用方据此照常记水位（见 _on_ep_synced 的判据）。
             if (r.get("type") or 0) != 2:
                 continue
             ep = r.get("episode") or {}
             watched_at = _iso_from_epoch(r.get("updated_at")) or collection_time
             if not watched_at:
+                # 这一种才是**真故障**：该保留的记录因为拿不到时间被丢掉了
+                # （历史上 `updated_at` 恒为 0 时整批被弃 → 页面一片空白）
+                no_time += 1
                 continue
             rows.append({
                 "bangumi_ep_id": int(ep.get("id") or 0),
@@ -573,7 +580,12 @@ class _EpisodeWorker(QThread):
                 "watched_at": watched_at,
             })
         out["rows"] = rows
-        out["dropped"] = len(raw) - len(rows)
+        out["dropped"] = len(raw) - len(rows)   # 总丢弃数（含 type≠2 的，仅供诊断）
+        # **判据用的计数**：只统计"本该保留、却因时间戳缺失被丢"的那些。
+        # 早先用 `raw_count > 0 而 rows == 0` 当判据 ✗，把"整部没标过单集"
+        # 也当成故障 → 那批条目**每次刷新都被重拉**（实测一次同步刷出
+        # 23 行 WARNING、每轮都重新请求这 23 部 ✗）。
+        out["no_time"] = no_time
         out["ok"] = True
         return out
 
@@ -583,18 +595,22 @@ class _EpisodeWorker(QThread):
 
         三类口径：
         - `synced`  —— 成功且可写库（含"成功但没有记录"的终态）
-        - `skipped` —— 服务端返回了记录但过滤后一条不剩（不写库、不记水位）
+        - `no_marks`—— 成功、但这部**确实没有逐集标记**（0 条；正常终态 ✓）
+        - `skipped` —— **真故障**：记录因缺少时间戳被整批丢弃（不写库、不记水位）
         - `failed`  —— 请求失败（不写库、不记水位）
         """
-        summary = {"synced": 0, "rows": 0, "skipped": 0, "failed": 0}
+        summary = {"synced": 0, "rows": 0, "no_marks": 0, "skipped": 0,
+                   "failed": 0}
         for r in final.values():
             if not r["ok"]:
                 summary["failed"] += 1
-            elif r["raw_count"] and not r["rows"]:
+            elif r.get("no_time") and not r["rows"]:
                 summary["skipped"] += 1
             else:
                 summary["synced"] += 1
                 summary["rows"] += len(r["rows"])
+                if not r["rows"]:
+                    summary["no_marks"] += 1
         return summary
 
     def _fetch_with_session(self, session, subject_id: int) -> list[dict]:
@@ -641,6 +657,56 @@ class _EpisodeWorker(QThread):
         return out[:limit]
 
 
+class _UploadWorker(QThread):
+    """把「本地看过、Bangumi 还没标」的集逐条补传（F21）。
+
+    - **为什么走线程**：一次可能几十条 POST，串行要几秒到几十秒，放 UI 线程会卡界面。
+    - **为什么串行而不是并发**：`requests.Session` **不是线程安全的**，
+      并发 POST 要像 `_EpisodeWorker` 那样给每个线程各建一个 Session；这里
+      量小（一个条目几十集），串行的成本可以接受，不值得再引入那套复杂度。
+    - **逐条独立 try**：单条失败不影响其余；失败的会留在"待上传"里，
+      用户再点一次即只补失败的（幂等由调用方的差集筛选保证）。
+    """
+
+    progress = Signal(int, int)               # (已处理, 总数)
+    # (成功数, 失败数, {bangumi_id: [成功上传的 bangumi_ep_id, ...]})
+    # 结果随信号一起送，免得回调里去读可能已被 deleteLater 销毁的 worker ✗
+    finished_upload = Signal(int, int, object)
+
+    def __init__(
+        self,
+        api: BangumiClient,
+        tasks: list[tuple[int, list[dict]]],
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.api = api
+        # [(bangumi_id, [{bangumi_ep_id, ep_index}, ...]), ...]
+        self.tasks = tasks
+
+    def run(self) -> None:
+        ok = fail = 0
+        done = 0
+        total = sum(len(eps) for _, eps in self.tasks)
+        uploaded: dict[int, list[int]] = {}
+        for bid, eps in self.tasks:
+            for ep in eps:
+                try:
+                    self.api.mark_episode_watched(bid, int(ep["bangumi_ep_id"]))
+                    ok += 1
+                    uploaded.setdefault(int(bid), []).append(
+                        int(ep["bangumi_ep_id"]))
+                except Exception as e:
+                    fail += 1
+                    log.warning("补传条目 %s 第 %s 集失败（本地记录已保留，可重试）: %s",
+                                bid, ep.get("ep_index"), e)
+                done += 1
+                self.progress.emit(done, total)
+        log.info("补传完成：成功 %s 条，失败 %s 条（涉及 %s 个条目）",
+                 ok, fail, len(uploaded))
+        self.finished_upload.emit(ok, fail, uploaded)
+
+
 class InProgressBridge(QObject):
     """Bangumi「看过」收藏数据源（负责拉取与落库，展示交给 LibraryBridge）。"""
 
@@ -665,6 +731,9 @@ class InProgressBridge(QObject):
         self._running = False
         self._worker: Optional[_FetchWorker] = None
         self._ep_worker: Optional[_EpisodeWorker] = None
+        self._upload_worker: Optional[_UploadWorker] = None
+        # 待传集的本地行（bangumi_ep_id → 行），上传成功后写回用
+        self._upload_meta: dict[int, dict] = {}
         # 界面刷新节流：首次全量会写十几批，合并到最多 1 次/秒
         # （见 _schedule_ui_refresh）
         self._ui_refresh_pending = False
@@ -857,23 +926,31 @@ class InProgressBridge(QObject):
         首次全量的十几秒里动态页一直是旧的。现在每批 10 部就写一次。
 
         三条分支（护栏的实现在这里，不在 worker）：
-        - `ok=False`             → 不写、不记水位，下次刷新自动重试
-        - `raw_count>0, rows=0`  → 服务端给了记录但过滤后一条不剩（历史故障：
-                                   `updated_at` 恒为 0 → 整批被弃 → 页面空白）。
-                                   **不写、不记水位**，下次重试。
+        - `ok=False`              → 不写、不记水位，下次刷新自动重试
+        - `no_time>0 且 rows==0`  → **真故障**：该保留的记录因拿不到时间戳被
+                                    整批丢弃（历史故障：`updated_at` 恒为 0）。
+                                    **不写、不记水位**，下次重试。
         - 其余（含"成功且确实 0 条"）→ 写库 + 记水位，那是终态。
+          其中"0 条"绝大多数是**整部只标了在看/想看、从没标过单集** ✗ ——
+          它们本来就是 0 条，那是终态答案、必须记水位，否则每轮刷新都会
+          重新请求它们（实测一次同步重拉 23 部 ✗）。
         """
         written = 0
+        no_marks = 0        # "成功但确实 0 条"的部数（正常终态，不是跳过）
         for r in batch or []:
             try:
                 if not r.get("ok"):
                     continue
-                if r.get("raw_count") and not r.get("rows"):
+                if r.get("no_time") and not r.get("rows"):
                     log.warning(
-                        "条目 %s 返回 %s 条原始记录但没有可用的逐集记录，"
+                        "条目 %s 有 %s 条记录因缺少时间戳被整批丢弃，"
                         "本次不写库、不记水位（下次重试）",
-                        r.get("bangumi_id"), r.get("raw_count"))
+                        r.get("bangumi_id"), r.get("no_time"))
                     continue
+                if r.get("ok") and not r.get("rows"):
+                    # 0 条不是故障：整部没标过单集就是这样。落库（0 行）+
+                    # 记水位，让它成为终态，别每轮重拉。
+                    no_marks += 1
                 self._db.replace_subject_watched_episodes(
                     int(r["bangumi_id"]),
                     r.get("rows") or [],
@@ -886,6 +963,10 @@ class InProgressBridge(QObject):
                 log.exception("写入条目 %s 的集级记录失败", r.get("bangumi_id"))
         if written:
             self._schedule_ui_refresh()
+        if no_marks:
+            # 不是异常：整部只标了在看/想看、没标过单集，0 条就是终态答案。
+            # 记一行 INFO 便于回答"为什么这部没有逐集记录"。
+            log.info("本批 %s 部没有逐集标记（已记账，后续不再重复请求）", no_marks)
 
     def _schedule_ui_refresh(self) -> None:
         """把"写库完成 → 通知界面"合并到最多 1 次/秒。
@@ -944,6 +1025,142 @@ class InProgressBridge(QObject):
                 self._done_hook()
             except Exception:
                 log.exception("刷新收藏数据缓存失败")
+
+    # ---------- 补传：本地看过 → Bangumi（F21）----------
+    @Slot("QVariantList", result="QVariantMap")
+    def uploadEpisodes(self, episode_ids: list) -> dict:
+        """把**勾选的那几集**补传到 Bangumi（**幂等**）。
+
+        与"按条目上传"的区别：粒度是**集** —— 小窗是一行一集，用户可能只勾
+        其中几集（比如某部只想先传一集试试 ✗）。
+
+        **幂等**：待传清单仍由 `Database.pending_uploads()` 给出（判据只定义在
+        那一处 ✓），再按传入的 `episode_id` 过滤。于是：
+          - 某集在别处已经传过（不再待传）→ 这里自动排除 ✓，重复点不会重复 POST ✓
+          - 上次失败的那些仍在待传清单里 → 再点一次就只补它们 ✓
+
+        真正的 POST 在 `_UploadWorker` 线程里跑（条数多时要几秒），所以这里
+        立刻返回统计、结果由 `message` 信号稍后报告。返回：
+            {"ok", "pending", "blocked", "subjects", "message"}
+        """
+        # 连点两次时，上一个 worker 可能已经跑完并被 deleteLater 销毁 ——
+        # 此时 `isRunning()` 会抛 RuntimeError（C++ 对象已删），按"没在跑"处理。
+        # 同类坑见 cancel() 的说明。
+        try:
+            if self._upload_worker is not None and self._upload_worker.isRunning():
+                return {"ok": False, "pending": 0, "subjects": 0,
+                        "message": "上一批补传还在进行中…"}
+        except RuntimeError:
+            pass
+
+        ids = {int(i) for i in (episode_ids or []) if i}
+        if not ids:
+            return {"ok": False, "pending": 0, "subjects": 0,
+                    "message": "没有勾选要上传的集"}
+
+        try:
+            pend = self._db.pending_uploads()      # {subject_id: [集...]}
+            blocked = sum(self._db.blocked_upload_counts().values())
+        except Exception as e:
+            log.exception("准备补传失败: %s", e)
+            return {"ok": False, "pending": 0, "subjects": 0,
+                    "message": f"准备补传失败：{e}"}
+
+        tasks: list[tuple[int, list[dict]]] = []
+        meta: dict[int, dict] = {}      # bangumi_ep_id → 写回本地的行（见 _on_upload_finished）
+        unmatched = 0
+        for sid, eps in pend.items():
+            sel = [e for e in eps if int(e.get("episode_id") or 0) in ids]
+            if not sel:
+                continue
+            try:
+                subj = self._db.get_subject(int(sid))
+            except Exception:
+                subj = None
+            if subj is None or not subj.bangumi_id:
+                # 本地条目没匹配到 Bangumi → 没有可提交的目标，跳过
+                unmatched += len(sel)
+                continue
+            tasks.append((int(subj.bangumi_id), sel))
+            for e in sel:
+                meta[int(e["bangumi_ep_id"])] = {
+                    "bangumi_ep_id": int(e["bangumi_ep_id"]),
+                    "subject_id": int(sid),
+                    "bangumi_id": int(subj.bangumi_id),
+                    "subject_name": subj.name_cn or subj.name or "",
+                    "ep_index": e.get("ep_index") or 0,
+                    "ep_name": e.get("ep_title") or "",
+                }
+        self._upload_meta = meta
+
+        if not tasks:
+            msg = "勾选的集都不需要上传了（可能刚刚已经同步过）"
+            if unmatched:
+                msg += f"；{unmatched} 集所在条目未匹配 Bangumi"
+            return {"ok": True, "pending": 0, "subjects": 0, "message": msg}
+
+        total = sum(len(eps) for _, eps in tasks)
+        self._upload_worker = _UploadWorker(self._api, tasks)
+        self._upload_worker.progress.connect(self._on_upload_progress)
+        self._upload_worker.finished_upload.connect(self._on_upload_finished)
+        self._upload_worker.finished.connect(self._upload_worker.deleteLater)
+        self._upload_worker.start()
+        log.info("开始补传：勾选 %s 集 / 实际待传 %s 集 / %s 个条目（%s 集所在条目未匹配 Bangumi，已跳过）",
+                 len(ids), total, len(tasks), unmatched)
+        msg = f"开始补传 {total} 集（{len(tasks)} 部）…"
+        if blocked:
+            msg += f"；另有 {blocked} 集缺 Bangumi 集号，无法补传"
+        return {"ok": True, "pending": total, "subjects": len(tasks),
+                "message": msg}
+
+    def _on_upload_progress(self, done: int, total: int) -> None:
+        # 只在整数分档时报一次，别刷屏
+        if total and (done == total or done % max(1, total // 5) == 0):
+            self.message.emit(f"补传中… {done}/{total} 条")
+
+    def _on_upload_finished(self, ok: int, fail: int,
+                            uploaded: dict | None = None) -> None:
+        """补传结束：**先写回本地**，再让那些条目的集级记录重新同步一次。
+
+        **为什么必须写回**：补传成功后本地 `watched_episodes` 还没有这一集 ——
+        动态页那行要等下一次集级同步才会多出 `bgm` 标记 ✗，用户刚点完「上传」
+        却看不到变化，会以为没生效。这里直接 upsert（`watched_at` 取**上传
+        时刻**，与 Bangumi 网页一致），界面立刻就是对的 ✓；
+        下一次同步会拉到同一集并覆盖，值一致 ✓
+        
+
+        否则刚传上去的集要等下一次增量同步才会在动态页显示成 `bgm`
+        （见 sync_candidates）—— 用户点了上传却看不到变化，会以为没生效。
+        `touched` 由信号一起带过来：**不去读可能已被 deleteLater 销毁的 worker** ✗
+        """
+        # ---- 1. 先把上传成功的集写回本地（动态页立刻显示 bgm 标记）----
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        rows = [dict(self._upload_meta.get(int(eid)), watched_at=now)
+                for ep_ids in (uploaded or {}).values()
+                for eid in ep_ids
+                if self._upload_meta.get(int(eid))]
+        if rows:
+            try:
+                self._db.upsert_watched_episodes(rows)
+                log.info("已把 %s 条补传结果写回本地（动态页立刻可见）", len(rows))
+            except Exception as e:
+                log.warning("写回本地失败（不影响上传，下次同步会补上）: %s", e)
+
+        # ---- 2. 再让这些条目的集级记录重新同步一次（水位数对不上，拉一次校正）----
+        touched = set((uploaded or {}).keys())
+        try:
+            for bid in touched:
+                self._db.clear_ep_sync_state_for(int(bid))
+            if touched:
+                self._refresh_ep_view()
+        except Exception as e:
+            log.warning("补传后刷新集级记录失败（不影响补传）: %s", e)
+        if fail:
+            # 失败的不清掉"待上传"状态 —— 小窗里再点一次即只补它们
+            self.message.emit(
+                f"补传完成：成功 {ok} 条，失败 {fail} 条（可再点一次只补失败的）")
+        else:
+            self.message.emit(f"补传完成：{ok} 条已同步到 Bangumi")
 
     @Slot(str, result="QVariantMap")
     def resolveUsername(self, token: str = "") -> dict:
@@ -1071,7 +1288,8 @@ class InProgressBridge(QObject):
         早期版本没接住这个异常，退出时必打一条"等待拉取结束失败"的
         误导性警告（看着像线程没退干净，其实早就结束了）。
         """
-        for w, label in ((self._worker, "收藏列表"), (self._ep_worker, "集级记录")):
+        for w, label in ((self._worker, "收藏列表"), (self._ep_worker, "集级记录"),
+                         (self._upload_worker, "补传")):
             if w is None:
                 continue
             try:

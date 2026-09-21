@@ -62,6 +62,7 @@ class PlayerBridge(QObject):
             poll_interval=config.getint("monitor", "poll_interval", 3),
             trigger_threshold=config.getfloat("monitor", "trigger_threshold", 0.95),
             title_regex=config.get("monitor", "title_regex", ""),
+            auto_upload=config.getbool("bangumi", "auto_upload", True),
             parent=self,
         )
         self._monitor.progress_changed.connect(self._on_progress)

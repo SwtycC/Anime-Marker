@@ -120,6 +120,8 @@ ApplicationWindow {
             TimelinePage {
                 id: timelinePage
                 objectName: "timelinePage"
+                // 「上传」→ 打开补传小窗（见 UploadDialog.qml）
+                onUploadRequested: uploadDialog.open()
                 onSubjectClicked: function (subjectId) {
                     if (subjectId <= 0)
                         return
@@ -221,6 +223,17 @@ ApplicationWindow {
             var subj = typeof library !== "undefined" && library
                        ? library.subject(subjectId) : null
             matchDialog.open(subjectId, subj ? subj.title : "")
+        }
+    }
+
+    // ============ 上传对话框（本地观看记录 → Bangumi）============
+    UploadDialog {
+        id: uploadDialog
+
+        // 上传成功后动态页要重取（传过的集会从「仅本地」变成带 bgm 标记）
+        onVisibleChanged: {
+            if (!visible)
+                timelinePage.reload()
         }
     }
 

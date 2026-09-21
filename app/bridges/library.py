@@ -137,6 +137,14 @@ class LibraryBridge(QObject):
             log.exception("读取在看缓存失败: %s", e)
             return []
 
+        # 「上传」统计：**一次查全量**再按条目取（逐条查会变成 2N 次查询）
+        try:
+            pend_map = self._db.pending_uploads()
+            block_map = self._db.blocked_upload_counts()
+        except Exception as e:
+            log.exception("统计待补传失败: %s", e)
+            pend_map, block_map = {}, {}
+
         out: list[dict] = []
         for it in items:
             # 本地关联：有同 bangumi_id 的条目就能一键跳详情
@@ -157,6 +165,10 @@ class LibraryBridge(QObject):
             # 「下一集」按钮：要播的集 ID（0 = 播不了）+ 播不了时的原因文案。
             # 按钮**不隐藏**，点不动时把原因报到状态栏（见 _next_episode）。
             next_ep_id, next_ep_hint = self._next_episode(local_id, it.ep_status)
+            # 「上传」按钮：本地看过但 Bangumi 未标的集数（0 = 无事可做），
+            # 以及本地看过却没有 bangumi_ep_id、压根传不了的集数
+            pending_up = len(pend_map.get(local_id, []))
+            blocked_up = int(block_map.get(local_id, 0))
 
             out.append({
                 "bangumiId": int(it.bangumi_id or 0),
@@ -174,8 +186,62 @@ class LibraryBridge(QObject):
                 "inLibrary": local_id > 0,
                 "nextEpisodeId": next_ep_id,
                 "nextEpisodeHint": next_ep_hint,
+                "pendingUpload": pending_up,
+                "blockedUpload": blocked_up,
             })
         return out
+
+    @Slot(result="QVariantList")
+    def pendingUploads(self) -> list[dict]:
+        """「本地看过、Bangumi 未标」的**逐集**清单 —— 动态页「上传」小窗的数据源。
+
+        **一行 = 一集**（小窗里勾选的就是"这一集"），字段：
+            {episodeId, bangumiEpId, subjectId, title, epIndex, epTitle}
+        `title` 是动漫名 —— 小窗里与集名一起显示成「碧蓝之海 第三季 · EP7 妈妈」，
+        否则用户根本看不出待传的是哪一集 ✗（实测反馈）。
+
+        判据统一由 `Database.pending_uploads()` 给出 —— 与实际上传时的筛选
+        **是同一个查询** ✓（否则会出现"显示 3 条只传了 1 条"）。
+        """
+        try:
+            pend_map = self._db.pending_uploads()
+        except Exception as e:
+            log.exception("统计待补传失败: %s", e)
+            return []
+        out: list[dict] = []
+        for sid, eps in pend_map.items():
+            try:
+                subj = self._db.get_subject(int(sid))
+            except Exception:
+                subj = None
+            if subj is None or not subj.bangumi_id:
+                continue            # 没匹配到 Bangumi 的传不了，不列
+            title = subj.name_cn or subj.name or "（未命名条目）"
+            for e in eps:
+                out.append({
+                    "episodeId": int(e["episode_id"]),
+                    "bangumiEpId": int(e["bangumi_ep_id"]),
+                    "subjectId": int(sid),
+                    "title": title,
+                    "epIndex": float(e["ep_index"] or 0),
+                    "epTitle": e.get("ep_title") or "",
+                })
+        # 按动漫名 + 集号排：同一部的待传集挨在一起，便于逐部核对
+        out.sort(key=lambda x: (x["title"], x["epIndex"]))
+        return out
+
+    @Slot(result=int)
+    def blockedUploadCount(self) -> int:
+        """本地看过但**没有 Bangumi 集号**、无法补传的集数（小窗里提示用）。
+
+        实测本机 1446 集里有 455 集属于这种情况（扫描时没拿到集数元数据）——
+        它们必须被**明确告知**，不能静默 ✗。
+        """
+        try:
+            return sum(self._db.blocked_upload_counts().values())
+        except Exception as e:
+            log.exception("统计无法补传的集数失败: %s", e)
+            return 0
 
     def _next_episode(self, subject_id: int, ep_status: int) -> tuple[int, str]:
         """「下一集」对应的本地集 ID 与**播不了时的原因**；可播时原因为空串。
