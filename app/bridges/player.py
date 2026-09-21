@@ -104,7 +104,7 @@ class PlayerBridge(QObject):
             player_path=self._config.get("general", "player_path", ""),
             ls_path=self._config.get("general", "ls_path", ""),
             enable_ls=self._config.getbool("launcher", "enable_ls", True),
-            ls_shortcut=self._config.get("launcher", "ls_shortcut", "ctrl+alt+l"),
+            ls_shortcut=self._config.get("launcher", "ls_shortcut", "ctrl+alt+p"),
             ls_start_delay=self._config.getfloat("launcher", "ls_start_delay", 5.0),
             player_start_delay=self._config.getfloat(
                 "launcher", "player_start_delay", 1.0),

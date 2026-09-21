@@ -110,6 +110,11 @@ ApplicationWindow {
                 onStatusMessage: function (text) {
                     statusBar.setMessage(text, 5000)
                 }
+                // 「下一集」→ 交给播放器（与详情页同一条路径）
+                onPlayEpisode: function (episodeId) {
+                    if (typeof player !== "undefined" && player)
+                        player.playEpisode(episodeId)
+                }
             }
 
             TimelinePage {

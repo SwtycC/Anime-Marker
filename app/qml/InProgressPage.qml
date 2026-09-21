@@ -30,6 +30,9 @@ Item {
     /// 未入库的行点不出详情 —— 由页面发提示（Main.qml 接到状态栏）
     signal statusMessage(string text)
 
+    /// 请求播放某一集（由 Main.qml 转给 player.playEpisode，与详情页一致）
+    signal playEpisode(int episodeId)
+
     Flickable {
         id: flick
         anchors.fill: parent
@@ -111,10 +114,51 @@ Item {
 
                         width: listColumn.width
                         height: 76
-                        color: mouse.containsMouse ? Theme.hoverFillStrong
-                                                   : Theme.fade(Theme.hoverFillStrong)
+                        color: rowHover.hovered ? Theme.hoverFillStrong
+                                                : Theme.fade(Theme.hoverFillStrong)
 
                         Behavior on color { ColorAnimation { duration: Theme.durFast } }
+
+                        // ---- 整行点击区：必须声明在内容之前（层级最低）----
+                        //
+                        // QML 里**后声明的兄弟项在上层、优先接收事件**。早期这个
+                        // MouseArea 写在最后（层级最高）盖住了「详情」按钮，于是靠
+                        // `propagateComposedEvents: true` + `accepted = false`
+                        // 把点击"漏"给下面的按钮。那个 hack 的副作用是致命的：
+                        // 点击会**继续往更下层同步传播**，而按钮的处理函数在传播
+                        // 途中就把页面切到了详情页 —— 同一次点击于是又落到了详情页
+                        // 的集数行上（那行是点击即播放）→
+                        // **「详情」一点就开始播放**（实测反馈）。
+                        //
+                        // 放回最前面后：按钮自己接收点击，空白处归本 MouseArea，
+                        // 两条路互不干扰，不需要任何传播技巧。
+                        // （Row / Text / Image 这类没有事件处理器的项不会吃掉点击，
+                        //   所以放在下面照样能收到。）
+                        MouseArea {
+                            id: mouse
+                            anchors.fill: parent
+                            // 悬停状态交给 HoverHandler（见下），这里只负责点击
+                            // 未入库的行没有本地详情可开，光标明确提示不可点
+                            // （实测 11 部「在看」里通常有 3~4 部未入库）
+                            cursorShape: modelData.inLibrary ? Qt.PointingHandCursor
+                                                             : Qt.ArrowCursor
+                            onClicked: {
+                                if (modelData.inLibrary)
+                                    root.subjectClicked(modelData.localSubjectId)
+                                else
+                                    root.statusMessage(
+                                        "「" + modelData.title
+                                        + "」未入库，无法打开详情")
+                            }
+                        }
+
+                        // 整行悬停高亮。
+                        // 用 HoverHandler 而不是 MouseArea.containsMouse：后者会被
+                        // 「详情」按钮的 MouseArea 抢走（鼠标移到按钮上时整行高亮会掉），
+                        // 而 HoverHandler 不参与这种独占，悬在按钮上整行依然亮。
+                        HoverHandler {
+                            id: rowHover
+                        }
 
                         Row {
                             anchors.fill: parent
@@ -224,6 +268,28 @@ Item {
                                     }
                                 }
 
+                                // 「下一集」：直接接着看那一集。
+                                // 集号由后端按 Bangumi 的「已看到第 N 集」算出
+                                // （见 LibraryBridge._next_episode），与左侧进度条
+                                // 「5 / 12 集」同一口径。
+                                //
+                                // **按钮不隐藏**（实测要求）：播不了时把"为什么播不了"
+                                // 报到状态栏 —— 没入库 / 本地已看到最新 / 集号数据异常，
+                                // 三种情况的处置完全不同，藏掉按钮等于把信息也藏掉了。
+                                AppButton {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: "下一集"
+                                    onClicked: {
+                                        if (modelData.nextEpisodeId > 0)
+                                            root.playEpisode(modelData.nextEpisodeId)
+                                        else
+                                            root.statusMessage(
+                                                "「" + modelData.title + "」"
+                                                + (modelData.nextEpisodeHint
+                                                   || "没有可播放的下一集"))
+                                    }
+                                }
+
                                 AppButton {
                                     anchors.verticalCenter: parent.verticalCenter
                                     visible: modelData.inLibrary
@@ -243,26 +309,6 @@ Item {
                             opacity: 0.6
                         }
 
-                        MouseArea {
-                            id: mouse
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            // 让「详情」按钮优先接收点击，避免被整行吃掉
-                            propagateComposedEvents: true
-                            // 未入库的行没有本地详情可开，光标明确提示不可点
-                            // （实测 11 部「在看」里通常有 3~4 部未入库）
-                            cursorShape: modelData.inLibrary ? Qt.PointingHandCursor
-                                                             : Qt.ArrowCursor
-                            onClicked: function (m) {
-                                if (modelData.inLibrary)
-                                    root.subjectClicked(modelData.localSubjectId)
-                                else
-                                    root.statusMessage(
-                                        "「" + modelData.title
-                                        + "」未入库，无法打开详情")
-                                m.accepted = false
-                            }
-                        }
                     }
                 }
             }

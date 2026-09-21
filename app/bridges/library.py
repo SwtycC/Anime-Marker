@@ -154,6 +154,10 @@ class LibraryBridge(QObject):
                 except Exception:
                     pass
 
+            # 「下一集」按钮：要播的集 ID（0 = 播不了）+ 播不了时的原因文案。
+            # 按钮**不隐藏**，点不动时把原因报到状态栏（见 _next_episode）。
+            next_ep_id, next_ep_hint = self._next_episode(local_id, it.ep_status)
+
             out.append({
                 "bangumiId": int(it.bangumi_id or 0),
                 "name": it.name or "",
@@ -168,8 +172,55 @@ class LibraryBridge(QObject):
                 "updatedAt": it.collection_updated_at or it.updated_at or "",
                 "localSubjectId": local_id,
                 "inLibrary": local_id > 0,
+                "nextEpisodeId": next_ep_id,
+                "nextEpisodeHint": next_ep_hint,
             })
         return out
+
+    def _next_episode(self, subject_id: int, ep_status: int) -> tuple[int, str]:
+        """「下一集」对应的本地集 ID 与**播不了时的原因**；可播时原因为空串。
+
+        **按 Bangumi 的 `ep_status`（已看到第 N 集）算，不用本地的 `watched`
+        标记** —— 实测本账号「在看」的 11 部里本地 `watched` 全是 0（那些集是
+        在 Bangumi 网页 / 别的设备上标的，本程序没有播放记录），若按本地标记
+        取"第一个未看过的"，会一律算成第 1 集 ✗。按 `ep_status` 算与页面上的
+        进度条（读的也是 `ep_status`，如「5 / 12 集」）口径一致。
+
+        规则：优先取 `ep_index == ep_status + 1` 的那一集（"接着看"的那集）；
+        编号对不上（本地缺集/续篇从中间编号）时退回"第一集 ep_index 大于
+        ep_status 的"；都没有则返回 0，并给出一句能解释清楚的原因 ——
+        界面上按钮**不隐藏**，点不动时把原因报到状态栏（实测要求）。
+
+        为什么要区分原因：三种"播不了"的处置完全不同 ——
+        没入库（去入库）、本地已看到最新（正常，无需做什么）、
+        集号数据坏了（是扫描解析的问题，得回去修）。
+        """
+        if subject_id <= 0:
+            return 0, "未入库，无法播放"
+        try:
+            # 只考虑有本地文件的集（没文件没法播）
+            eps = [e for e in self._db.list_episodes(subject_id)
+                   if (e.file_path or "").strip()]
+        except Exception as e:
+            log.exception("查找下一集失败: %s", e)
+            return 0, "读取本地集数失败（详见日志）"
+        if not eps:
+            return 0, "本地没有可播放的剧集文件"
+
+        want = float(ep_status or 0) + 1
+        for e in eps:                       # list_episodes 已按 ep_index 升序
+            if abs(float(e.ep_index or 0) - want) < 1e-6:
+                return int(e.id), ""
+        later = [e for e in eps if float(e.ep_index or 0) > want]
+        if later:
+            return int(later[0].id), ""
+        # 走到这里说明本地没有任何"第 want 集及以后"的集。两种成因要分开说：
+        if len({float(e.ep_index or 0) for e in eps}) == 1:
+            # 所有集号一模一样 → 扫描时标题没解析出来（实测：某部 12 集全是 2.0）
+            return 0, ("本地集号异常（%d 集全是第 %g 集，扫描解析可能失败），"
+                       "无法判断下一集" % (len(eps), float(eps[0].ep_index or 0)))
+        return 0, ("本地没有更靠后的集了（Bangumi 进度 %d 集，本地共 %d 集）"
+                   % (int(ep_status or 0), len(eps)))
 
     # ---------- F20：集级观看记录（动态页时间线）----------
     @Property("QVariantList", notify=watchedEpsChanged)

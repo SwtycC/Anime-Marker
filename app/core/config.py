@@ -67,7 +67,11 @@ DEFAULTS: dict[str, dict[str, str]] = {
     },
     "launcher": {
         "enable_ls": "true",
-        "ls_shortcut": "ctrl+alt+l",
+        # **必须与小黄鸭「设置 → 缩放快捷键」里的值一致**，否则按了也没反应。
+        # 别用 ctrl+alt+l —— 那是 QQ 的「锁定 QQ」全局快捷键，会被 QQ
+        # 抢先注册（小黄鸭也设不上），实测触发过一次 QQ 自我锁定。
+        # 小黄鸭各版本默认不同，以你机器上的设置为准。
+        "ls_shortcut": "ctrl+alt+p",
         "ls_start_delay": "5",
         "player_start_delay": "1",
     },

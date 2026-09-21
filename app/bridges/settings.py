@@ -58,7 +58,7 @@ FALLBACKS: dict[str, str] = {
     "general.player_path": r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
     "general.ls_path": r"C:\Program Files\Lossless Scaling\LosslessScaling.exe",
     "launcher.enable_ls": "true",
-    "launcher.ls_shortcut": "ctrl+alt+l",
+    "launcher.ls_shortcut": "ctrl+alt+p",
     "monitor.poll_interval": "3",
     "monitor.trigger_threshold": "0.95",
     "scanner.season_patterns": "cn",
