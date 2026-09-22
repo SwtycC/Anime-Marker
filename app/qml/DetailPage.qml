@@ -28,7 +28,7 @@ Item {
         anchors.margins: Theme.pagePadding
         spacing: Theme.spacingLg
 
-        // ---- 顶部：返回 + 重新匹配 ----
+        // ---- 顶部：返回 + 更换海报 + 重新匹配 ----
         RowLayout {
             Layout.fillWidth: true
             spacing: Theme.spacingMd
@@ -39,6 +39,11 @@ Item {
             }
 
             Item { Layout.fillWidth: true }
+
+            AppButton {
+                text: "更换海报"
+                onClicked: root.posterRequested(root.subjectId)
+            }
 
             AppButton {
                 text: "重新匹配"
@@ -273,6 +278,7 @@ Item {
     // ---- 信号（由 Main.qml 接）----
     signal playEpisode(int episodeId)
     signal rematchRequested(int subjectId)
+    signal posterRequested(int subjectId)
 
     // ---- 文案辅助 ----
     function buildMeta() {

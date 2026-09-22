@@ -22,3 +22,4 @@ SegmentedControl 1.0 SegmentedControl.qml
 CheckBoxLine 1.0 CheckBoxLine.qml
 NumberStepper 1.0 NumberStepper.qml
 HelpButton 1.0 HelpButton.qml
+PosterDialog 1.0 PosterDialog.qml

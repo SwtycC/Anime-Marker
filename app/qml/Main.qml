@@ -93,7 +93,7 @@ ApplicationWindow {
                     }
                 }
 
-                DetailPage { id: detailPage }
+                DetailPage { id: detailPage; objectName: "detailPage" }
             }
 
             InProgressPage {
@@ -224,6 +224,12 @@ ApplicationWindow {
                        ? library.subject(subjectId) : null
             matchDialog.open(subjectId, subj ? subj.title : "")
         }
+
+        function onPosterRequested(subjectId) {
+            var subj = typeof library !== "undefined" && library
+                       ? library.subject(subjectId) : null
+            posterDialog.open(subjectId, subj ? subj.title : "")
+        }
     }
 
     // ============ 上传对话框（本地观看记录 → Bangumi）============
@@ -246,6 +252,33 @@ ApplicationWindow {
             detailPage.load(subjectId)
             library.reload()
             statusBar.setMessage("已手动指定 Bangumi 条目", 5000)
+        }
+    }
+
+    // ============ 更换海报对话框 ============
+    PosterDialog {
+        id: posterDialog
+
+        // 更换/恢复成功后：详情页重取（新海报立即生效）。海报墙不用在这里
+        // reload —— LibraryBridge._notify_cover_changed 已发 subjectsChanged，
+        // QML 会自动重取 subjects。
+        onApplied: function (subjectId, message) {
+            if (detailPage.subjectId === subjectId)
+                detailPage.load(subjectId)
+            statusBar.setMessage(message, 5000)
+        }
+
+        // 关窗时补一次刷新。
+        //
+        // 为什么需要：小窗是**独立顶层窗口**，编辑期间用户可能把它拖到一边
+        // 继续看主窗口 —— 此时 detailPage 的封面已经过期（仍是旧图），
+        // 而 onApplied 只在操作成功那一瞬间刷新过。关窗补刷一次，保证
+        // 「关掉小窗后看到的一定是当前海报」。
+        // 用 subjectId 而不是 detailPage.subjectId 判定：小窗可能在用户
+        // 切到别的条目之后才关闭，此时不该动详情页。
+        onVisibleChanged: {
+            if (!visible && detailPage.subjectId === subjectId && subjectId > 0)
+                detailPage.load(subjectId)
         }
     }
 
@@ -422,6 +455,21 @@ ApplicationWindow {
     /** 诊断用：滚动海报墙到指定位置。 */
     function debugScrollWall(y) {
         wallPage.scrollTo(y)
+    }
+
+    /** 诊断用：打开指定条目的详情页（截图核对用）。 */
+    function debugOpenDetail(subjectId) {
+        detailOriginPage = window.currentPage
+        detailPage.load(subjectId)
+        browseStack.currentIndex = 1
+        window.currentPage = 0
+        return detailPage.subjectId
+    }
+
+    /** 诊断用：打开更换海报小窗（截图核对用）。 */
+    function debugOpenPosterDialog(subjectId, title) {
+        posterDialog.open(subjectId, title || "")
+        return posterDialog.visible
     }
 
     /** 诊断用：导出设置页的行布局几何，便于核对 FormRow 是否正常撑开。 */

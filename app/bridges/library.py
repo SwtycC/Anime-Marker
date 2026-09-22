@@ -15,15 +15,21 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
 from PySide6.QtCore import QObject, Property, Signal, Slot
+from PySide6.QtGui import QImage
+from PySide6.QtWidgets import QFileDialog
 
 from app.core.bangumi_api import COLLECT_TYPE_DOING
 from app.core.database import Database, Episode, Subject
+from app.utils.cover_cache import cover_path_for, known_cover_files
+from app.utils.cover_cache import download as download_cover
+from app.utils.paths import covers_dir
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +65,8 @@ class LibraryBridge(QObject):
     episodesChanged = Signal()
     inProgressChanged = Signal()
     watchedEpsChanged = Signal()
+    #: 海报变更（参数：subject_id），更换海报小窗与详情页据此刷新
+    coverChanged = Signal(int)
 
     def __init__(self, db: Database, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -72,6 +80,11 @@ class LibraryBridge(QObject):
         self._inprogress_dirty = True
         self._eps_cache: list[dict] = []
         self._eps_dirty = True
+        # 海报版本号：换海报后 cover_path 可能指回**同一个文件**（恢复原版），
+        # 而 QML 的 Image 按 URL 缓存解码结果 —— URL 不变就一直显示旧图（踩坑）。
+        # 按条目记一个递增版本号，以 `?v=N` 追加到 file:// URL 后（query 不参与
+        # 本地文件寻址，只作为缓存键的一部分），每次海报变更 +1 强制重新解码。
+        self._cover_revs: dict[int, int] = {}
 
     # ---------- 配置 ----------
     def set_display_mode(self, mode: str) -> None:
@@ -158,7 +171,7 @@ class LibraryBridge(QObject):
             if local_id:
                 try:
                     s = self._db.get_subject(local_id)
-                    local_cover = as_file_url(s.cover_path or "") if s else ""
+                    local_cover = self._cover_file_url(s.cover_path or "", s.id) if s else ""
                 except Exception:
                     pass
 
@@ -464,6 +477,272 @@ class LibraryBridge(QObject):
             "total": len(eps),
         }
 
+    # ---------- 海报管理（更换 / 恢复原版）----------
+    #
+    # 设计：**不新建数据库字段**。原版海报 = Bangumi 封面的本地缓存
+    # （scanner / 手动匹配都经 cover_cache.cover_path_for() 写到
+    # `covers/<sid>.<ext>`，路径由 subject_id + URL 扩展名唯一确定，可反推）；
+    # 自定义海报是**另存**的 `covers/<sid>_custom.<ext>`，更换只是把
+    # cover_path 指过去。因此恢复 = 指回原路径（零下载、原文件不动）。
+
+    @Slot(int, result="QVariantMap")
+    def coverInfo(self, subject_id: int) -> dict:
+        """当前海报状态（更换海报小窗的数据源）。
+
+        返回字段：
+            coverUrl     —— 当前海报的 file:// URL（带 `?v=` 版本号）
+            isCustom     —— **当前用的是不是用户自定义的那张**
+            hasOriginal  —— 有没有 Bangumi 原版可恢复（未匹配时没有）
+
+        `isCustom` 的判定（四条，缺一都会误报，见下）：
+          1. **根本没有封面**（`cover_path` 为空）→ `False`。
+             旧实现只看"路径不相等"，而没封面时 `cover_path` 是空串，
+             与任何原版路径都不等，于是无封面的条目被判成"自定义"，
+             「恢复原版海报」按钮错误地可点。这不是自定义，是"还没有图"。
+          2. `cover_path` **指向的文件已不存在**（缓存被清理、换过盘符、
+             手工删过图）→ `False`，并按"没有自定义海报"处理。
+             此时界面读不到图，用户点「恢复原版」才有意义；若判成
+             `isCustom=True`，恢复按钮虽可点，但底下显示的是"破损的自定义
+             海报"，语义是错的。
+          3. 当前路径与「原版缓存文件」**是同一个文件** → `False`。
+          4. 其余情况（指向一个真实存在的、非原版的文件）→ `True`。
+
+        比较用 `Path.resolve()` 归一（大小写、分隔符、相对路径差异
+        不该影响判定）。
+        """
+        try:
+            s = self._db.get_subject(subject_id)
+        except Exception as e:
+            log.exception("读取条目 %s 失败: %s", subject_id, e)
+            return {}
+        if s is None:
+            return {}
+
+        original = self._original_cover_path(s)
+        has_original = bool(s.cover_url)
+        cur_str = (s.cover_path or "").strip()
+
+        # 1. 没有封面
+        cur_exists = False
+        if cur_str:
+            try:
+                cur_exists = Path(cur_str).exists()
+            except OSError:
+                cur_exists = False
+        if not cur_str or not cur_exists:
+            # 兜底：文件没了但原版还在 → 直接把显示指向原版，
+            # 免得详情页/海报墙留着一块空白（覆盖式写库，幂等）
+            fallback_url = ""
+            if has_original and original.exists():
+                fallback_url = self._cover_file_url(str(original), s.id)
+            return {
+                "coverUrl": fallback_url,
+                "isCustom": False,
+                "hasOriginal": has_original,
+                "missing": True,        # 供小窗提示"原海报文件已丢失"
+            }
+
+        # 3/4. 与原版比对
+        cur = Path(cur_str)
+        try:
+            is_custom = cur.resolve() != original.resolve()
+        except OSError:
+            is_custom = str(cur) != str(original)
+
+        return {
+            "coverUrl": self._cover_file_url(cur_str, s.id),
+            "isCustom": is_custom,
+            "hasOriginal": has_original,
+            "missing": False,
+        }
+
+    @Slot(result=str)
+    def pickImage(self) -> str:
+        """选择本地图片（自定义海报）。取消返回空串。"""
+        path, _ = QFileDialog.getOpenFileName(
+            None, "选择海报图片", "",
+            "图片文件 (*.jpg *.jpeg *.png *.webp *.bmp *.gif);;所有文件 (*)",
+        )
+        return path or ""
+
+    @Slot(int, str, result="QVariantMap")
+    def setCustomCover(self, subject_id: int, image_path: str) -> dict:
+        """把用户选的图片设为该条目的海报。"""
+        src = Path(image_path or "")
+        if not src.exists():
+            return {"ok": False, "message": "图片文件不存在"}
+        # 后缀不可信（用户可能选到改名的非图片），实际解码一次再收
+        if QImage(str(src)).isNull():
+            return {"ok": False, "message": "无法读取该图片文件"}
+
+        try:
+            s = self._db.get_subject(subject_id)
+        except Exception as e:
+            log.exception("读取条目 %s 失败: %s", subject_id, e)
+            return {"ok": False, "message": "读取条目失败（详见日志）"}
+        if s is None:
+            return {"ok": False, "message": "条目不存在"}
+
+        ext = src.suffix.lower() or ".jpg"
+        dst = covers_dir() / f"{subject_id}_custom{ext}"
+        try:
+            if src.resolve() != dst.resolve():      # 重复选同一张时跳过自拷贝
+                shutil.copyfile(src, dst)
+            # 换了扩展名后旧的自定义文件会残留，顺手清掉（保留刚写入的）
+            self._remove_custom_files(subject_id, keep=dst)
+        except Exception as e:
+            log.exception("复制自定义海报失败：《%s》（subject_id=%s）",
+                          self._subject_label(s), subject_id)
+            return {"ok": False, "message": "复制图片失败：%s" % e}
+
+        try:
+            self._db.set_cover_path(subject_id, str(dst))
+        except Exception as e:
+            log.exception("写入自定义海报失败：《%s》（subject_id=%s）",
+                          self._subject_label(s), subject_id)
+            return {"ok": False, "message": "写入失败：%s" % e}
+
+        log.info("自定义海报已设置：《%s》（subject_id=%s）→ %s",
+                 self._subject_label(s), subject_id, dst)
+        self._notify_cover_changed(subject_id)
+        return {"ok": True, "message": "海报已更换"}
+
+    @Slot(int, result="QVariantMap")
+    def restoreCover(self, subject_id: int) -> dict:
+        """恢复 Bangumi 原版海报。
+
+        正常情况只是把 cover_path 指回原版缓存文件（瞬时完成，不联网）；
+        缓存被清理过才需要重新下载 —— 罕见路径，同步执行可接受
+        （本类的设计原则是「轻操作直接同步」，见文件头注释）。
+        """
+        try:
+            s = self._db.get_subject(subject_id)
+        except Exception as e:
+            log.exception("读取条目 %s 失败: %s", subject_id, e)
+            return {"ok": False, "message": "读取条目失败（详见日志）"}
+        if s is None:
+            return {"ok": False, "message": "条目不存在"}
+        if not s.cover_url:
+            return {"ok": False, "message": "没有原版海报可恢复（条目未匹配 Bangumi）"}
+
+        label = self._subject_label(s)
+        original = self._original_cover_path(s)
+        if not original.exists():
+            # 缓存被清理过：按 **bangumi_id** 重新下载（与 scanner / match
+            # 的命名保持一致，否则下次又会找不到 —— 见 _original_cover_path）
+            log.info("原版海报缓存不存在，重新下载：《%s》（subject_id=%s）← %s",
+                     label, subject_id, s.cover_url)
+            try:
+                original = download_cover(
+                    s.bangumi_id or s.id, s.cover_url, timeout=10.0)
+            except Exception as e:
+                log.warning("原版海报重新下载失败：《%s》（subject_id=%s）: %s",
+                            label, subject_id, e)
+            # download 失败时返回占位图路径而非抛异常，所以这里再查一次落盘结果
+            if not original.exists():
+                return {"ok": False, "message": "原版海报下载失败，请检查网络后重试"}
+
+        try:
+            self._db.set_cover_path(subject_id, str(original))
+        except Exception as e:
+            log.exception("恢复原版海报失败：《%s》（subject_id=%s）",
+                          label, subject_id)
+            return {"ok": False, "message": "写入失败：%s" % e}
+
+        # 顺手清掉自定义海报文件。**放在写库之后**：先把 cover_path 指回
+        # 原版（此时数据已一致），再删文件；万一删除失败也只是留下一个
+        # 孤儿文件，不会出现"库里指着自定义、文件却没了"的坏状态。
+        self._remove_custom_files(subject_id)
+
+        log.info("已恢复原版海报：《%s》（subject_id=%s）→ %s",
+                 label, subject_id, original)
+        self._notify_cover_changed(subject_id)
+        return {"ok": True, "message": "已恢复原版海报"}
+
+    @staticmethod
+    def _remove_custom_files(subject_id: int, keep: Optional[Path] = None) -> None:
+        """删除该条目的自定义海报文件（`covers/<sid>_custom.*`）。
+
+        `keep` 用于「重新选图」场景：新旧扩展名可能不同，留下新的、删掉旧的。
+        """
+        try:
+            for old in covers_dir().glob(f"{subject_id}_custom.*"):
+                if keep is not None and old == keep:
+                    continue
+                old.unlink(missing_ok=True)
+                log.debug("已删除旧的自定义海报文件：%s", old)
+        except OSError as e:
+            log.warning("清理自定义海报文件失败 subject_id=%s: %s", subject_id, e)
+
+    @staticmethod
+    def _subject_label(s: Subject) -> str:
+        """日志里用的条目名：中文名优先，退回原名，再退回占位。
+
+        为什么要它：只看 `subject_id=8` 根本不知道是哪部动漫（见下方日志
+        示例），排查"某张海报怎么被换掉了"时要回数据库查 id，很费事。
+        名字可能为空（pending 条目），所以要有兜底，不能直接拼。
+        """
+        return (s.name_cn or s.name or "").strip() or "（未命名条目）"
+
+    def _original_cover_path(self, s: Subject) -> Path:
+        """原版海报的本地缓存路径（按实际情况探测，不靠猜）。
+
+        **踩坑（两种命名混用，导致"更换海报"一打开就显示已自定义）**：
+        原版缓存文件是 `scanner` / `match` 写的，两者传给
+        `cover_cache.download()` 的都是 **bangumi_id**（见 scanner.py 与
+        match.py 的调用点），所以真实文件名是 `covers/<bangumi_id>.<ext>`。
+        这里如果按 `s.id` 反推，只要本地 id 与 bangumi_id 不等（几乎所有
+        条目都如此，如 id=2 ↔ bangumi_id=302189），就会算出一个**不存在的
+        路径**，于是：
+          - `coverInfo().isCustom` 恒为 True → 小窗一打开就打上「自定义」
+            徽标、「恢复原版海报」按钮错误地可点；
+          - `restoreCover()` 认为原版不存在 → 白下载一次（或断网直接失败）。
+
+        改为按优先级探测真实文件：
+          bangumi_id → subject_id（兼容早期按本地 id 命名的数据）
+        都找不到时退回"按 bangumi_id + URL 推断的扩展名"，交给
+        `restoreCover()` 走"缓存被清理 → 重新下载"的分支。
+
+        **未匹配 Bangumi 的条目（bangumi_id 为空）特殊处理**：只用
+        `subject_id` 探测，且**不以 subject_id 兜底造路径** —— 否则
+        `covers/<sid>.jpg` 可能恰好命中别的条目的文件（历史数据里
+        原版按 bangumi_id 命名，而 bangumi_id 就是些小整数），
+        会把不相干的图当成"原版"。
+        """
+        keys = [k for k in (s.bangumi_id, s.id) if k]
+        found = known_cover_files(*keys)
+        if found:
+            return found[0]
+        if not s.bangumi_id:
+            # 没有 Bangumi 来源，就没有"原版"可言 —— 给一个必定不存在的
+            # 路径，让 restoreCover() 的分支走"无原版可恢复"的提示
+            return covers_dir() / f"{s.id}_no_original"
+        return cover_path_for(s.bangumi_id, s.cover_url or "")
+
+    def _notify_cover_changed(self, subject_id: int) -> None:
+        """海报写库后的统一收尾：版本号 +1、失效条目缓存、通知 QML。
+
+        海报墙与详情页都读 subjects Property，一条 subjectsChanged
+        两处同时刷新（emit 即触发 QML 重取，无需调用方再 reload）。
+        """
+        self._cover_revs[subject_id] = self._cover_revs.get(subject_id, 0) + 1
+        self._dirty = True
+        self.subjectsChanged.emit()
+        self.coverChanged.emit(subject_id)
+
+    def _cover_file_url(self, path: str, subject_id: int) -> str:
+        """封面路径 → file:// URL，附 `?v=` 版本号防 QML 图片缓存。
+
+        换海报后 URL 字符串可能不变（恢复原版 = 指回同一个文件），
+        `Image.source` 相同就会命中解码缓存、界面一直显示旧图；
+        版本号拼进 URL 后每次变更都拿到新缓存键，本地读取不受影响。
+        """
+        url = as_file_url(path)
+        if not url:
+            return ""
+        rev = self._cover_revs.get(subject_id, 0)
+        return url + "?v=%d" % rev if rev > 0 else url
+
     # ---------- 转换 ----------
     def _subject_to_dict(self, s: Subject) -> dict:
         return {
@@ -476,8 +755,9 @@ class LibraryBridge(QObject):
             "matchState": s.match_state or "auto",
             "totalEps": int(s.total_eps or 0),
             "folderPath": s.folder_path or "",
-            # 封面转 URL，QML 的 Image 才能加载（含中文路径也能用）
-            "coverUrl": as_file_url(s.cover_path or ""),
+            # 封面转 URL，QML 的 Image 才能加载（含中文路径也能用）；
+            # 带 ?v= 版本号，换海报后同路径也能刷新（见 _cover_file_url）
+            "coverUrl": self._cover_file_url(s.cover_path or "", s.id),
             "isGroup": False,
             "childCount": 1,
             "childIds": [s.id],
@@ -513,13 +793,14 @@ class LibraryBridge(QObject):
                 eps = self._db.list_episodes(s.id)
                 total += len(eps) or (s.total_eps or 0)
                 watched += sum(1 for e in eps if e.watched)
-            cover = next((s.cover_path for s in items if s.cover_path), "")
+            cover_subj = next((s for s in items if s.cover_path), None)
             d = self._subject_to_dict(items[0])
             d.update({
                 "title": series,
                 "name": series,
                 "nameCn": series,
-                "coverUrl": as_file_url(cover),
+                "coverUrl": self._cover_file_url(cover_subj.cover_path, cover_subj.id)
+                            if cover_subj else "",
                 "isGroup": True,
                 "childCount": len(items),
                 "childIds": [s.id for s in items],
