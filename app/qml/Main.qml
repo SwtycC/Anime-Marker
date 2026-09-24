@@ -230,6 +230,23 @@ ApplicationWindow {
                        ? library.subject(subjectId) : null
             posterDialog.open(subjectId, subj ? subj.title : "")
         }
+
+        // 标签编辑 / 补拉的提示 → 状态栏
+        function onStatusMessage(text) {
+            statusBar.setMessage(text, 5000)
+        }
+    }
+
+    // 标签自动补拉：完成/失败通知 + 兜底刷新
+    Connections {
+        target: typeof library !== "undefined" && library ? library : null
+        function onTagsChanged(subjectId) {
+            if (detailPage.subjectId === subjectId)
+                detailPage.resetTagState()
+        }
+        function onStatusMessage(text) {
+            statusBar.setMessage(text, 5000)
+        }
     }
 
     // ============ 上传对话框（本地观看记录 → Bangumi）============

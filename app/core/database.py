@@ -160,6 +160,30 @@ CREATE TABLE IF NOT EXISTS download_history (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_download_source_ep
     ON download_history(source_id, ep_index);
 CREATE INDEX IF NOT EXISTS idx_download_hash ON download_history(torrent_hash);
+
+-- 条目标签（详情页展示 + 用户编辑）
+--
+-- 来源两路：① 扫描 / 手动匹配时从 Bangumi subject 响应存入**前 10 个**
+-- （source='api'，pos 记接口原始顺序 = 打此 tag 的人数降序）；
+-- ② 用户在详情页手动添加（source='user'）。
+--
+-- `deleted` 只对 api tag 有意义：用户删掉的接口 tag **不物理删除**，
+-- 而是置删除标记 —— 再次进入编辑时仍以置灰形态可见、可恢复
+-- （接口行为：删了就"不再展示"，但不是永远找不回来）。
+-- user tag 删除即物理删除（用户自己加的，没"恢复原状"可言）。
+--
+-- 主键 (subject_id, name)：同一部不会出现同名 tag 两个来源。
+-- 重扫时的覆盖策略见 replace_subject_tags（保留 deleted 标记）。
+CREATE TABLE IF NOT EXISTS subject_tags (
+    subject_id INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    source     TEXT NOT NULL DEFAULT 'api',  -- api=接口带来 / user=用户添加
+    pos        INTEGER NOT NULL DEFAULT 0,   -- 排序：api 按接口顺序(0~9)，user 从 100 起
+    deleted    INTEGER NOT NULL DEFAULT 0,   -- 1=用户已删除（仅 api tag 使用）
+    PRIMARY KEY (subject_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_subject_tags_subject
+    ON subject_tags(subject_id);
 """
 
 
@@ -381,6 +405,108 @@ class Database:
             cur.execute(
                 "UPDATE subjects SET cover_path=?, updated_at=? WHERE id=?",
                 (cover_path, _now(), subject_id),
+            )
+
+    # ---------- 条目标签 ----------
+    @staticmethod
+    def tags_from_subject(subj: dict) -> list[tuple[str, int]]:
+        """从 Bangumi subject 响应提取**前 10 个** tag，供入库。
+
+        接口的 `tags` 已按 `count`（打此 tag 的人数）降序排列（实测多部
+        条目全部严格降序，文档虽未明说但搜索接口的 SlimSubject.tags
+        注明"前 10 个 tag"，佐证有序），直接截取即可，无需再排。
+        """
+        out: list[tuple[str, int]] = []
+        for i, t in enumerate(subj.get("tags") or []):
+            name = (t.get("name") or "").strip()
+            if name:
+                out.append((name, i))
+            if len(out) >= 10:
+                break
+        return out
+
+    def replace_subject_tags(self, subject_id: int, tags: list[tuple[str, int]]) -> None:
+        """扫描 / 手动匹配时写入接口的前 10 个 tag（source='api'）。
+
+        **重扫不复活用户删除**：同名 tag 已存在时保留其 `deleted` 标记 ——
+        用户删掉的 tag 在重扫后又冒出来，会被感知为"程序坏了"。
+        user tag（source='user'）完全不动。
+        """
+        with self._cursor() as cur:
+            old = {
+                r["name"]: r["deleted"]
+                for r in cur.execute(
+                    "SELECT name, deleted FROM subject_tags"
+                    " WHERE subject_id=? AND source='api'",
+                    (subject_id,),
+                )
+            }
+            cur.execute(
+                "DELETE FROM subject_tags WHERE subject_id=? AND source='api'",
+                (subject_id,),
+            )
+            cur.executemany(
+                "INSERT OR REPLACE INTO subject_tags"
+                " (subject_id, name, source, pos, deleted) VALUES (?,?,'api',?,?)",
+                [(subject_id, name, pos, old.get(name, 0)) for name, pos in tags],
+            )
+
+    def list_subject_tags(self, subject_id: int) -> list[dict]:
+        """该条目的全部 tag，展示顺序：接口 tag 按原始顺序在前，用户 tag 在后。"""
+        with self._cursor() as cur:
+            rows = cur.execute(
+                "SELECT name, source, pos, deleted FROM subject_tags"
+                " WHERE subject_id=?"
+                " ORDER BY (source='user'), pos, name",
+                (subject_id,),
+            ).fetchall()
+        return [
+            {
+                "name": r["name"],
+                "isApi": r["source"] == "api",
+                "deleted": bool(r["deleted"]),
+            }
+            for r in rows
+        ]
+
+    def has_subject_tags(self, subject_id: int) -> bool:
+        with self._cursor() as cur:
+            row = cur.execute(
+                "SELECT 1 FROM subject_tags WHERE subject_id=? LIMIT 1",
+                (subject_id,),
+            ).fetchone()
+            return row is not None
+
+    def save_edited_tags(
+        self,
+        subject_id: int,
+        api_states: list[dict],
+        user_names: list[str],
+    ) -> None:
+        """保存详情页的 tag 编辑结果（确定按钮）。
+
+        - `api_states`：`[{"name": str, "deleted": bool}]`，只**更新**接口
+          tag 的删除标记（不动 pos / source —— "恢复原状"的语义）；
+        - `user_names`：用户 tag 的最终名单，整体替换（删掉的不留痕）。
+        """
+        with self._cursor() as cur:
+            for st in api_states:
+                name = (st.get("name") or "").strip()
+                if not name:
+                    continue
+                cur.execute(
+                    "UPDATE subject_tags SET deleted=?"
+                    " WHERE subject_id=? AND name=? AND source='api'",
+                    (1 if st.get("deleted") else 0, subject_id, name),
+                )
+            cur.execute(
+                "DELETE FROM subject_tags WHERE subject_id=? AND source='user'",
+                (subject_id,),
+            )
+            cur.executemany(
+                "INSERT OR REPLACE INTO subject_tags"
+                " (subject_id, name, source, pos, deleted) VALUES (?,?,'user',?,0)",
+                [(subject_id, n, 100 + i) for i, n in enumerate(user_names)],
             )
 
     # ---------- episodes ----------

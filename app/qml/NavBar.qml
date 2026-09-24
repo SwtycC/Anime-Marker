@@ -15,6 +15,9 @@ Item {
 
     // 当前选中项索引
     property int currentIndex: 0
+    // 外部 SVG 图标的目录基地址（见 NavIcon.iconsBase）
+    property string iconsBase: typeof iconsBaseUrl !== "undefined"
+                               ? iconsBaseUrl : ""
     // 按钮定义：[{ kind, label }]
     property var items: [
         { "kind": "grid", "label": "海报墙" },
@@ -93,6 +96,7 @@ Item {
                         width: Theme.navButtonSize * 0.55
                         height: width
                         kind: btnHost.modelData.kind
+                        iconsBase: root.iconsBase
                         color: btnHost.selected ? Theme.accentText
                              : btnHost.hovered  ? Theme.textPrimary
                              : Theme.textSecondary

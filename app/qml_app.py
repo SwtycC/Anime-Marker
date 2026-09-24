@@ -31,7 +31,7 @@ from app.core.bangumi_api import BangumiClient
 from app.core.config import Config
 from app.core.database import Database
 from app.utils.logger import setup_logging
-from app.utils.paths import app_data_dir, qml_dir
+from app.utils.paths import app_data_dir, qml_dir, resource_path
 
 log = logging.getLogger(__name__)
 
@@ -113,7 +113,7 @@ class QmlApp:
         self.api = self._build_api()
 
         # ---- 桥接层 ----
-        self.library_bridge = LibraryBridge(self.db)
+        self.library_bridge = LibraryBridge(self.db, self.api)
         self.scanner_bridge = ScannerBridge(self.db, self.config)
         self.settings_bridge = SettingsBridge(self.config)
         self.player_bridge = PlayerBridge(self.db, self.config, self.api)
@@ -139,6 +139,7 @@ class QmlApp:
         self.player_bridge.set_api(self.api)
         self.match_bridge.set_api(self.api)
         self.inprogress_bridge.set_api(self.api)
+        self.library_bridge.set_api(self.api)
         # 海报墙展示模式可能变了
         self.library_bridge.set_display_mode(
             self.config.get("scanner", "season_display", "flat")
@@ -184,6 +185,17 @@ class QmlApp:
         # ---- 上下文对象 ----
         ctx = self.engine.rootContext()
         ctx.setContextProperty("appVersion", __version__)
+        # 图标目录的基地址（NavIcon 的 grid / rss / gear 用，拼上
+        # `<name>.svg` 即为完整地址）。
+        #
+        # 为什么由 Python 注入：QML 的导入根是 app/，而图标在项目根的
+        # resources/ 下；相对路径在开发态 / 打包态结构不同，不可靠。
+        # 末尾保留斜杠便于 QML 侧直接拼接；转成 file:// URL 是因为
+        # QML 的 Image.source 不认 Windows 反斜杠。
+        icons_base = QUrl.fromLocalFile(
+            str(resource_path("icons")) + "/").toString()
+        ctx.setContextProperty("iconsBaseUrl", icons_base)
+        log.info("图标目录：%s", icons_base)
         self.theme_bridge = ThemeBridge(self.config)
         ctx.setContextProperty("themeBridge", self.theme_bridge)
 
@@ -309,6 +321,10 @@ class QmlApp:
             self.inprogress_bridge.cancel()
         except Exception as e:  # pragma: no cover - 防御性
             log.warning("等待收藏/集级拉取结束失败：%s", e)
+        try:
+            self.library_bridge.waitTagWorker()
+        except Exception as e:  # pragma: no cover - 防御性
+            log.warning("等待标签拉取结束失败：%s", e)
         try:
             self.db.close()
         except Exception as e:  # pragma: no cover - 防御性

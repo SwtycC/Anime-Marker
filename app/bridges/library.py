@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
-from PySide6.QtCore import QObject, Property, Signal, Slot
+from PySide6.QtCore import QObject, Property, QThread, Signal, Slot
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QFileDialog
 
@@ -57,6 +57,59 @@ def as_file_url(path: str) -> str:
         return ""
 
 
+class _TagFetchWorker(QThread):
+    """后台拉取单个条目的前 10 个 tag（详情页进入时的自动补录）。
+
+    为什么独立成 worker：进入详情页就要发一次网络请求（存量条目），
+    不能阻塞 UI 线程。每个条目只需成功一次，之后全部走本地库，
+    因此不值得做成常驻线程池 —— 用完即弃的 QThread 足够。
+    """
+
+    #: (subject_id, ok, message) —— message 供状态栏展示
+    done = Signal(int, bool, str)
+
+    def __init__(
+        self,
+        db: Database,
+        api: BangumiClient,
+        subject_id: int,
+        bangumi_id: int,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._db = db
+        self._api = api
+        self._subject_id = subject_id
+        self._bangumi_id = bangumi_id
+
+    def run(self) -> None:
+        try:
+            subj = self._api.get_subject(self._bangumi_id)
+        except Exception as e:
+            log.warning("拉取条目标签失败 subject_id=%s: %s", self._subject_id, e)
+            self.done.emit(self._subject_id, False,
+                           "获取标签失败，请检查网络后重试")
+            return
+
+        tags = Database.tags_from_subject(subj or {})
+        if not tags:
+            # 请求成功但确实没有 tag：也算"完成"，只是没有数据可写 ——
+            # 不写任何行，下次进入还会再试（与 F20 水位的"成功 0 行"不同，
+            # tag 拉取极廉价，不值得为此建水位表）
+            self.done.emit(self._subject_id, False, "该条目在 Bangumi 上没有标签")
+            return
+        try:
+            self._db.replace_subject_tags(self._subject_id, tags)
+        except Exception as e:
+            log.exception("写入条目标签失败 subject_id=%s: %s", self._subject_id, e)
+            self.done.emit(self._subject_id, False, "写入标签失败：%s" % e)
+            return
+
+        log.info("已拉取条目标签：subject_id=%s（bgm=%s）%s 个",
+                 self._subject_id, self._bangumi_id, len(tags))
+        self.done.emit(self._subject_id, True, "已获取 %d 个标签" % len(tags))
+
+
 class LibraryBridge(QObject):
     """媒体库数据源。"""
 
@@ -67,10 +120,20 @@ class LibraryBridge(QObject):
     watchedEpsChanged = Signal()
     #: 海报变更（参数：subject_id），更换海报小窗与详情页据此刷新
     coverChanged = Signal(int)
+    #: 条目标签变更（参数：subject_id），详情页据此重取 tag 列表
+    tagsChanged = Signal(int)
+    #: 标签拉取的进度/结果提示（状态栏展示）
+    statusMessage = Signal(str)
 
-    def __init__(self, db: Database, parent: Optional[QObject] = None) -> None:
+    def __init__(
+        self,
+        db: Database,
+        api: Optional[BangumiClient] = None,
+        parent: Optional[QObject] = None,
+    ) -> None:
         super().__init__(parent)
         self._db = db
+        self._api = api
         self._display_mode = DISPLAY_FLAT
         # 查询缓存：Property 会被 QML 频繁读取（每次绑定重算都会调 getter），
         # 若每次都跑 SQL + 组装 dict 会很浪费。改为「变更时失效」。
@@ -85,6 +148,13 @@ class LibraryBridge(QObject):
         # 按条目记一个递增版本号，以 `?v=N` 追加到 file:// URL 后（query 不参与
         # 本地文件寻址，只作为缓存键的一部分），每次海报变更 +1 强制重新解码。
         self._cover_revs: dict[int, int] = {}
+        # 标签自动补拉：同一时刻最多一个 worker；期间新请求只记最后一个
+        self._tag_worker: Optional[_TagFetchWorker] = None
+        self._tag_fetch_pending: Optional[int] = None
+
+    def set_api(self, api: BangumiClient) -> None:
+        """注入 Bangumi 客户端（QmlApp 在启动 / 配置重建时调用）。"""
+        self._api = api
 
     # ---------- 配置 ----------
     def set_display_mode(self, mode: str) -> None:
@@ -683,6 +753,128 @@ class LibraryBridge(QObject):
         名字可能为空（pending 条目），所以要有兜底，不能直接拼。
         """
         return (s.name_cn or s.name or "").strip() or "（未命名条目）"
+
+    # ---------- 条目标签（详情页展示 + 编辑）----------
+    @Slot(int, result="QVariantList")
+    def subjectTags(self, subject_id: int) -> list[dict]:
+        """该条目的 tag 列表（详情页展示与编辑的数据源）。
+
+        返回项：`{ "name": str, "isApi": bool, "deleted": bool }`。
+        `deleted=True` 的项**不参与展示**，只在编辑模式置灰可见。
+        """
+        try:
+            return self._db.list_subject_tags(subject_id)
+        except Exception as e:
+            log.exception("读取条目标签失败 subject_id=%s: %s", subject_id, e)
+            return []
+
+    @Slot(int, "QVariantList", "QVariantList", result="QVariantMap")
+    def saveSubjectTags(
+        self,
+        subject_id: int,
+        api_states: list,
+        user_names: list,
+    ) -> dict:
+        """保存详情页的 tag 编辑结果（「确定」按钮）。
+
+        参数（都由 QML 组装）：
+            api_states: `[{"name": str, "deleted": bool}]`
+                接口 tag 的最终状态 —— 只更新删除标记；
+            user_names: `[str]`
+                用户 tag 的最终名单（顺序即展示顺序），整体替换。
+
+        返回 `{ok, message}`，message 供状态栏展示。
+        """
+        try:
+            # 清洗：去空白、去重（大小写不敏感 —— Bangumi tag 没有大小写
+            # 区分的语义，"TV" 和 "tv" 应视为同一个）
+            states: list[dict] = []
+            seen: set[str] = set()
+            for st in api_states or []:
+                if not isinstance(st, dict):
+                    continue
+                name = str(st.get("name") or "").strip()
+                if not name or name.lower() in seen:
+                    continue
+                seen.add(name.lower())
+                states.append({"name": name, "deleted": bool(st.get("deleted"))})
+
+            names: list[str] = []
+            for n in user_names or []:
+                name = str(n or "").strip()
+                if not name or name.lower() in seen:
+                    continue
+                seen.add(name.lower())
+                names.append(name)
+
+            self._db.save_edited_tags(subject_id, states, names)
+        except Exception as e:
+            log.exception("保存条目标签失败 subject_id=%s: %s", subject_id, e)
+            return {"ok": False, "message": "保存失败：%s" % e}
+
+        log.info("条目标签已保存：subject_id=%s（api %s 项，user %s 项）",
+                 subject_id, len(states), len(names))
+        self.tagsChanged.emit(subject_id)
+        return {"ok": True, "message": "标签已保存"}
+
+    @Slot(int)
+    def requestTagFetch(self, subject_id: int) -> None:
+        """异步补拉该条目的前 10 个 tag（详情页进入时自动 / 按钮手动）。
+
+        为什么是异步：进入详情页就会触发（存量条目自动补录），
+        同步网络请求会把 UI 卡住 0.3~1s，不可接受。
+        完成后经 tagsChanged 通知详情页重取，消息走 statusMessage。
+
+        幂等：已有 tag（含"全被用户删掉"的标记状态）时直接跳过，
+        不会重复请求 —— 这也保证用户删过的 tag 不会被重新拉回来。
+
+        快速翻页时的并发治理：同一时刻只跑一个 worker，期间的请求
+        只记下**最后一个** subject_id，当前完成后接续（防请求风暴）。
+        """
+        if self._tag_worker is not None and self._tag_worker.isRunning():
+            self._tag_fetch_pending = int(subject_id)
+            log.info("标签拉取进行中，%s 排队等待", subject_id)
+            return
+        try:
+            s = self._db.get_subject(subject_id)
+        except Exception as e:
+            log.exception("读取条目 %s 失败: %s", subject_id, e)
+            return
+        if s is None or not s.bangumi_id:
+            return                      # 未匹配 Bangumi：无可拉取（QML 侧不会触发）
+        if self._db.has_subject_tags(subject_id):
+            return                      # 已有（幂等）
+        if self._api is None:
+            self.statusMessage.emit("Bangumi 客户端未就绪，无法获取标签")
+            return
+
+        self.statusMessage.emit("正在获取标签…")
+        self._start_tag_worker(int(subject_id), int(s.bangumi_id))
+
+    def _start_tag_worker(self, subject_id: int, bangumi_id: int) -> None:
+        self._tag_worker = _TagFetchWorker(self._db, self._api,
+                                           subject_id, bangumi_id)
+        self._tag_worker.done.connect(self._on_tag_fetch_done)
+        self._tag_worker.finished.connect(self._tag_worker.deleteLater)
+        self._tag_worker.start()
+
+    def _on_tag_fetch_done(self, subject_id: int, ok: bool, message: str) -> None:
+        # done 在 finished 之前发出，这里先摘掉引用再让 deleteLater 生效
+        self._tag_worker = None
+        if ok:
+            self.tagsChanged.emit(subject_id)
+        self.statusMessage.emit(message)
+        pending = self._tag_fetch_pending
+        self._tag_fetch_pending = None
+        if pending:
+            self.requestTagFetch(pending)
+
+    def waitTagWorker(self, ms: int = 3000) -> None:
+        """退出时等待进行中的标签拉取线程（QmlApp.shutdown 调用）。"""
+        w = self._tag_worker
+        if w is not None and w.isRunning():
+            log.info("等待标签拉取线程结束…")
+            w.wait(ms)
 
     def _original_cover_path(self, s: Subject) -> Path:
         """原版海报的本地缓存路径（按实际情况探测，不靠猜）。

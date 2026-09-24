@@ -655,6 +655,12 @@ class ScanWorker(QThread):
             series_name=cand.series_name,
             match_state="auto",
         )
+        # 顺路存接口前 10 个 tag（就在本次搜索响应里，零额外请求）。
+        # 失败不阻塞扫描 —— tag 是展示性数据，丢了可手动重取。
+        try:
+            self.db.replace_subject_tags(subject_id, self.db.tags_from_subject(subj))
+        except Exception as e:
+            log.warning("写入条目标签失败 %s: %s", name_cn, e)
         self.log_message.emit(f"  ✓ {name_cn}（{result.score} 分：{result.reason}）")
         self.item_matched.emit(subject_id, name_cn)
         self._fill_episodes(subject_id, bangumi_id, cand)

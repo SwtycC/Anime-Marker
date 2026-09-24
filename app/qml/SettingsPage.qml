@@ -186,6 +186,27 @@ Item {
             policy: ScrollBar.AsNeeded
         }
 
+        // 点击设置页空白处：让当前聚焦的输入框（AppTextField / NumberStepper）
+        // 交出焦点、边框恢复原状 —— QML 里点击空白不会自动移走焦点。
+        //
+        // 实现要点（三条缺一不可）：
+        //   1. 必须是 Flickable 的**直接子项**：空白处的 press 被 Flickable
+        //      独占接收，挂在页面根上的 MouseArea / TapHandler 都收不到；
+        //   2. height 取 contentHeight（内容坐标系，铺满整个可滚动区域），
+        //      z:-1 压到表单之下 —— 点输入框 / 按钮时事件被它们拿走，
+        //      这个 MouseArea 收不到，焦点不会被误清；
+        //   3. onPressed 里**先清焦点再 accepted=false**：把事件交还给
+        //      Flickable，空白处拖拽滚动不受影响。
+        MouseArea {
+            width: flick.width
+            height: flick.contentHeight
+            z: -1
+            onPressed: function (mouse) {
+                root.forceActiveFocus()
+                mouse.accepted = false
+            }
+        }
+
         // 用 Column + 显式宽度，而不是 ColumnLayout。
         //
         // 原因：ColumnLayout 作为 Flickable 的直接子项时，其尺寸不由父级

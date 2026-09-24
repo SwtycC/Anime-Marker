@@ -223,6 +223,14 @@ class MatchBridge(QObject):
             self.failed.emit(f"写入失败：{e}")
             return False
 
+        # 顺路存接口前 10 个 tag（get_subject 响应里就有，零额外请求）。
+        # 与扫描路径同一策略：失败不阻塞匹配。
+        try:
+            self._db.replace_subject_tags(
+                self._subject_id, self._db.tags_from_subject(subj))
+        except Exception as e:
+            log.warning("写入条目标签失败 subject_id=%s: %s", self._subject_id, e)
+
         # 重拉集数并回填 bangumi_ep_id（本地文件不动）
         self._refill_episodes(bangumi_id, name_cn or name)
 
