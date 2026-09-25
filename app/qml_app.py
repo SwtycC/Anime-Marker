@@ -147,6 +147,10 @@ class QmlApp:
         # 「集级记录条数」可能被改小 —— 立即裁剪多余的旧记录，
         # 否则界面仍会显示上一次拉取的更多部内容（见 applyEpisodeCount）
         self.inprogress_bridge.applyEpisodeCount()
+        # 监控参数（自动上传 / 轮询间隔 / 阈值）**必须显式同步**：
+        # ProgressMonitor 是长生命周期对象、参数在构造时读入，
+        # 不重新下发的话要重启程序才生效（见 PlayerBridge.apply_config）
+        self.player_bridge.apply_config()
         log.info("配置已应用，服务已重建")
 
     def _on_scan_requested(self) -> None:

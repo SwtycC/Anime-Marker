@@ -245,6 +245,20 @@ class LibraryBridge(QObject):
                 except Exception:
                     pass
 
+            # 没有本地缓存就**不回落在线 URL**（踩坑，见下方说明）。
+            #
+            # 早期写的是 `local_cover or it.cover_url`：本地未入库 / 封面还没
+            # 下载的条目，会把 `https://lain.bgm.tv/...` 直接交给 QML 的
+            # `Image.source` —— 让 QML 引擎自己去联网取图。后果：
+            #   ① `lain.bgm.tv` 在内网/被墙环境下连不上 → 控制台刷
+            #      `QML QQuickImage: Connection timed out`（QML 的报错**输出到
+            #      控制台而非日志**，看着像程序出了问题）；
+            #   ② 每个可见行都发一次请求，几十行就是几十个连接，页面卡顿；
+            #   ③ 封面本该由 `cover_cache` 下载到本地后经 `as_file_url()`
+            #      使用（见 §5.12.5），绕过这条链路等于丢了缓存与失败兜底。
+            # 现在只用本地 URL，拿不到就交给 QML 显示占位底色（原本就有的
+            # 空态），不再让界面层承担联网职责。
+
             # 「下一集」按钮：要播的集 ID（0 = 播不了）+ 播不了时的原因文案。
             # 按钮**不隐藏**，点不动时把原因报到状态栏（见 _next_episode）。
             next_ep_id, next_ep_hint = self._next_episode(local_id, it.ep_status)
@@ -258,7 +272,9 @@ class LibraryBridge(QObject):
                 "name": it.name or "",
                 "nameCn": it.name_cn or "",
                 "title": it.name_cn or it.name or "",
-                "coverUrl": local_cover or (it.cover_url or ""),
+                # 只用本地缓存 URL（见上方说明：不回落在线的 lain.bgm.tv，
+                # 否则 QML 引擎会自己联网取图并刷超时错误）
+                "coverUrl": local_cover,
                 "epStatus": int(it.ep_status or 0),
                 "totalEps": int(it.total_eps or 0),
                 # 2 = 看过（当前唯一使用的类型，见 InProgressBridge）

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Optional
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -119,6 +120,38 @@ class ProgressMonitor(QObject):
         # 连续读不到进度的次数（用于"静默失败"时给一次提示）
         self._misses = 0
 
+    def apply_config(
+        self,
+        poll_interval: Optional[int] = None,
+        trigger_threshold: Optional[float] = None,
+        title_regex: Optional[str] = None,
+        auto_upload: Optional[bool] = None,
+    ) -> None:
+        """在**运行中**更新监控参数（设置页保存后调用）。
+
+        **为什么需要它**：这些参数原先是构造时一次性读入并冻结的
+        （`self.auto_upload = bool(auto_upload)`），而 `ProgressMonitor`
+        在 `PlayerBridge.__init__` 里只建一次、之后一直复用。于是用户在
+        设置页改了「自动上传」「轮询间隔」等，**当前这次运行不会生效**,
+        必须重启程序 —— 表现是"勾了自动上传，看完还是没传，手动刷新才补上"。
+
+        所有参数都是可选：只传要改的那几个，其余保持不动。
+        `poll_interval` 会立即重设 QTimer 间隔（`setInterval` 对运行中的
+        QTimer 同样有效，无需重启定时器）。
+        """
+        if poll_interval is not None:
+            self._timer.setInterval(max(1, int(poll_interval)) * 1000)
+        if trigger_threshold is not None:
+            self.threshold = float(trigger_threshold)
+        if title_regex is not None:
+            self.title_regex = title_regex or None
+        if auto_upload is not None:
+            changed = self.auto_upload != bool(auto_upload)
+            self.auto_upload = bool(auto_upload)
+            if changed:
+                log.info("自动上传已%s（立即生效）",
+                         "开启" if self.auto_upload else "关闭")
+
     def start(self, episode: Episode) -> None:
         self._episode = episode
         self._triggered.discard(episode.id)
@@ -163,9 +196,31 @@ class ProgressMonitor(QObject):
         # 注意它拦不住"手动把进度条拖到结尾"—— 拖动同样是一次位置推进，而且
         # 那本就是个明确动作（旧实现同样会算）。真要区分得看"单次跳变幅度"，
         # 目前不做。
+        #
+        # **`watched` 必须现查库、不能用 `ep.watched`**（踩坑）：
+        # `ep` 是 `start()` 时抓的**快照**，播放期间可能已经过期 ——
+        # 用户在详情页手动点过「标记看过」、或用「上传」小窗补传过，
+        # 库里已是 1 而快照仍是 0。此时超阈值会**再触发一次**：
+        #   ① 本地 `mark_watched()` 覆盖掉原来的 `watched_at` 时间；
+        #   ② 再 POST 一次 Bangumi（接口幂等，但白白多一次请求）。
+        # 现查一次库代价极小（本地 SQLite），换掉这个竞态。
         if (progress >= self.threshold and advancing
-                and ep.id not in self._triggered and not ep.watched):
+                and ep.id not in self._triggered
+                and not self._is_watched(ep.id)):
             self._trigger_watched(ep)
+
+    def _is_watched(self, episode_id: int) -> bool:
+        """现查库确认该集是否已标记看过（不用启动时的快照，见 _tick 说明）。
+
+        查不到（集被删 / 重扫换了 id）时保守返回 True —— 宁可漏标一次
+        （用户可在详情页手动补），也不要对着一条不存在的记录反复写。
+        """
+        try:
+            row = self.db.get_episode(episode_id)
+        except Exception as e:      # pragma: no cover - 防御性
+            log.warning("查询 episode_id=%s 观看状态失败: %s", episode_id, e)
+            return True
+        return bool(row.watched) if row is not None else True
 
     def _read_progress(self, hwnd: int) -> tuple[Optional[float], bool]:
         """读一次进度 → (progress 或 None, 位置是否在推进)。
@@ -247,6 +302,33 @@ class ProgressMonitor(QObject):
             return
         log.info("已同步到 Bangumi：episode_id=%s（条目 %s 第 %s 集）",
                  ep.id, subject.bangumi_id, ep.ep_index)
+        # ---- 3. 把这一集写回本地「已同步」表 ----
+        #
+        # **为什么必须写回**（踩坑）：`watched_episodes` 是「**从 Bangumi 拉回来的**
+        # 已标记集」；而这里是「**推过去**」—— 只 POST 不写回，这张表就永远缺这一行。
+        # 于是 `Database.pending_uploads()` 的判据
+        # （`LEFT JOIN watched_episodes ... WHERE w.bangumi_ep_id IS NULL`）
+        # 会把**刚刚自动上传成功的集**继续算成"待上传" ✗ ——
+        # 实测现象：日志已打印"已同步到 Bangumi"，但「上传」小窗里
+        # 那一集仍然列在待上传清单里，用户以为没传上去。
+        #
+        # 与手动补传走同一条路（见 InProgressBridge._on_upload_finished）：
+        # upsert 后动态页立刻出现 `bgm` 标记，不必等下一次集级同步。
+        # `watched_at` 取**上传时刻**，与 Bangumi 网页记录的时间一致。
+        try:
+            self.db.upsert_watched_episodes([{
+                "bangumi_ep_id": int(ep.bangumi_ep_id),
+                "subject_id": int(ep.subject_id),
+                "bangumi_id": int(subject.bangumi_id),
+                "subject_name": subject.name_cn or subject.name or "",
+                "ep_index": ep.ep_index or 0,
+                "ep_name": ep.title or "",
+                "watched_at": datetime.now().astimezone().isoformat(
+                    timespec="seconds"),
+            }])
+        except Exception as e:
+            # 只影响"待上传清单"与界面标记，下次集级同步会补上，不影响已提交的标记
+            log.warning("写回本地集级记录失败（不影响 Bangumi 标记）: %s", e)
         # 让这条目的集级记录下次刷新时重新同步，否则刚标的这一集要等
         # 收藏行变化或 30 天超期兜底才会出现在动态页（见 sync_candidates）
         try:

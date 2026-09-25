@@ -117,6 +117,8 @@ Item {
         // 启动器
         v["launcher.enable_ls"] = enableLsBox.checked
         v["launcher.ls_shortcut"] = lsShortcutField.text.trim()
+        v["launcher.fullscreen_shortcut"] = fullscreenShortcutField.text.trim()
+        v["launcher.fullscreen_settle"] = fullscreenSettleField.value
         // 监控
         v["monitor.poll_interval"] = pollIntervalField.value
         v["monitor.trigger_threshold"] = thresholdField.value
@@ -293,7 +295,7 @@ Item {
                             minimum: 120
                             maximum: 400
                             step: 20
-                            suffix: " px"
+                            suffix: "px"
                         }
                         Text {
                             anchors.verticalCenter: parent.verticalCenter
@@ -443,7 +445,7 @@ Item {
                             minimum: 0
                             maximum: 300
                             step: 5          // 需求：按一下 ±5
-                            suffix: " 条"
+                            suffix: "条"
                             width: 180
                         }
                         Text {
@@ -589,7 +591,58 @@ Item {
                         objectName: "lsShortcutField"
                         text: root.getValue("launcher.ls_shortcut", "")
                         width: parent.width
-                        placeholder: "ctrl+alt+l"
+                        // 占位符与 DEFAULTS 保持一致：ctrl+alt+l 会和 QQ 的
+                        // 「锁定 QQ」全局热键冲突（会被 QQ 抢先注册）
+                        placeholder: "ctrl+alt+p"
+                    }
+                }
+
+                FormRow {
+                    width: parent.width
+                    label: "全屏快捷键"
+                    AppTextField {
+                        id: fullscreenShortcutField
+                        objectName: "fullscreenShortcutField"
+                        text: root.getValue("launcher.fullscreen_shortcut", "")
+                        width: parent.width
+                        placeholder: "alt+enter"
+                    }
+                }
+
+                FormRow {
+                    width: parent.width
+                    label: "全屏后等待"
+                    // 结构照搬「Access Token」那一行：按钮用负偏移移出布局流，
+                    // 因此控件左边缘与其余各行严格对齐（见 tokenField 处注释）。
+                    //
+                    // **宽度不能锚满**：这里刻意不设 anchors.left/right ——
+                    // NumberStepper 自带 implicitWidth(220)，与「轮询间隔」
+                    // 「触发阈值」等其余数值框同宽；早期写成左右锚满会让
+                    // 本行独占整条宽度，与相邻行视觉不齐。
+                    Item {
+                        width: fullscreenSettleField.implicitWidth
+                        height: 34
+
+                        NumberStepper {
+                            id: fullscreenSettleField
+                            objectName: "fullscreenSettleField"
+                            anchors.fill: parent
+                            value: root.getFloat("launcher.fullscreen_settle", 3.0)
+                            minimum: 0
+                            maximum: 10
+                            step: 0.5
+                            decimals: 1
+                            suffix: "秒"
+                        }
+
+                        HelpButton {
+                            id: settleHelpBtn
+                            objectName: "settleHelpBtn"
+                            x: -width - Theme.spacingSm
+                            anchors.verticalCenter: parent.verticalCenter
+                            tooltip: "全屏与等待时间说明"
+                            onClicked: settleDialog.open()
+                        }
                     }
                 }
 
@@ -603,7 +656,7 @@ Item {
                         minimum: 1
                         maximum: 60
                         step: 1
-                        suffix: " 秒"
+                        suffix: "秒"
                     }
                 }
 
@@ -618,7 +671,8 @@ Item {
                         maximum: 1.0
                         step: 0.05
                         decimals: 2
-                        width: 180
+                        // 不写死宽度：与「全屏后等待」「轮询间隔」保持同宽
+                        // （原先写死 180，导致这一行右边比邻行短一截 ✗）
                     }
                 }
             }
@@ -779,7 +833,7 @@ Item {
                         minimum: 5
                         maximum: 720
                         step: 5
-                        suffix: " 分钟"
+                        suffix: "分钟"
                         width: 180
                     }
                 }
@@ -896,6 +950,82 @@ Item {
                     text: "知道了"
                     variant: "primary"
                     onClicked: tokenDialog.close()
+                }
+            }
+        }
+    }
+
+    // ==================== 全屏与等待时间说明弹窗 ====================
+    Dialog {
+        id: settleDialog
+        modal: true
+        anchors.centerIn: parent
+        width: 560
+        padding: Theme.spacingXl
+        title: "全屏与等待时间说明"
+
+        background: Rectangle {
+            color: Theme.surfaceBg
+            border.width: Theme.lineThin
+            border.color: Theme.border
+            radius: Theme.radiusMd
+        }
+
+        contentItem: Column {
+            width: parent.width
+            spacing: Theme.spacingMd
+
+            Text {
+                width: parent.width
+                text: "为什么播放前要先全屏？"
+                color: Theme.textPrimary
+                font.pixelSize: Theme.fontMd
+                font.bold: true
+            }
+
+            Text {
+                width: parent.width
+                text: "小黄鸭的捕获是按「捕获那一刻的窗口尺寸」出画的：" +
+                      "窗口化会出现黑边、最大化会帧数不稳，" +
+                      "只有真全屏才正常。所以播放前会先按「全屏快捷键」" +
+                      "把 PotPlayer 切到全屏。若你在 PotPlayer 里改过全屏键" +
+                      "（F5 → 基本 → 快捷键 里搜「全屏」），这里要填成一致的值。"
+                color: Theme.textSecondary
+                font.pixelSize: Theme.fontSm
+                lineHeight: 1.5
+                wrapMode: Text.WordWrap
+            }
+
+            Text {
+                width: parent.width
+                text: "「全屏后等待」是做什么的？"
+                color: Theme.textPrimary
+                font.pixelSize: Theme.fontMd
+                font.bold: true
+            }
+
+            Text {
+                width: parent.width
+                text: "PotPlayer 达到全屏尺寸后，可能仍在切换渲染模式。" +
+                      "此时过早就发送插帧快捷键，小黄鸭虽然当场抓到了窗口，" +
+                      "但随后的渲染模式切换会让捕获失效 —— " +
+                      "表现为「全屏后右上角有帧数，一开始播放就没了」。\n\n" +
+                      "这个等待就是为了让渲染模式切换完成后再发插帧键。" +
+                      "实测 1 秒不够、3 秒稳定，故默认 3 秒；" +
+                      "机器较慢或播放器启动慢时可调大。"
+                color: Theme.textSecondary
+                font.pixelSize: Theme.fontSm
+                lineHeight: 1.5
+                wrapMode: Text.WordWrap
+            }
+
+            Row {
+                anchors.right: parent.right
+
+                AppButton {
+                    text: "知道了"
+                    variant: "primary"
+                    onClicked: settleDialog.close()
                 }
             }
         }

@@ -31,7 +31,8 @@ ALLOWED_KEYS = {
     "general.library_path", "general.player_path", "general.ls_path",
     # 启动器
     "launcher.enable_ls", "launcher.ls_shortcut", "launcher.ls_start_delay",
-    "launcher.player_start_delay",
+    "launcher.player_start_delay", "launcher.fullscreen_shortcut",
+    "launcher.fullscreen_settle",
     # 监控
     "monitor.poll_interval", "monitor.trigger_threshold", "monitor.title_regex",
     # 扫描与匹配
@@ -60,6 +61,8 @@ FALLBACKS: dict[str, str] = {
     "general.ls_path": r"C:\Program Files\Lossless Scaling\LosslessScaling.exe",
     "launcher.enable_ls": "true",
     "launcher.ls_shortcut": "ctrl+alt+p",
+    "launcher.fullscreen_shortcut": "alt+enter",
+    "launcher.fullscreen_settle": "3.0",
     "monitor.poll_interval": "3",
     "monitor.trigger_threshold": "0.95",
     "scanner.season_patterns": "cn",

@@ -534,6 +534,13 @@ class Database:
             )
             return [Episode(**dict(r)) for r in cur.fetchall()]
 
+    def get_episode(self, episode_id: int) -> Optional[Episode]:
+        """按主键取单集（进度监控需要"现查最新 watched 状态"，见 monitor._tick）。"""
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM episodes WHERE id=?", (episode_id,))
+            row = cur.fetchone()
+            return Episode(**dict(row)) if row else None
+
     def find_episode_by_path(self, file_path: str) -> Optional[Episode]:
         with self._cursor() as cur:
             cur.execute("SELECT * FROM episodes WHERE file_path=?", (file_path,))

@@ -74,6 +74,25 @@ class PlayerBridge(QObject):
         self._api = api
         self._monitor.api = api
 
+    def apply_config(self) -> None:
+        """设置保存后，把**监控相关配置**同步给运行中的 monitor（无需重启）。
+
+        **为什么必须显式同步**：`ProgressMonitor` 只在 `__init__` 里建一次，
+        监控参数（自动上传 / 轮询间隔 / 阈值 / 标题正则）原先都是构造时
+        一次性读入的，改完配置不重启程序不生效。表现就是"勾了自动上传，
+        看完这集仍只写本地，得手动刷新才补传上 Bangumi"。
+
+        `player_path` / `ls_path` 等启动参数不需要同步 —— `playEpisode()`
+        每次播放都现读配置（见该方法内构造 `PlayerLauncher` 的地方）。
+        """
+        self._monitor.apply_config(
+            poll_interval=self._config.getint("monitor", "poll_interval", 3),
+            trigger_threshold=self._config.getfloat(
+                "monitor", "trigger_threshold", 0.95),
+            title_regex=self._config.get("monitor", "title_regex", ""),
+            auto_upload=self._config.getbool("bangumi", "auto_upload", True),
+        )
+
     # ---------- 状态属性 ----------
     @Property(int, notify=playingChanged)
     def playingEpisodeId(self) -> int:
@@ -106,6 +125,10 @@ class PlayerBridge(QObject):
             ls_path=self._config.get("general", "ls_path", ""),
             enable_ls=self._config.getbool("launcher", "enable_ls", True),
             ls_shortcut=self._config.get("launcher", "ls_shortcut", "ctrl+alt+p"),
+            fullscreen_shortcut=self._config.get(
+                "launcher", "fullscreen_shortcut", "alt+enter"),
+            fullscreen_settle=self._config.getfloat(
+                "launcher", "fullscreen_settle", 3.0),
             ls_start_delay=self._config.getfloat("launcher", "ls_start_delay", 5.0),
             player_start_delay=self._config.getfloat(
                 "launcher", "player_start_delay", 1.0),
