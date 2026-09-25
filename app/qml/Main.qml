@@ -231,21 +231,31 @@ ApplicationWindow {
             posterDialog.open(subjectId, subj ? subj.title : "")
         }
 
-        // 标签编辑 / 补拉的提示 → 状态栏
-        function onStatusMessage(text) {
-            statusBar.setMessage(text, 5000)
+        // 标签编辑的提示 → 底部浮条。
+        //
+        // 为什么走浮条而不是状态栏：状态栏在窗口最底部、字小色淡，用户
+        // 注意力在标签行上，看不到；浮条浮在内容上方且能变琥珀色
+        // （warn=true，如"该标签已存在"），一眼可见。
+        function onStatusMessage(text, warn) {
+            banner.show(text, warn)
         }
     }
 
-    // 标签自动补拉：完成/失败通知 + 兜底刷新
+    // 标签在别处变更（自动补拉完成 / 外部修改）→ 刷新详情页数据。
+    //
+    // **注意**：这里必须用 `reloadTagRows()`（只重取数据）而不是
+    // `resetTagState()`（重取 + 退出编辑态）。
+    // 因为 addUserTag / toggleApiTag 每次操作都会写库 → 后端 emit
+    // tagsChanged → 若这里调 resetTagState，编辑态会被**立刻踢出**
+    // （实测：点一次 ✔ 加完 tag，编辑面板就自己关了）。
     Connections {
         target: typeof library !== "undefined" && library ? library : null
         function onTagsChanged(subjectId) {
             if (detailPage.subjectId === subjectId)
-                detailPage.resetTagState()
+                detailPage.reloadTagRows()
         }
         function onStatusMessage(text) {
-            statusBar.setMessage(text, 5000)
+            banner.show(text)
         }
     }
 
@@ -328,16 +338,34 @@ ApplicationWindow {
         }
     }
 
-    // 鼠标后侧键（XButton1）在详情页时返回海报墙
+    // 鼠标后侧键（XButton1）= "返回上一层"，两处语义：
+    //   详情页       → 回到进来的那一页（同 onBackRequested）
+    //   海报墙 · 搜索中 → 退出搜索，回到整墙（同浏览器的"返回"退出搜索页）
     MouseArea {
         anchors.fill: parent
         acceptedButtons: Qt.BackButton
-        // 只在详情页拦截，否则会吃掉正常点击
-        enabled: browseStack.currentIndex === 1
+
+        readonly property bool onDetail: window.currentPage === 0
+                                         && browseStack.currentIndex === 1
+        readonly property bool onWallSearch: window.currentPage === 0
+                                             && browseStack.currentIndex === 0
+                                             && wallPage.searchActive
+
+        // 只在"确实能返回"时拦截，否则会吃掉正常点击 / 抢别的按键语义。
+        //
+        // 两个条件都必须带 `window.currentPage === 0`：browseStack 只在外层第 0 页
+        // 可见，从详情页用底部导航切到别的页时 currentIndex 仍停在 1，
+        // 只判 currentIndex 会在"设置页按后侧键"这类场景里误触发（实测踩到）。
+        enabled: onDetail || onWallSearch
+
         onClicked: {
-            // 同上：不调 library.reload()，避免重建全部卡片
-            browseStack.currentIndex = 0
-            window.currentPage = detailOriginPage   // 同 onBackRequested
+            if (onDetail) {
+                // 不调 library.reload()，避免重建全部卡片
+                browseStack.currentIndex = 0
+                window.currentPage = detailOriginPage   // 同 onBackRequested
+            } else {
+                wallPage.clearSearch()
+            }
         }
     }
 
@@ -428,13 +456,16 @@ ApplicationWindow {
     }
 
     /**
-     * 应用主题（启动时由 Python 侧读取 config.ini 后调用）。
+     * 应用主题（界面加载完成后由 Python 侧调用，做一次复核）。
      *
      * 参数：
      *   isDark       —— true 深色 / false 白色简约
      *   accentColor  —— 主题色 "#RRGGBB"
      *
      * 说明：Theme 是 QML 单例，Python 无法直接拿到实例，故从这里转发。
+     * **首帧的主题不靠这里** —— 那时已经画出去了；启动主题由 Python 在加载
+     * QML 之前注入 `themeStartup`，Theme 单例创建时就已初始化（见 Theme.qml
+     * 的 applyStartupTheme 与 QmlApp.run 里的说明）。
      */
     function applyTheme(isDark, accentColor) {
         Theme.dark = isDark
@@ -472,6 +503,12 @@ ApplicationWindow {
     /** 诊断用：滚动海报墙到指定位置。 */
     function debugScrollWall(y) {
         wallPage.scrollTo(y)
+    }
+
+    /** 诊断用：给海报墙搜索框填关键词（截图核对过滤结果用）。返回命中条数。 */
+    function debugSearchWall(text) {
+        wallPage.searchText = text
+        return wallPage.matchCount
     }
 
     /** 诊断用：打开指定条目的详情页（截图核对用）。 */
@@ -625,38 +662,79 @@ ApplicationWindow {
         id: banner
         objectName: "statusBanner"
 
-        // 浮在内容之上、导航栏上方，不占布局空间
+        // 提示条有两种语气：
+        //   normal —— 主题色底（"已保存"这类中性/成功信息）
+        //   warn   —— 琥珀色底（"该标签已存在"这类需要注意但不致命的提示）
+        // 用 `warn` 而不是 `dangerColor`：重复添加不是错误，红字会显得过重。
+        property bool warn: false
+
+        // 位置：**窗口顶部居中**，浮在内容之上，不占布局空间。
+        //
+        // 位置取舍（三次调整，记下结论）：
+        //   ① 最初在底部导航正上方 —— 与高对比的胶囊导航挤成一团，
+        //      既抢注意力、又像是导航的一部分（实测反馈"和导航栏重叠"）。
+        //   ② 搬到右上角 —— 会压住详情页右上角的「更换海报 / 重新匹配」
+        //      按钮（实测截图确认）。各页面右上角基本都有操作按钮，
+        //      这里并不空。
+        //   ③ 现在放在**顶部居中** —— 该区域在各页面都是空白：标题左对齐、
+        //      操作按钮靠右，中间这条带子没人占用。
+        //
+        // 为什么不贴顶：贴着窗口边缘会有"被裁切"的观感，留 `_topMargin`
+        // 让它落在标题行上方的空白带里。
         readonly property int _pad: 12
+        readonly property int _topMargin: 14
         x: Math.round((window.width - width) / 2)
-        y: Math.round(window.height - height - Theme.navBottomMargin
-                      - Theme.navPillHeight - 12)
+        y: _topMargin
 
         width: bannerText.implicitWidth + Theme.spacingXl * 2
         height: 38
         radius: Theme.radiusSm
-        color: Theme.accentSoft
+        // 琥珀色不放进 Theme：只在提示条这一处用，加进主题表反而增加
+        // 维护面（且 warningColor 是为深色背景调过的，做底色偏暗）
+        color: banner.warn
+               ? (Theme.dark ? "#3A2E12" : "#FFF4D6")
+               : Theme.accentSoft
         border.width: Theme.lineThin
-        border.color: Theme.accent
+        border.color: banner.warn
+                      ? (Theme.dark ? "#8A6D1F" : "#E0B84C")
+                      : Theme.accent
         opacity: 0
         visible: opacity > 0.01
         z: 200
+
+        // 出现时从上方轻微滑入（配合顶部位置的"弹出"观感）
+        transform: Translate {
+            y: banner.opacity > 0.5 ? 0 : -8
+            Behavior on y {
+                NumberAnimation { duration: Theme.durNormal; easing.type: Easing.OutCubic }
+            }
+        }
 
         Behavior on opacity { NumberAnimation { duration: Theme.durNormal } }
 
         Text {
             id: bannerText
             anchors.centerIn: parent
-            color: Theme.accent
+            color: banner.warn
+                   ? (Theme.dark ? "#F0D48A" : "#7A5B08")
+                   : Theme.accent
             font.pixelSize: Theme.fontMd
+
+            Behavior on color { ColorAnimation { duration: Theme.durNormal } }
         }
 
         Timer {
             id: bannerTimer
+            // 停留 3 秒后淡出（淡出动画本身再加 durNormal=200ms）。
+            // 用 restart() 而非 start()：连续触发时重新计时，避免第二条
+            // 提示被前一条的计时器提前关掉。
             interval: 3000
             onTriggered: banner.opacity = 0
         }
 
-        function show(text) {
+        /// 显示提示。`warn` 为 true 时用琥珀色（重复 / 需注意）。
+        function show(text, warn) {
+            banner.warn = warn === true
             bannerText.text = text
             banner.opacity = 1
             bannerTimer.restart()

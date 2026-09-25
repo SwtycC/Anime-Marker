@@ -9,7 +9,9 @@ Item {
     id: root
 
     signal backRequested()
-    signal statusMessage(string text)
+    /// 提示消息（由 Main.qml 转成窗口底部浮条）。
+    /// `warn` = true 时浮条用琥珀色（如"该标签已存在"）。
+    signal statusMessage(string text, bool warn)
 
     property int subjectId: 0
     property var subject: ({})
@@ -42,12 +44,21 @@ Item {
         epFlick.contentY = 0
     }
 
-    /// 从桥接层重取 tag 并复位编辑态（打开页面 / 保存成功后调用）
-    function resetTagState() {
+    /// 只从桥接层重取 tag（不动编辑态、不清草稿）。
+    ///
+    /// 用途：后端 `tagsChanged` 通知（每次写库都会发）—— 本页自己写库时
+    /// 也会收到，此时**必须保留编辑态**，否则点一次 ✔ 面板就自己关了
+    /// （踩坑记录见 Main.qml 该信号的接线处）。
+    function reloadTagRows() {
         if (typeof library !== "undefined" && library)
             root.tagRows = library.subjectTags(root.subjectId)
         else
             root.tagRows = []
+    }
+
+    /// 重取 tag **并退出编辑态**（打开页面 / 点 × 退出时调用）
+    function resetTagState() {
+        root.reloadTagRows()
         root.editingTags = false
         root.editApi = []
         root.editUser = []
@@ -86,49 +97,104 @@ Item {
         root.editingTags = true
     }
 
-    /// 编辑态点接口 tag：切换删除 / 恢复（不立即写库，确定时统一提交）
+    /// 编辑态点接口 tag：切换删除 / 恢复，**立即写库**（见 addUserTag 的说明）
     function toggleApiTag(index) {
         var next = []
         for (var i = 0; i < root.editApi.length; i++) {
-            var t = root.editApi[i]
-            if (i === index)
-                t.deleted = !t.deleted
-            next.push(t)
+            // 必须深拷贝：直接改 t.deleted 会改到 root.editApi 里的同一对象，
+            // 即使随后整体赋值也可能因"值没变"而漏掉通知
+            next.push({
+                "name": root.editApi[i].name,
+                "deleted": i === index ? !root.editApi[i].deleted
+                                       : root.editApi[i].deleted
+            })
         }
+        if (!root.pushTags(next, root.editUser))
+            return
         root.editApi = next
     }
 
-    /// 编辑态点用户 tag：直接从草稿移除（用户加的没有"恢复"一说）
+    /// 编辑态点用户 tag：移除，**立即写库**（用户加的没有"恢复"一说）
     function removeUserTag(index) {
         var next = []
         for (var i = 0; i < root.editUser.length; i++)
             if (i !== index)
                 next.push(root.editUser[i])
+        if (!root.pushTags(root.editApi, next))
+            return
         root.editUser = next
     }
 
-    /// 把输入框里的文字添加为用户 tag（去重、去空白）
+    /// 把输入框里的文字添加为用户 tag（去重、去空白），并**立即落库**。
+    ///
+    /// **踩坑（加了 tag 按 × 却没了）**：早期版本把 ✔ 设计成"只改草稿"、
+    /// 需要再点一次空输入的 ✔ 才写库，× 则是"丢弃草稿退出"。但用户的心智
+    /// 是"我点了 ✔ 就已经加上了"，随后按 × 收工 → 草稿被丢弃 → tag 消失
+    /// （实测反馈）。
+    ///
+    /// 现在改为**每次操作立即提交**：
+    ///   ✔ 添加   → 立刻写库，失败则不当场改 UI
+    ///   点 tag 切换删除/恢复 → 立刻写库
+    ///   × 退出   → 只收起编辑面板，不再承担"回滚"职责（无草稿可丢）
+    /// 编辑态与展示态因此永远一致，不存在"改了没保存"的中间状态。
     function addUserTag() {
         var name = root.newTagText.trim()
         if (!name)
             return
-        for (var i = 0; i < root.editUser.length; i++)
-            if (root.editUser[i].toLowerCase() === name.toLowerCase())
-                return          // 已存在，静默忽略
+
+        // 查重范围要**同时覆盖用户 tag 与接口 tag** —— 后端是按
+        // (subject_id, name) 去重的，若只查 editUser，输入一个已存在的
+        // 接口 tag（如「科幻」）时，后端会静默丢弃，界面却提示"已添加"。
+        var lower = name.toLowerCase()
+        for (var i = 0; i < root.editUser.length; i++) {
+            if (root.editUser[i].toLowerCase() === lower) {
+                root.statusMessage("标签「" + name + "」已存在", true)
+                return
+            }
+        }
+        for (var j = 0; j < root.editApi.length; j++) {
+            if (root.editApi[j].name.toLowerCase() === lower) {
+                // 已被用户删掉的接口 tag：提示可以点它恢复，而不是重复添加
+                root.statusMessage(
+                    root.editApi[j].deleted
+                        ? "「" + name + "」已存在（已删除，点它可恢复）"
+                        : "标签「" + name + "」已存在", true)
+                return
+            }
+        }
+
         var next = root.editUser.slice()
         next.push(name)
+        // 先写库：成功才更新界面（避免"界面加上了、库里没有"）
+        if (!root.pushTags(root.editApi, next))
+            return
         root.editUser = next
         root.newTagText = ""
+        root.statusMessage("已添加标签「" + name + "」")
     }
 
-    /// 确定：把草稿提交给桥接层
-    function confirmTags() {
+    /// 把当前草稿提交给桥接层；返回是否成功。
+    ///
+    /// 成功后**不退出编辑态** —— 调用方通常还要继续编辑（添加下一个 tag、
+    /// 或接着删别的 tag）。要退出的地方显式调 `resetTagState()`。
+    function pushTags(apiStates, userNames) {
         if (typeof library === "undefined" || !library)
+            return false
+        var r = library.saveSubjectTags(root.subjectId, apiStates, userNames)
+        if (!r.ok)
+            root.statusMessage(r.message || "保存失败")
+        return r.ok === true
+    }
+
+    /// ✔ 按钮 / 回车：**只添加，不退出**编辑态。
+    ///
+    /// 空输入时点击不做任何事（不退出）—— 退出编辑统一走 ×。
+    /// 早先版本让空输入的 ✔ 兼任"保存退出"，但那样用户会以为
+    /// "按勾 = 完成"，与"按叉才能退出"的心智冲突（实测反馈）。
+    function commitTagInput() {
+        if (root.newTagText.trim() === "")
             return
-        var r = library.saveSubjectTags(root.subjectId, root.editApi, root.editUser)
-        root.statusMessage(r.message || (r.ok ? "标签已保存" : "保存失败"))
-        if (r.ok === true)
-            root.resetTagState()
+        root.addUserTag()
     }
 
     // 点击页面空白处：让输入框交出键盘焦点（恢复原状）。
@@ -296,15 +362,21 @@ Item {
                     }
                 }
 
-                // 编辑态：接口 tag（含置灰）+ 用户 tag + 添加 + 确定/取消
+                // 编辑态：接口 tag（含置灰）+ 用户 tag + 输入框 + ✔ / ×
                 ColumnLayout {
                     Layout.fillWidth: true
                     spacing: Theme.spacingSm
                     visible: root.editingTags
+                    // 说明：输入框的"浮动标签"会浮到它上方（见 tagLabel 的
+                    // 说明）。这里不能加 topPadding —— ColumnLayout 没有该属性
+                    // （那是 Column/Control 的）。留白由上面的操作提示文字与
+                    // 输入框之间的 spacing 自然提供，且浮动标签的底色会遮住
+                    // 途经的内容，不会显脏。
 
                     Text {
                         Layout.fillWidth: true
-                        text: "点击标签切换删除/恢复；灰色删除线的是已删除、确定后不再展示，再次编辑时可恢复。"
+                        text: "改动即时生效：点标签可删除 / 恢复（灰色删除线的不再展示）；"
+                              + "输入后点 ✔ 添加。点 × 收起编辑面板。"
                         color: Theme.textTertiary
                         font.pixelSize: Theme.fontXs
                         wrapMode: Text.WordWrap
@@ -394,14 +466,34 @@ Item {
                         }
                     }
 
-                    // 添加新 tag
+                    // 标签行与输入框之间的留白。
+                    //
+                    // 为什么单独留一行：输入框的"浮动标签"会浮到框上方
+                    // （见 tagLabel），距输入框顶部约一个字高。若紧跟 tag 行
+                    // 排布，浮起的「标签」会插进上面那排 chip 的空隙里
+                    // （实测：贴着 "日本" 那个 tag 下沿，看着像被压住）。
+                    // ColumnLayout 没有 topPadding，用显式占位项补出这段空间。
+                    Item {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 12
+                    }
+
+                    // 输入框 + ✔ / ×
+                    //
+                    // 两个圆钮的职责（**语义已调整**，见下）：
+                    //   ✔ —— 只负责"添加"：输入框有内容就加入并落库，
+                    //        然后清空输入框继续等下一次输入；**空输入时点击
+                    //        不退出**（用户反馈：按勾应当只能输入）
+                    //   × —— 唯一的"退出编辑"入口
+                    // 两个圆钮用 PillActionButton，与「修改」按钮同一套样式
+                    // （圆形 / 投影 / 悬停变色）。
                     //
                     // 输入框：浮动标签样式（移植自 uiverse.io
                     // alexruix/slippery-snail-18，用户提供的原版 CSS）：
                     //   - 「标签」两字常驻框内当占位（原版 translateY(1rem)）；
-                    //   - 聚焦或已有输入（原版 input:valid）时浮到上边框
-                    //     （原版 translateY(-50%) scale(0.8)），并用自身
-                    //     背景色遮出"嵌在边框上"的断口（原版 #212121）；
+                    //   - 聚焦或已有输入（原版 input:valid）时浮到框上方
+                    //     （原版 translateY(-50%) scale(0.8)，本实现整字移出
+                    //     框外，原因见 tagLabel），并用自身背景色遮出断口；
                     //   - 边框灰 → 主题色（原版 #9e9e9e → #1a73e8），
                     //     过渡 150ms（原版 cubic-bezier(0.4,0,0.2,1)）。
                     Row {
@@ -410,9 +502,9 @@ Item {
                         Rectangle {
                             id: tagField
                             width: 180
-                            height: 36
-                            radius: 12                   // 原版 border-radius: 1rem
-                            color: "transparent"         // 原版 background: none
+                            height: 24                  // 与 tag chip / 圆钮同高
+                            radius: 12                  // 胶囊端（= 半高）
+                            color: "transparent"        // 原版 background: none
                             border.width: tagInput.activeFocus
                                           ? Theme.lineThick : Theme.lineThin
                             border.color: tagInput.activeFocus
@@ -433,19 +525,29 @@ Item {
                                 anchors.rightMargin: Theme.spacingMd
                                 verticalAlignment: TextInput.AlignVCenter
                                 color: Theme.textPrimary
-                                font.pixelSize: Theme.fontSm
+                                font.pixelSize: Theme.fontXs
                                 clip: true
                                 text: root.newTagText
                                 onTextEdited: root.newTagText = tagInput.text
-                                onAccepted: root.addUserTag()
-                                // Esc = 失焦恢复原状（比点空白更顺手）
-                                Keys.onEscapePressed: tagInput.focus = false
+                                // 回车 = 点 ✔（有内容则添加）
+                                onAccepted: root.commitTagInput()
+                                // Esc = 点 ×（放弃编辑退出）
+                                Keys.onEscapePressed: root.resetTagState()
                             }
 
                             Text {
                                 id: tagLabel
                                 x: tagField.floated ? 10 : Theme.spacingMd
-                                y: tagField.floated ? -7
+                                // 浮起位置：**完全抬到框外**（-height），而不是
+                                // 压在边框线上（原版的 -50%）。
+                                //
+                                // 原因：原版输入框 padding 1rem（约 44px 高），
+                                // 上移半个字高后下半截仍在框内、不挡输入内容。
+                                // 这里为了与 tag chip 同高只有 24px，同样上移
+                                // 6px 会让大半个字留在框里、和输入内容重叠
+                                // （实测："标签"压住了刚输入的 tag 文字）。
+                                // 整字移出框外后，浮起的标签变成框上方的小标注。
+                                y: tagField.floated ? -height
                                                     : (tagField.height - height) / 2
                                 text: "标签"
                                 color: tagField.floated
@@ -476,25 +578,22 @@ Item {
                             }
                         }
 
-                        AppButton {
-                            height: 36
-                            text: "添加"
-                            onClicked: root.addUserTag()
-                        }
-                    }
-
-                    // 确定 / 取消
-                    Row {
-                        spacing: Theme.spacingMd
-
-                        AppButton {
-                            text: "确定"
-                            variant: "primary"
-                            onClicked: root.confirmTags()
+                        // ✔ 仅添加（输入框为空时点击无效果，不会退出）
+                        PillActionButton {
+                            objectName: "tagConfirmBtn"
+                            text: "添加标签"
+                            glyph: "✔"
+                            onClicked: root.commitTagInput()
                         }
 
-                        AppButton {
-                            text: "取消"
+                        // × 唯一的"退出编辑"入口。
+                        // 注意：**不是"放弃修改"** —— 所有改动（加 tag、删 tag）
+                        // 都已经即时落库了，这里只是把面板收起来。
+                        PillActionButton {
+                            objectName: "tagCancelBtn"
+                            text: "完成编辑"
+                            glyph: "✕"
+                            danger: true
                             onClicked: root.resetTagState()
                         }
                     }

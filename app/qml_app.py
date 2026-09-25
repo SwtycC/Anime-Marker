@@ -196,6 +196,17 @@ class QmlApp:
             str(resource_path("icons")) + "/").toString()
         ctx.setContextProperty("iconsBaseUrl", icons_base)
         log.info("图标目录：%s", icons_base)
+
+        # 启动主题：**必须在 engine.load() 之前注入**。
+        #
+        # Theme 单例在创建时（Main.qml 实例化的那一瞬间，早于首帧渲染）就会
+        # 读这个属性并初始化，因此首帧就是配置里的主题色。
+        # 早期只在界面加载完之后才调 _apply_saved_theme()，结果是首帧先按
+        # Theme.qml 的默认色（蓝 #2F6FEB）画出来、下一帧才跳成配置色 ——
+        # 肉眼就是"打开软件的一瞬间搜索按钮是蓝的，然后才变主题色"（实测反馈）。
+        is_dark, accent = self._saved_theme()
+        ctx.setContextProperty("themeStartup", {"dark": is_dark, "accent": accent})
+
         self.theme_bridge = ThemeBridge(self.config)
         ctx.setContextProperty("themeBridge", self.theme_bridge)
 
@@ -288,24 +299,33 @@ class QmlApp:
         log.info("窗口尺寸已适配 %s 列：%sx%s", cols, target_w, target_h)
 
     # ---------- 主题 ----------
-    def _apply_saved_theme(self) -> None:
-        """把配置里的主题注入 QML 的 Theme 单例。
-
-        实现方式：调用 Main.qml 暴露的 `applyTheme(dark, accent)` 函数 ——
-        比在 Python 里反射访问 QML 单例更稳定，也便于以后扩展更多主题项。
-        """
-        if self.window is None:
-            return
+    def _saved_theme(self) -> tuple[bool, str]:
+        """读取配置里的主题（亮暗 + 主题色），非法值回退默认。"""
         mode = self.config.get(CFG_SECTION, CFG_THEME_MODE, DEFAULT_THEME_MODE)
         accent = self.config.get(CFG_SECTION, CFG_ACCENT, DEFAULT_ACCENT)
         if not _is_hex_color(accent):
             log.warning("配置中的主题色非法，回退默认：%r", accent)
             accent = DEFAULT_ACCENT
+        return mode == "dark", accent
 
-        is_dark = mode == "dark"
+    def _apply_saved_theme(self) -> None:
+        """把配置里的主题注入 QML 的 Theme 单例。
+
+        实现方式：调用 Main.qml 暴露的 `applyTheme(dark, accent)` 函数 ——
+        比在 Python 里反射访问 QML 单例更稳定，也便于以后扩展更多主题项。
+
+        注意：**首帧的主题色不靠这里**（那时已经渲染完了），而是在 load 之前
+        通过 `themeStartup` 上下文属性注入，由 Theme 单例在创建时读取
+        （见 `run()` 里的说明）。这里保留一次调用做复核：万一 QML 侧的启动
+        注入被改动或失效，界面仍会被纠正到配置的主题上。
+        """
+        if self.window is None:
+            return
+        is_dark, accent = self._saved_theme()
         try:
             self.window.applyTheme(is_dark, accent)  # type: ignore[attr-defined]
-            log.info("已应用主题：mode=%s accent=%s", mode, accent)
+            log.info("已应用主题：mode=%s accent=%s",
+                     "dark" if is_dark else "light", accent)
         except Exception as e:  # pragma: no cover - 防御性
             log.warning("应用主题失败（将使用默认值）：%s", e)
 

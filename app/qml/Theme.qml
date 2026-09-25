@@ -38,7 +38,31 @@ QtObject {
     // 主题色或模式变化时重算派生色
     onAccentSourceChanged: recalcAccent()
     onDarkChanged: recalcAccent()
-    Component.onCompleted: recalcAccent()
+
+    Component.onCompleted: {
+        applyStartupTheme()
+        recalcAccent()
+    }
+
+    /// 应用 Python 注入的**启动**主题（配置里保存的亮暗 + 主题色）。
+    ///
+    /// **为什么必须在这里做**：Theme 单例是本文件第一个属性被读取时创建的，
+    /// 也就是 Main.qml 实例化期间 —— 那时点开窗口还是本文件的默认值（蓝），
+    /// 等 Python 在界面加载完再调 applyTheme()，首帧早就画出去了。
+    /// 于是肉眼能看到的顺序是：默认蓝渲染一帧 → 跳成配置的主题色
+    /// （实测反馈"打开软件的一瞬间搜索按钮是蓝色，再切到主题色"）。
+    /// 在单例创建的那一刻（早于首帧）赋初值就没有这一跳。
+    ///
+    /// 防御性写法同 NavIcon 读 iconsBaseUrl：单独加载本文件做预览 / 静态检查时
+    /// 这个上下文属性并不存在，直接写 `themeStartup.dark` 会抛 ReferenceError。
+    function applyStartupTheme() {
+        if (typeof themeStartup === "undefined" || !themeStartup)
+            return
+        if (themeStartup.dark !== undefined)
+            dark = themeStartup.dark
+        if (themeStartup.accent)
+            accentSource = themeStartup.accent
+    }
 
     function recalcAccent() {
         var src = accentSource

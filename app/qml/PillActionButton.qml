@@ -28,9 +28,16 @@ Item {
     property string text: ""
     /// 强制交互态："" (跟随鼠标) / "hover" / "pressed"
     property string state: ""
-    /// 图标（SVG 文件地址；为空则不显示）
+    /// 图标（SVG 文件地址；为空则回落到 `glyph`）
     property string iconSource: ""
+    /// 文字符号（如 ✔ / ×）：`iconSource` 为空时显示它。
+    /// 用于"确定 / 取消"这类没有合适 SVG 的场景 —— 复用本组件的
+    /// 圆形底 + 投影 + 悬停变色，视觉与图标按钮完全一致。
+    property string glyph: ""
     property int iconSize: Math.round(root.bodyHeight * 0.5)
+    /// 是否处于"语义危险"状态（如删除 / 取消）：悬停时用 dangerColor
+    /// 而不是主题色，避免"随手点一下就退出编辑"被误当成主操作
+    property bool danger: false
     property real hoverLift: 2        // 悬停上移像素（24px 圆不宜大动作）
     // 交互态：默认跟随鼠标；`state` 非空时强制指定（诊断截图 / 特殊场景用）
     property bool pressedState: state === "pressed"
@@ -39,6 +46,15 @@ Item {
                            || (state === "" && mouseArea.containsMouse)
 
     signal clicked()
+
+    // ---- 悬停 / 按下的派生配色 ----
+    // 抽出来是因为底下有投影层、本体、图标三处都要用同一套色，
+    // 各写一遍三元表达式容易改漏（且 MultiEffect 的颜色无法用 Behavior 动画）。
+    readonly property color _hoverColor: root.danger ? Theme.dangerColor
+                                                     : Theme.accent
+    // 压在悬停底色上的文字 / 图标色（按底色亮度自动取黑或白）
+    readonly property color _hoverFg: Theme.isLight(root._hoverColor)
+                                      ? "#1A1A1A" : "#FFFFFF"
 
     // 投影留白：只在**底部**留，不在顶部留。
     //
@@ -77,7 +93,7 @@ Item {
             width: body.width
             height: body.height
             radius: height / 2
-            color: root.hovered ? Theme.accent : "#000000"
+            color: root.hovered ? root._hoverColor : "#000000"
             opacity: root.hovered
                      ? (Theme.dark ? 0.30 : 0.22) / (index + 1)
                      : (Theme.dark ? 0.28 : 0.10) / (index + 1)
@@ -98,9 +114,9 @@ Item {
         width: root._bodyWidth
         height: root.bodyHeight
         radius: height / 2                       // 圆形（正圆 = 半高）
-        color: root.hovered ? Theme.accent : Theme.surfaceBg
+        color: root.hovered ? root._hoverColor : Theme.surfaceBg
         border.width: Theme.lineThin
-        border.color: root.hovered ? Theme.accent : Theme.border
+        border.color: root.hovered ? root._hoverColor : Theme.border
 
         // transition: all .3s ease（原版 300ms）
         Behavior on y { NumberAnimation { duration: Theme.durSlow; easing.type: Easing.OutCubic } }
@@ -127,8 +143,22 @@ Item {
             visible: btnIcon.visible
             source: btnIcon
             colorization: 1.0
-            colorizationColor: root.hovered ? Theme.accentText
-                                            : Theme.textPrimary
+            // 注意：MultiEffect 的 colorizationColor 是普通属性、不走
+            // Behavior，所以这里是"跳变"而非渐变。视觉上几乎察觉不到
+            // （本体底色同时在渐变），不值得为它引入额外动画层。
+            colorizationColor: root.hovered ? root._hoverFg : Theme.textPrimary
+        }
+
+        // 文字符号（iconSource 为空时使用，如 ✔ / ×）
+        Text {
+            anchors.centerIn: parent
+            visible: root.iconSource === "" && root.glyph !== ""
+            text: root.glyph
+            color: root.hovered ? root._hoverFg : Theme.textPrimary
+            font.pixelSize: Math.round(root.bodyHeight * 0.55)
+            font.weight: Font.Medium
+
+            Behavior on color { ColorAnimation { duration: Theme.durSlow } }
         }
     }
 

@@ -9,6 +9,7 @@ SubscriptionPage 1.0 SubscriptionPage.qml
 SettingsPage 1.0 SettingsPage.qml
 AppButton 1.0 AppButton.qml
 AppTextField 1.0 AppTextField.qml
+SearchPill 1.0 SearchPill.qml
 SectionHeader 1.0 SectionHeader.qml
 AccentPicker 1.0 AccentPicker.qml
 PosterCard 1.0 PosterCard.qml
