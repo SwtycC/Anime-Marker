@@ -25,7 +25,7 @@ from PySide6.QtCore import QObject, Property, QThread, Signal, Slot
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QFileDialog
 
-from app.core.bangumi_api import COLLECT_TYPE_DOING
+from app.core.bangumi_api import COLLECT_TYPE_DOING, is_studio_name
 from app.core.database import Database, Episode, Subject
 from app.utils.cover_cache import cover_path_for, known_cover_files
 from app.utils.cover_cache import download as download_cover
@@ -58,15 +58,19 @@ def as_file_url(path: str) -> str:
 
 
 class _TagFetchWorker(QThread):
-    """后台拉取单个条目的前 10 个 tag（详情页进入时的自动补录）。
+    """后台拉取单个条目的前 10 个 tag + 动画制作公司（详情页进入时的自动补录）。
 
     为什么独立成 worker：进入详情页就要发一次网络请求（存量条目），
     不能阻塞 UI 线程。每个条目只需成功一次，之后全部走本地库，
     因此不值得做成常驻线程池 —— 用完即弃的 QThread 足够。
+
+    **公司也在这里补**：`get_subject` 的响应里 infobox 本来就有，白拿 ——
+    存量条目（scan 的新逻辑之前入库的）不用整库重扫，翻到详情页就补上了。
     """
 
-    #: (subject_id, ok, message) —— message 供状态栏展示
-    done = Signal(int, bool, str)
+    #: (subject_id, ok, message, studio_written) —— message 供状态栏展示；
+    #: studio_written 为真时调用方要刷新海报墙（subjects 变了）
+    done = Signal(int, bool, str, bool)
 
     def __init__(
         self,
@@ -74,6 +78,8 @@ class _TagFetchWorker(QThread):
         api: BangumiClient,
         subject_id: int,
         bangumi_id: int,
+        need_tags: bool = True,
+        need_studio: bool = True,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -81,6 +87,9 @@ class _TagFetchWorker(QThread):
         self._api = api
         self._subject_id = subject_id
         self._bangumi_id = bangumi_id
+        # 各取所需：只有缺的那部分才写库、才通知（都齐了时不会走到这里）
+        self._need_tags = need_tags
+        self._need_studio = need_studio
 
     def run(self) -> None:
         try:
@@ -88,26 +97,40 @@ class _TagFetchWorker(QThread):
         except Exception as e:
             log.warning("拉取条目标签失败 subject_id=%s: %s", self._subject_id, e)
             self.done.emit(self._subject_id, False,
-                           "获取标签失败，请检查网络后重试")
+                           "获取标签失败，请检查网络后重试", False)
             return
 
-        tags = Database.tags_from_subject(subj or {})
-        if not tags:
-            # 请求成功但确实没有 tag：也算"完成"，只是没有数据可写 ——
+        tags = Database.tags_from_subject(subj or {}) if self._need_tags else []
+        # 公司与 tag 同源同价：infobox 有就白拿，没有才多查一次 /persons
+        studio = (self._api.studio_for(subj or {}, self._bangumi_id)
+                  if self._need_studio else "")
+        if not tags and not studio:
+            # 请求成功但确实没有可取的数据：也算"完成"，只是没有数据可写 ——
             # 不写任何行，下次进入还会再试（与 F20 水位的"成功 0 行"不同，
-            # tag 拉取极廉价，不值得为此建水位表）
-            self.done.emit(self._subject_id, False, "该条目在 Bangumi 上没有标签")
+            # 这点数据极廉价，不值得为此建水位表）。提示要说清缺的是哪一样：
+            # 「动画制作」这一栏只有一部分条目有，说成"没有标签"会让人以为
+            # 标签也没了。
+            msg = ("该条目在 Bangumi 上没有标签" if self._need_tags
+                   else "该条目的 infobox 里没有「动画制作」")
+            self.done.emit(self._subject_id, False, msg, False)
             return
         try:
-            self._db.replace_subject_tags(self._subject_id, tags)
+            if tags:
+                self._db.replace_subject_tags(self._subject_id, tags)
+            if studio:
+                self._db.set_subject_studio(self._subject_id, studio)
         except Exception as e:
             log.exception("写入条目标签失败 subject_id=%s: %s", self._subject_id, e)
-            self.done.emit(self._subject_id, False, "写入标签失败：%s" % e)
+            self.done.emit(self._subject_id, False, "写入标签失败：%s" % e, False)
             return
 
-        log.info("已拉取条目标签：subject_id=%s（bgm=%s）%s 个",
-                 self._subject_id, self._bangumi_id, len(tags))
-        self.done.emit(self._subject_id, True, "已获取 %d 个标签" % len(tags))
+        log.info("已拉取条目标签：subject_id=%s（bgm=%s）tag %s 个 / 公司 %s",
+                 self._subject_id, self._bangumi_id, len(tags), studio or "无")
+        if tags:
+            msg = "已获取 %d 个标签" % len(tags)
+        else:
+            msg = "已获取制作公司：%s" % studio
+        self.done.emit(self._subject_id, True, msg, bool(studio))
 
 
 class LibraryBridge(QObject):
@@ -122,6 +145,8 @@ class LibraryBridge(QObject):
     coverChanged = Signal(int)
     #: 条目标签变更（参数：subject_id），详情页据此重取 tag 列表
     tagsChanged = Signal(int)
+    #: 全库 tag 映射变更（无参数），海报墙的 tag 筛选据此重算分类目录
+    tagsBySubjectChanged = Signal()
     #: 标签拉取的进度/结果提示（状态栏展示）
     statusMessage = Signal(str)
 
@@ -139,6 +164,9 @@ class LibraryBridge(QObject):
         # 若每次都跑 SQL + 组装 dict 会很浪费。改为「变更时失效」。
         self._subjects_cache: list[dict] = []
         self._dirty = True
+        # 全库 tag 映射（海报墙筛选用）：{subject_id(str): [tag 名, ...]}
+        self._tags_map: dict[str, list[str]] = {}
+        self._tags_dirty = True
         self._inprogress_cache: list[dict] = []
         self._inprogress_dirty = True
         self._eps_cache: list[dict] = []
@@ -171,9 +199,13 @@ class LibraryBridge(QObject):
         self._dirty = True
         self._inprogress_dirty = True
         self._eps_dirty = True
+        self._tags_dirty = True
         self.subjectsChanged.emit()
         self.inProgressChanged.emit()
         self.watchedEpsChanged.emit()
+        # 扫描 / 手动匹配都会写 tag（scanner.py、match.py），海报墙的筛选
+        # 目录要跟着变 —— 否则"新增了动漫却筛不出来"。
+        self.tagsBySubjectChanged.emit()
 
     @Slot()
     def reloadInProgress(self) -> None:
@@ -492,6 +524,45 @@ class LibraryBridge(QObject):
             return self._build_groups(rows)
         return [self._subject_to_dict(s) for s in rows]
 
+    @Property("QVariantMap", notify=tagsBySubjectChanged)
+    def tagsBySubject(self) -> dict:
+        """条目 id → tag 名列表（海报墙 tag 筛选的数据源）。
+
+        键是**字符串**形式的 subject_id：QVariantMap 的键只能是字符串，
+        这里显式转好过让 QML 侧猜（QML 里按 `String(item.id)` 取）。
+
+        **为什么不做进 `subjects` 的条目字典里**：tag 是**独立变化**的数据 ——
+        ① 每次进详情页都会异步补拉该条目的 tag（见 requestTagFetch），
+        ② 手动匹配、重新扫描也会重写 tag。
+        若塞进 `subjects`，上面每件事都得发 subjectsChanged，而 Repeater 的
+        model 一变就会**销毁重建全部卡片**（每张都要重新解码封面，见
+        PosterWallPage.qml 里"每敲一个字卡一次"的踩坑）。单独一个 Property
+        让筛选目录刷新时海报卡片毫发无损，也让新增 tag 能实时出现在面板里。
+        """
+        if self._tags_dirty:
+            self._tags_map = self._load_tags_map()
+            self._tags_dirty = False
+        return self._tags_map
+
+    def _load_tags_map(self) -> dict:
+        """全库 tag（**已剔除制作公司 tag**，见下）。
+
+        公司 tag（京阿尼 / MAPPA / A-1Pictures…）在这里就摘掉，不让它们进
+        海报墙的标签筛选 —— 公司由 subjects 的 `studio` 字段在"制作公司"栏
+        单独成栏，再以 tag 形式散落在"其他"栏里就是同一个东西出现两次。
+        判定用 `bangumi_api.is_studio_name`（带词表，见那里的说明）。
+
+        注意：**列表页的 tag 展示不受影响**（详情页走 `subjectTags()`），
+        这里只是筛选目录的取数口径。
+        """
+        try:
+            raw = self._db.all_subject_tags()
+        except Exception as e:
+            log.exception("读取条目 tag 映射失败: %s", e)
+            return {}
+        return {str(sid): [n for n in names if not is_studio_name(n)]
+                for sid, names in raw.items()}
+
     # ---------- 单条 ----------
     @Slot(int, result="QVariantMap")
     def subject(self, subject_id: int) -> dict:
@@ -720,7 +791,8 @@ class LibraryBridge(QObject):
                      label, subject_id, s.cover_url)
             try:
                 original = download_cover(
-                    s.bangumi_id or s.id, s.cover_url, timeout=10.0)
+                    s.bangumi_id or s.id, s.cover_url, timeout=10.0,
+                    label=label)
             except Exception as e:
                 log.warning("原版海报重新下载失败：《%s》（subject_id=%s）: %s",
                             label, subject_id, e)
@@ -841,8 +913,9 @@ class LibraryBridge(QObject):
         同步网络请求会把 UI 卡住 0.3~1s，不可接受。
         完成后经 tagsChanged 通知详情页重取，消息走 statusMessage。
 
-        幂等：已有 tag（含"全被用户删掉"的标记状态）时直接跳过，
-        不会重复请求 —— 这也保证用户删过的 tag 不会被重新拉回来。
+        幂等：tag 与制作公司**都齐了**才跳过，缺哪样取哪样 ——
+        已有 tag（含"全被用户删掉"的标记状态）时不会重复写 tag，
+        这也保证用户删过的 tag 不会被重新拉回来。
 
         快速翻页时的并发治理：同一时刻只跑一个 worker，期间的请求
         只记下**最后一个** subject_id，当前完成后接续（防请求风暴）。
@@ -858,27 +931,46 @@ class LibraryBridge(QObject):
             return
         if s is None or not s.bangumi_id:
             return                      # 未匹配 Bangumi：无可拉取（QML 侧不会触发）
-        if self._db.has_subject_tags(subject_id):
-            return                      # 已有（幂等）
+        need_tags = not self._db.has_subject_tags(subject_id)
+        # 公司来自 infobox 的「动画制作」，只有一部分条目有 —— 取不到时
+        # 这个条件恒为真，每次进详情页都会多试一次（极廉价，与 tag 同理）
+        need_studio = not (s.studio or "").strip()
+        if not need_tags and not need_studio:
+            return                      # 都齐了（幂等）
         if self._api is None:
             self.statusMessage.emit("Bangumi 客户端未就绪，无法获取标签")
             return
 
         self.statusMessage.emit("正在获取标签…")
-        self._start_tag_worker(int(subject_id), int(s.bangumi_id))
+        self._start_tag_worker(int(subject_id), int(s.bangumi_id),
+                               need_tags, need_studio)
 
-    def _start_tag_worker(self, subject_id: int, bangumi_id: int) -> None:
+    def _start_tag_worker(self, subject_id: int, bangumi_id: int,
+                          need_tags: bool = True,
+                          need_studio: bool = True) -> None:
         self._tag_worker = _TagFetchWorker(self._db, self._api,
-                                           subject_id, bangumi_id)
+                                           subject_id, bangumi_id,
+                                           need_tags, need_studio)
         self._tag_worker.done.connect(self._on_tag_fetch_done)
         self._tag_worker.finished.connect(self._tag_worker.deleteLater)
         self._tag_worker.start()
 
-    def _on_tag_fetch_done(self, subject_id: int, ok: bool, message: str) -> None:
+    def _on_tag_fetch_done(self, subject_id: int, ok: bool, message: str,
+                           studio_written: bool = False) -> None:
         # done 在 finished 之前发出，这里先摘掉引用再让 deleteLater 生效
         self._tag_worker = None
         if ok:
             self.tagsChanged.emit(subject_id)
+            # 新拉到的 tag 同样要进海报墙的筛选目录（见 tagsBySubject），
+            # 否则"刚进过详情页的条目"仍筛不出来
+            self._tags_dirty = True
+            self.tagsBySubjectChanged.emit()
+        if studio_written:
+            # 公司写在 subjects 里（不是那份 tag 映射），得让海报墙重取 ——
+            # 这会重建全部卡片，但每次进详情页最多发生一次，且发生时代
+            # 海报墙不可见；补完之后再进就不会了（幂等）
+            self._dirty = True
+            self.subjectsChanged.emit()
         self.statusMessage.emit(message)
         pending = self._tag_fetch_pending
         self._tag_fetch_pending = None
@@ -960,6 +1052,20 @@ class LibraryBridge(QObject):
             "nameCn": s.name_cn or "",
             "title": s.name_cn or s.name or "",
             "seriesName": s.series_name or "",
+            # Bangumi infobox 的别名（**空格拼接**，见下）。
+            #
+            # 存储里是换行分隔（database.aliases_to_text），这里换成空格再给
+            # QML：搜索是 `haystack.indexOf(q) >= 0` 的**子串**匹配，
+            # QML 侧再 split 一遍纯属多余；而换行符在 QML 的 JS 字符串里
+            # 只是普通字符，保留它反而会让"跨别名的连续子串"意外命中
+            # （如搜 "花\n那朵" 也成立），用空格归一更符合"分词"的直觉。
+            "aliases": " ".join(
+                Database.aliases_from_text(s.aliases)),
+            # 动画制作公司（infobox 的「动画制作」，扫描 / 手动匹配时顺路写入）。
+            # 合作署名形如 "WIT STUDIO / CloverWorks"，海报墙按 ` / ` 拆开
+            # 分别匹配（QML 侧 itemStudios）。没有的条目为空串 —— 在
+            # "制作公司"筛选栏里不出现，不拿别处的数据凑。
+            "studio": s.studio or "",
             "matchState": s.match_state or "auto",
             "totalEps": int(s.total_eps or 0),
             "folderPath": s.folder_path or "",
@@ -1003,12 +1109,49 @@ class LibraryBridge(QObject):
                 watched += sum(1 for e in eps if e.watched)
             cover_subj = next((s for s in items if s.cover_path), None)
             d = self._subject_to_dict(items[0])
+            # 可搜索文本要**合并整个系列**，而且必须同时收**正式名与别名**。
+            #
+            # 两件事各有一个坑：
+            #
+            # ① 只用 items[0] 不够 —— 别名可能登记在别的季上，用户搜那个
+            #    别名就搜不到这张卡 ✗。
+            # ② 只收别名也不够（**实测踩到**）：下面的 update 会把
+            #    title/name/nameCn 三个字段**统一替换成 series_name**，
+            #    于是各成员原本的正式名被彻底覆盖掉。实例：
+            #       组成员 1（TV）   name_cn="链锯人"     别名=[Chainsaw Man, 电锯人]
+            #       组成员 2（剧场版）name_cn="电锯人 剧场版 蕾塞篇"
+            #       series_name="电锯人"
+            #    替换后卡片只剩「电锯人」，而「链锯人」**既不是系列名
+            #    也不在任何别名里** → 搜「链锯人」直接搜不到 ✗。
+            #    所以每个成员的 name_cn / name 也要一并并入。
+            #
+            # 排除 series 本身：它已经是 title/name/nameCn 了，重复无意义。
+            merged: list[str] = []
+            seen_alias: set[str] = set()
+            for s in items:
+                for a in (*Database.aliases_from_text(s.aliases),
+                          s.name_cn or "", s.name or ""):
+                    a = a.strip()
+                    if a and a not in seen_alias and a != series:
+                        seen_alias.add(a)
+                        merged.append(a)
+            # 制作公司同样**合并整个系列**：各季可能换过公司（如续篇转手），
+            # 任一季的公司都该能筛到这张卡。QML 侧按 childIds 取不到 studio
+            # （分组模式下子条目不在列表里），所以在这里先拼好。
+            studios: list[str] = []
+            for s in items:
+                for name in (s.studio or "").split("/"):
+                    name = name.strip()
+                    if name and name not in studios:
+                        studios.append(name)
             d.update({
                 "title": series,
                 "name": series,
                 "nameCn": series,
+                "aliases": " ".join(merged),
                 "coverUrl": self._cover_file_url(cover_subj.cover_path, cover_subj.id)
                             if cover_subj else "",
+                "studio": " / ".join(studios),
                 "isGroup": True,
                 "childCount": len(items),
                 "childIds": [s.id for s in items],

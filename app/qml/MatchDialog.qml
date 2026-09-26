@@ -147,7 +147,9 @@ Window {
                     readonly property bool isLow: modelData.lowScore === true
 
                     width: resultList.width
-                    height: 64
+                    // 82 = 原先 64 + 别名行（18）。加高是为了让别名有一整行
+                    // 的位置，不必挤在元信息那行里被 elide 掉。
+                    height: 82
                     color: isSelected ? Theme.accentSoft
                          : rowMouse.containsMouse ? Theme.hoverFillStrong
                          : Theme.fade(Theme.hoverFillStrong)
@@ -206,6 +208,18 @@ Window {
                                       + " · 匹配分 "
                                       + (isRejected ? "不相关" : modelData.score)
                                       + "（" + modelData.reason + "）"
+                                color: Theme.textTertiary
+                                font.pixelSize: Theme.fontXs
+                                elide: Text.ElideRight
+                                maximumLineCount: 1
+                            }
+
+                            // 别名：用俗称搜到的候选，靠这行才能确认"就是这部"
+                            // （如「未闻花名」↔「我们仍未知道那天所看见的花的名字。」）
+                            Text {
+                                Layout.fillWidth: true
+                                visible: !!modelData.aliases
+                                text: "别名：" + (modelData.aliases || "")
                                 color: Theme.textTertiary
                                 font.pixelSize: Theme.fontXs
                                 elide: Text.ElideRight

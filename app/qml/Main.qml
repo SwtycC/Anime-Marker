@@ -363,6 +363,10 @@ ApplicationWindow {
                 // 不调 library.reload()，避免重建全部卡片
                 browseStack.currentIndex = 0
                 window.currentPage = detailOriginPage   // 同 onBackRequested
+            } else if (wallPage.filterOpen) {
+                // 筛选面板开着 → 先收面板。**不能顺手把搜索词也清了**：
+                // 用户只是开了下面板，关键词还得留着。
+                wallPage.closeFilterPanel()
             } else {
                 wallPage.clearSearch()
             }

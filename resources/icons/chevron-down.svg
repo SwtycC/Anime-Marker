@@ -1,0 +1,4 @@
+<!-- fill 必须为白色：MultiEffect 的 colorization 按「源亮度」相乘，黑色永远染不出颜色（见本目录 README） -->
+<!-- 本图标是**描边式**（stroke）而非填充式：一个 V 形折线，靠 stroke-linecap/linejoin=round 得到圆头端点。
+     染色的前提不变 —— 笔画必须是白色。 -->
+<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M4.4 6.2 8 9.8 11.6 6.2" fill="none" stroke="#FFFFFF" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>

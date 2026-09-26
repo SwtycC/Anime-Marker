@@ -20,7 +20,7 @@ from app.utils.paths import database_path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS subjects (
     total_eps    INTEGER,
     folder_path  TEXT,
     series_name  TEXT,                       -- 所属系列（用于聚合展示）
+    aliases      TEXT,                       -- infobox 别名，用换行分隔（见下方注释）
+    studio       TEXT,                       -- 动画制作公司（规范名，见 bangumi_api.STUDIO_ALIASES）
     match_state  TEXT DEFAULT 'auto',        -- auto / manual / pending
     updated_at   TEXT
 );
@@ -198,6 +200,8 @@ class Subject:
     total_eps: int
     folder_path: str
     series_name: str
+    aliases: str
+    studio: str
     match_state: str
     updated_at: str
 
@@ -353,6 +357,25 @@ class Database:
                 "ALTER TABLE inprogress_cache"
                 " ADD COLUMN collection_updated_at TEXT"
             )
+        # v5：subjects 新增 aliases（Bangumi infobox 的别名，换行分隔）。
+        #
+        # 旧库该列为 NULL —— 不影响使用：别名只在**匹配阶段**用（在内存里
+        # 参与打分，见 matcher.score_subject），本地这列只服务于"按别名搜
+        # 已入库条目"。已入库的旧条目不重扫就没有别名，这是可接受的降级。
+        cols = {
+            r["name"] for r in self._conn.execute("PRAGMA table_info(subjects)")
+        }
+        if "aliases" not in cols:
+            log.info("迁移：subjects 增加 aliases 列")
+            self._conn.execute("ALTER TABLE subjects ADD COLUMN aliases TEXT")
+        # v6：subjects 新增 studio（动画制作公司，规范名）。
+        #
+        # 旧库该列为 NULL —— 与 aliases 同样是"不重扫就没有"的降级：
+        # 公司名来自扫描时的搜索响应（infobox / tag，零额外请求），
+        # 也可以之后进一次详情页补上（见 LibraryBridge.requestTagFetch）。
+        if "studio" not in cols:
+            log.info("迁移：subjects 增加 studio 列")
+            self._conn.execute("ALTER TABLE subjects ADD COLUMN studio TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -405,6 +428,52 @@ class Database:
             cur.execute(
                 "UPDATE subjects SET cover_path=?, updated_at=? WHERE id=?",
                 (cover_path, _now(), subject_id),
+            )
+
+    # ---------- 条目别名 ----------
+    #
+    # 存储形态：**换行分隔的纯文本**，而不是 JSON。
+    #
+    # 理由：别名里可能含 `,` `"` `[` 等字符（实测有
+    # "Anohana: The Flower We Saw That Day" 这类带冒号的，也有含逗号的
+    # 罗马音副标题）。JSON 需要转义、读取方还要 try/except 兜住脏数据；
+    # 而别名**本身不可能含换行符**（Bangumi 的 infobox 值是单行文本），
+    # 所以 `\n` 是天然安全的定界符 —— 存储和解析都是零风险的一行代码。
+    @staticmethod
+    def aliases_to_text(aliases: list[str]) -> str:
+        """别名列表 → 存储文本（换行分隔，去掉空项与重复）。"""
+        out: list[str] = []
+        seen: set[str] = set()
+        for a in aliases or []:
+            name = str(a).strip().replace("\n", " ").replace("\r", " ")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+        return "\n".join(out)
+
+    @staticmethod
+    def aliases_from_text(text: str) -> list[str]:
+        """存储文本 → 别名列表。空/None 安全。"""
+        if not text:
+            return []
+        return [t.strip() for t in str(text).split("\n") if t.strip()]
+
+    @staticmethod
+    def aliases_from_subject(subj: dict) -> str:
+        """从 Bangumi subject 响应提取别名并转成存储文本。"""
+        from app.core.bangumi_api import extract_aliases
+        return Database.aliases_to_text(extract_aliases(subj))
+
+    # ---------- 制作公司 ----------
+    def set_subject_studio(self, subject_id: int, studio: str) -> None:
+        """写入动画制作公司（详情页补拉时用；空串不覆盖已有值）。"""
+        if not (studio or "").strip():
+            return
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE subjects SET studio=?, updated_at=? WHERE id=?",
+                (studio.strip(), _now(), subject_id),
             )
 
     # ---------- 条目标签 ----------
@@ -468,6 +537,27 @@ class Database:
             }
             for r in rows
         ]
+
+    def all_subject_tags(self) -> dict[int, list[str]]:
+        """全库条目的 tag：`{subject_id: [名字, ...]}`，一次查完。
+
+        给海报墙的 tag 筛选做数据源。**必须一次查全量**再按条目分组 ——
+        海报墙有几条就要几份列表，逐条调 `list_subject_tags` 会变成 N 次
+        查询（本机 87 条时已能感到卡顿，库大了更明显）。
+
+        顺序与 `list_subject_tags` 一致（接口 tag 按原顺序在前、用户 tag 在后），
+        只取未删除的 —— 用户在详情页删掉的 tag 不应再出现在筛选里。
+        """
+        with self._cursor() as cur:
+            rows = cur.execute(
+                "SELECT subject_id, name FROM subject_tags"
+                " WHERE deleted=0"
+                " ORDER BY (source='user'), pos, name",
+            ).fetchall()
+        out: dict[int, list[str]] = {}
+        for r in rows:
+            out.setdefault(int(r["subject_id"]), []).append(r["name"])
+        return out
 
     def has_subject_tags(self, subject_id: int) -> bool:
         with self._cursor() as cur:
@@ -683,18 +773,28 @@ class Database:
         cover_url: str = "",
         cover_path: str = "",
         total_eps: int = 0,
+        aliases: str = "",
+        studio: str = "",
     ) -> None:
-        """用户手动指定 Bangumi 条目（match_state='manual'，重扫不覆盖）。"""
+        """用户手动指定 Bangumi 条目（match_state='manual'，重扫不覆盖）。
+
+        `aliases` / `studio` 传 `Database.aliases_from_subject(subj)` /
+        `BangumiClient.studio_for(subj, bangumi_id)` 的结果；
+        不传（旧调用方）时**保留原值不覆盖** —— 手动匹配的候选同样来自
+        搜索接口，通常能拿到别名与公司。
+        """
         with self._cursor() as cur:
             cur.execute(
                 """
                 UPDATE subjects SET
                     bangumi_id=?, name=?, name_cn=?, cover_url=?, cover_path=?,
-                    total_eps=?, match_state='manual', updated_at=?
+                    total_eps=?, aliases=COALESCE(NULLIF(?, ''), aliases),
+                    studio=COALESCE(NULLIF(?, ''), studio),
+                    match_state='manual', updated_at=?
                 WHERE id=?
                 """,
                 (bangumi_id, name, name_cn, cover_url, cover_path,
-                 total_eps, _now(), subject_id),
+                 total_eps, aliases or "", studio or "", _now(), subject_id),
             )
 
     def delete_subject(self, subject_id: int) -> None:

@@ -105,9 +105,23 @@ def _trim_latin_runs(text: str) -> str:
         head_match = re.match(r"^([A-Za-z]{1,4})\b", text.strip())
         head_word = head_match.group(1) if head_match else ""
 
+        # **紧贴数字的短拉丁词也要保留**（实测踩坑）：
+        # 「从Lv2开始无敌的原勇者候补」的开头是汉字「从」，于是 `Lv`
+        # 既不是 head_word、又被当成罗马音碎片删掉 → 关键词变成
+        # 「从 2开始无敌的原勇者候补」。而 Bangumi 的正式名是
+        # 「从**Lv2**开始…」，少这两个字母就**完全对不上**，只能靠词级
+        # 重合拿 20 分，总分 50 < 60 阈值 → 白白转人工。
+        # 这类「字母+数字」是作品名的正式组成部分（Lv2 / S2 / No.1 /
+        # 第2章 等），与 to / no / datta 这类纯字母碎片有本质区别，
+        # 判据就是**后面是否紧跟数字**。
+        glued_words = {
+            m.group(1)
+            for m in re.finditer(r"(?<![A-Za-z])([A-Za-z]{1,4})(?=\d)", text)
+        }
+
         def _keep_short(m: re.Match) -> str:
             word = m.group(0)
-            if head_word and word == head_word:
+            if (head_word and word == head_word) or word in glued_words:
                 return word
             return " "
 
@@ -120,9 +134,14 @@ def _trim_latin_runs(text: str) -> str:
             extras.append(f"{m.group(1).capitalize()} {m.group(2)}")
         for m in re.finditer(r"(?i)\b(\d+)(?:st|nd|rd|th)\s+Season\b", text):
             extras.append(f"Season {m.group(1)}")
-        # 「S1」「S02」这类短季数标记
+        # 「S1」「S02」这类短季数标记。
+        #
+        # **注意不要把已保留的词再加一遍**：`S3` 的 `S` 紧贴数字，会被
+        # 上面的 `glued_words` 保留在主串里；这里若再无脑 append，
+        # 结果就是「鬼灭之刃 S3 S3」（实测踩到）。故先检查主串是否已含它。
         for m in re.finditer(r"(?i)(?<![A-Za-z])S(\d{1,2})(?![A-Za-z])", text):
-            extras.append(m.group(0))
+            if m.group(0) not in kept:
+                extras.append(m.group(0))
         # 去重保序
         seen_x: set[str] = set()
         extras = [x for x in extras if not (x.lower() in seen_x or seen_x.add(x.lower()))]
@@ -640,7 +659,8 @@ class ScanWorker(QThread):
         cover_path = ""
         if cover_url:
             try:
-                cover_path = str(download_cover(bangumi_id, cover_url, self.api.session))
+                cover_path = str(download_cover(
+                    bangumi_id, cover_url, self.api.session, label=name_cn))
             except Exception as e:
                 log.warning("封面下载失败 %s: %s", name_cn, e)
 
@@ -653,6 +673,15 @@ class ScanWorker(QThread):
             total_eps=total_eps,
             folder_path=str(cand.folder_path),
             series_name=cand.series_name,
+            # 顺路存 infobox 别名（就在本次搜索响应里，零额外请求）。
+            # 用途：本地按别名搜已入库条目（匹配阶段用的是内存里的那份，
+            # 见 matcher.score_subject，与此列无关）。
+            aliases=self.db.aliases_from_subject(subj),
+            # 顺路存**动画制作公司**：优先用搜索响应里的 infobox（零额外请求），
+            # 它没有这一行时才补一个 /persons 请求（实测约三分之二的条目要
+            # 这一下 —— 见 BangumiClient.studio_for）。海报墙的"制作公司"
+            # 筛选栏靠它，写一次就永久在库里，之后不再请求。
+            studio=self.api.studio_for(subj, bangumi_id),
             match_state="auto",
         )
         # 顺路存接口前 10 个 tag（就在本次搜索响应里，零额外请求）。

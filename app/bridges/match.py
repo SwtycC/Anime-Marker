@@ -20,7 +20,7 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
-from app.core.bangumi_api import BangumiClient, BangumiError
+from app.core.bangumi_api import BangumiClient, BangumiError, extract_aliases
 from app.core.database import Database
 from app.core.matcher import SCORE_IRRELEVANT, SubjectMatcher
 from app.utils import bgm_log
@@ -91,6 +91,11 @@ class _SearchWorker(QThread):
             "name": name,
             "nameCn": name_cn,
             "title": name_cn or name,
+            # 别名：用户往往用俗称搜，展示出来才能确认"就是这部"。
+            # 与海报墙搜索同源（见 library._subject_to_dict 的说明）。
+            # 只取前 4 个：候选行只留得下一行文字，Bangumi 的别名动辄十来个，
+            # 全列会被 elide 截断，反而看不出重点。
+            "aliases": " / ".join(extract_aliases(subj)[:4]),
             "year": date[:4] if date else "",
             "totalEps": int(subj.get("total_episodes")
                             or subj.get("eps_count") or 0),
@@ -203,8 +208,9 @@ class MatchBridge(QObject):
         if cover_url:
             try:
                 from app.utils.cover_cache import download as download_cover
-                cover_path = str(
-                    download_cover(bangumi_id, cover_url, self._api.session))
+                cover_path = str(download_cover(
+                    bangumi_id, cover_url, self._api.session,
+                    label=name_cn or name))
             except Exception as e:
                 log.warning("封面下载失败: %s", e)
 
@@ -217,6 +223,12 @@ class MatchBridge(QObject):
                 cover_url=cover_url,
                 cover_path=cover_path,
                 total_eps=total_eps,
+                # 别名的用途见 scanner._process 同名参数处；
+                # 手动匹配走的是 get_subject（单条目详情），响应同样带 infobox
+                aliases=self._db.aliases_from_subject(subj),
+                # 动画制作公司（海报墙"制作公司"筛选栏的数据源）：
+                # 先 infobox，缺失时补一个 /persons 请求，同 scanner._process
+                studio=self._api.studio_for(subj, bangumi_id),
             )
         except Exception as e:
             log.exception("写入手动匹配失败 subject_id=%s", self._subject_id)

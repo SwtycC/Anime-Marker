@@ -94,6 +94,319 @@ def is_server_side_error(exc: Exception) -> bool:
     return bool(re.search(r"\b5\d\d\b", text)) and "server error" in text.lower()
 
 
+# infobox 里"别名"行的 key。Bangumi 的简体/繁体 wiki 用词不同，都收进来；
+# 小写 "alias" 是少数条目（尤其英文译名条目）的写法。
+_ALIAS_KEYS = frozenset({"别名", "別名", "alias"})
+
+# 过滤掉过短的别名：2 个字符以下的中文/英文简称（如 "AB"、"花"）
+# 极易误命中其他作品，收益远小于风险。**注意按"字符数"而非"词数"算**，
+# 因为中文别名一个字就是一个字符。
+MIN_ALIAS_LEN = 3
+
+
+def extract_aliases(subject: dict) -> list[str]:
+    """从 Bangumi subject 响应的 `infobox` 里取出所有别名。
+
+    **为什么需要它（实测）**：`score_subject()` 对"名称完全不相关"的候选
+    直接一票否决，而它原先只看 `name_cn` / `name` 两个字段。像
+    「未闻花名」这种**本地文件夹用俗称、Bangumi 用全名**的场景：
+
+        name_cn = "我们仍未知道那天所看见的花的名字。"
+        name    = "あの日見た花の名前を僕達はまだ知らない。"
+        别名    = ["未闻花名", "那朵花", "あの花", "ANOHANA", ...]
+
+    三个正式名与"未闻花名"毫无字符重合 → 必然被判"名称不相关" → 转人工。
+    而别名信息**本来就在搜索结果里**（`POST /v0/search/subjects` 的每条
+    data 都带 `infobox`），零额外请求，只是从没被读过。
+
+    infobox 结构（实测）：
+        [
+          {"key": "中文名", "value": "我们仍未知道那天所看见的花的名字。"},
+          {"key": "别名",   "value": [{"v": "Anohana: The Flower..."},
+                                       {"v": "那朵花"}, ...]},
+          {"key": "话数",   "value": "11"},
+          ...
+        ]
+    注意 `value` 的类型**不固定**：别名行是 `[{v: str}, ...]`，
+    而「中文名」「话数」等是**纯字符串**。所以取值必须双分支处理，
+    不能假定 `v.get()` 一定存在。
+
+    返回：去重后的别名列表（保持原顺序）；没有别名时返回空列表。
+    """
+    rows = subject.get("infobox")
+    if not isinstance(rows, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("key", "")).strip().lower() not in _ALIAS_KEYS:
+            continue
+        value = row.get("value")
+        # 形态一：别名行 —— [{"v": "..."}, ...]
+        if isinstance(value, list):
+            items = [
+                str(v.get("v", "")).strip()
+                for v in value if isinstance(v, dict)
+            ]
+        # 形态二：纯字符串（少数条目如此）
+        elif isinstance(value, str):
+            items = [value.strip()]
+        else:
+            items = []
+        for name in items:
+            if len(name) < MIN_ALIAS_LEN or name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+# infobox 里"动画制作"那一行的 key（Bangumi 的简繁/日文写法都收进来）。
+#
+# **故意不收「製作」/「制作」**：那一行是**制作委员会**，不是动画公司 ——
+# 实测「白聖女と黒牧師」的 `製作` 是
+# `「白聖女と黒牧師」製作委員会（講談社、Aniplex、Crunchyroll、動画工房）`，
+# 拿来当公司名会得到一长串无意义文本（公司名只偶然出现在括号里）。
+_STUDIO_KEYS = frozenset({
+    "动画制作", "动画制作公司", "动画制作会社",
+    "アニメーション制作", "アニメ制作", "アニメーション制作会社",
+})
+
+#: 动画制作公司词表：**官方名 → 其他写法**（日文名 / 英文名 / 中文俗称）。
+#:
+#: 两个用途：
+#:   ① **认公司**：infobox 的「动画制作」写的是哪种写法都能归到同一个官方名
+#:      （`京都アニメーション` / `京都动画` / `Kyoto Animation` → 同一家），
+#:      否则同一家公司会在筛选面板里裂成好几个选项（各带一两部番）；
+#:   ② **摘 tag**：认出"哪些 tag 是公司名"（见 is_studio_name），好在海报墙的
+#:      标签筛选里把它们摘出去 —— 公司已在"制作公司"栏单列，再以 tag 的形式
+#:      散落在"其他"栏里就是重复。
+#:
+#: 为什么必须是一份词表，而不是"看名字像不算像公司"：启发式只认得出
+#: `StudioXXX` / `XXXPictures` 这类，而 MAPPA、ufotable、SHAFT、京阿尼、
+#: MADHOUSE、J.C.STAFF 全都长得不像公司名。
+#:
+#: 表外的新公司 tag 不会被摘出去，会照常落在"其他"栏 —— 想收编就在这里加一行。
+STUDIO_ALIASES: dict[str, tuple[str, ...]] = {
+    "京都アニメーション": ("京都动画", "京都アニメ", "Kyoto Animation", "KyotoAnimation"),
+    "動画工房": ("动画工房", "Doga Kobo", "DogaKobo"),
+    "A-1 Pictures": ("A-1Pictures", "A1 Pictures", "A1Pictures"),
+    "MAPPA": ("マッパ",),
+    "ufotable": ("ユーフォーテーブル",),
+    "WHITE FOX": ("WHITEFOX", "White Fox"),
+    "Studio Bind": ("StudioBind", "スタジオバインド"),
+    "MADHOUSE": ("MADHouse", "MAD HOUSE", "マッドハウス"),
+    "J.C.STAFF": ("JCSTAFF", "JC Staff", "ジェー・シー・スタッフ"),
+    "CloverWorks": ("クローバーワークス",),
+    "WIT STUDIO": ("WITSTUDIO", "ウィットスタジオ"),
+    "P.A.WORKS": ("PAWORKS", "PA Works", "ピーエーワークス"),
+    "SHAFT": ("シャフト",),
+    "SILVER LINK.": ("SILVERLINK.", "SILVER LINK", "シルバーリンク"),
+    "8bit": ("エイトビット", "Eight Bit"),
+    "Studio DEEN": ("studiodeen", "スタジオディーン"),
+    "Studio五組": ("Studio五组", "スタジオ五組"),
+    "Studio Gaina": ("StudioGaina", "ガイナ", "GAINA"),
+    "Studio EEK": ("StudioEEK",),
+    "C2C": (),
+    "Nexus": ("ネクサス",),
+    "Feel.": ("フィール",),
+    "ZERO-G": ("ゼロジー",),
+    "Passione": ("パッショーネ",),
+    "Lerche": ("ラルケ",),
+    "Bibury Animation Studios": ("BiburyAnimationStudios", "Bibury Animation",
+                                 "ビブリーアニメーションスタジオ", "バイブリーアニメーションスタジオ"),
+    "キネマシトラス": ("KINEMACITRUS", "KINEMA CITRUS"),
+    "CygamesPictures": ("Cygames Pictures", "サイゲームスピクチャーズ"),
+    "Production I.G": ("Production.I.G", "ProductionIG", "プロダクションI.G"),
+    "SUNRISE": ("サンライズ",),
+    "domerica": ("ドメリカ",),
+    "TNK": ("ティー・エヌ・ケー",),
+    "ドライブ": ("Drive",),
+    "ハヤブサフィルム": ("Hayabusa Film",),
+    "BONES": ("ボンズ",),
+    "TRIGGER": ("トリガー",),
+    "東映アニメーション": ("Toei Animation", "ToeiAnimation"),
+    "スタジオジブリ": ("Studio Ghibli", "StudioGhibli", "ジブリ"),
+    "CoMix Wave Films": ("CoMixWave", "CoMix Wave", "コミックス・ウェーブ"),
+    "OLM": ("オー・エル・エム",),
+    "ぴえろ": ("スタジオぴえろ", "Pierrot", "Studio Pierrot"),
+    "シンエイ動画": ("Shin-Ei Animation", "ShinEi"),
+    "トムス・エンタテインメント": ("TMS Entertainment", "TMS", "トムス"),
+    "GAINAX": ("ガイナックス",),
+    "手塚プロダクション": ("Tezuka Productions", "TezukaProduction"),
+    "タツノコプロ": ("Tatsunoko", "竜の子プロダクション"),
+    "サテライト": ("Satelight",),
+    "ブレインズ・ベース": ("Brain'sBase", "Brains Base", "Brain's Base"),
+    "ライデンフィルム": ("LIDEN FILMS", "LIDENFILMS"),
+    "GONZO": ("ゴンゾ",),
+    "亜細亜堂": ("亚细亚堂",),
+    "スタジオコロリド": ("StudioColorido", "Studio Colorido"),
+    "サイエンスSARU": ("ScienceSARU", "Science SARU"),
+    "ラパントラック": ("LapinTrack", "Lapin Track"),
+    "XEBEC": ("ジーベック",),
+    "ディオメディア": ("Diomedea", "Diomedéa"),
+    "ENGI": ("エンジ",),
+    "スタジオKAI": ("StudioKAI", "Studio KAI"),
+    "横浜アニメーションラボ": ("Yokohama Animation Lab",),
+    "クラウドハーツ": ("Cloud Hearts",),
+    "颱風グラフィックス": ("Typhoon Graphics",),
+    "絵夢": ("絵梦", "绘梦", "Haoliners"),
+    "サンジゲン": ("Sanzigen",),
+    "ポリゴン・ピクチュアズ": ("Polygon Pictures", "PolygonPictures"),
+    "オレンジ": ("Orange",),
+    "ゼクシズ": ("ZEXCS",),
+    "マングローブ": ("Manglobe",),
+    "セブン・アークス": ("Seven Arcs", "SevenArcs"),
+}
+
+
+#: 有通行中文名 / 中文俗称的公司：`官方名 → 中文名`。
+#: 展示时拼成「官方名（中文名）」（见 studio_label）—— 用户想看的是**这是哪家**，
+#: 而 Bangumi 的「动画制作」多数写日文原名（京都アニメーション），
+#: 对中文用户不如"京阿尼"直观。
+#: 没有通行中文名的（MAPPA、SHAFT、A-1 Pictures…）不列，原样显示即可。
+STUDIO_CN_NAMES: dict[str, str] = {
+    "京都アニメーション": "京阿尼",
+    "動画工房": "动画工房",
+    "WHITE FOX": "白狐",
+    "MADHOUSE": "疯屋",
+    "ufotable": "飞碟社",
+    "BONES": "骨头社",
+    "TRIGGER": "扳机社",
+    "東映アニメーション": "东映动画",
+    "スタジオジブリ": "吉卜力",
+    "ぴえろ": "小丑社",
+    "シンエイ動画": "新锐动画",
+    "手塚プロダクション": "手冢制作",
+    "タツノコプロ": "龙之子",
+    "亜細亜堂": "亚细亚堂",
+    "横浜アニメーションラボ": "横滨动画",
+    "颱風グラフィックス": "台风图形",
+    "絵夢": "绘梦",
+    "キネマシトラス": "橘子社",
+    "SUNRISE": "日昇",
+    "トムス・エンタテインメント": "TMS",
+}
+
+
+def _norm_studio(name: str) -> str:
+    """公司名的比较用归一形：小写 + 去掉空格与标点。
+
+    于是 `A-1 Pictures` / `A-1Pictures` / `a1 pictures` 是同一个键。
+    `\\W` 在 Python 的 str 正则里是 Unicode 感知的，中文/日文名不受影响。
+    """
+    return re.sub(r"[\W_]+", "", (name or "").lower())
+
+
+#: 归一后的写法 → 官方名（模块加载时算一次）
+_STUDIO_LOOKUP: dict[str, str] = {
+    _norm_studio(name): official
+    for official, aliases in STUDIO_ALIASES.items()
+    for name in (official, *aliases, STUDIO_CN_NAMES.get(official, ""))
+    if _norm_studio(name)
+}
+
+#: 合作署名里常见的分隔符：「WIT STUDIO×CloverWorks」「A、B」。
+#: **全角也要收**（`＆` U+FF06、`／` U+FF2F）—— 实测有条目写的是
+#: `クラウドハーツ＆横浜アニメーションラボ`，只按半角 `&` 拆就整串认不出来，
+#: 连本来在词表里的「横浜アニメーションラボ」也跟着漏掉。
+_STUDIO_SPLIT = re.compile(r"[×✕✗&＆+＋/／、,，;；]|\s+x\s+")
+
+
+def is_studio_name(name: str) -> bool:
+    """这个词是不是**已知的**动画公司名。
+
+    海报墙用它把公司 tag（京阿尼、MAPPA、A-1Pictures…）从标签栏里摘掉 ——
+    它们已经在"制作公司"栏单列了，再散落进"其他"里会重复。
+    """
+    return _norm_studio(name) in _STUDIO_LOOKUP
+
+
+def _latin_alias(official: str) -> str:
+    """官方名是**纯日文**（不含拉丁字母）时，挑一个拉丁写法当括号里的说明。
+
+    让 `ドライブ` 显示成 `ドライブ（Drive）`、`ティー・エヌ・ケー` 显示成
+    `ティー・エヌ・ケー（TNK）` —— 中文名没有，但英文名总比片假名好认。
+    官方名本身含拉丁字母的（`SILVER LINK.`、`MAPPA`）不需要这一手。
+    """
+    if re.search(r"[A-Za-z]", official):
+        return ""
+    for alias in STUDIO_ALIASES.get(official, ()):
+        if re.search(r"[A-Za-z]", alias):
+            return alias
+    return ""
+
+
+def studio_label(name: str) -> str:
+    """公司名 → 展示用标签：`官方名（中文名）`，没有中文名时就是官方名。
+
+    例：`京都アニメーション` → `京都アニメーション（京阿尼）`；
+        `ドライブ` → `ドライブ（Drive）`；`MAPPA` → `MAPPA`；
+        表外的（`Project No.9`）原样返回。
+
+    **这个标签是存进数据库的**（subjects.studio），不是渲染时才拼 ——
+    省得每次筛选都算，也省得界面层再持有第二份词表（见 database.set_subject_studio）。
+    """
+    text = (name or "").strip()
+    if not text:
+        return ""
+    official = _STUDIO_LOOKUP.get(_norm_studio(text), text)
+    cn = STUDIO_CN_NAMES.get(official, "") or _latin_alias(official)
+    if cn and _norm_studio(cn) != _norm_studio(official):
+        return "%s（%s）" % (official, cn)
+    return official
+
+
+def extract_studio(subject: dict) -> str:
+    """从 Bangumi subject 响应的 infobox 里取**动画制作**（= 制作公司）。
+
+    **只认 `动画制作` 这一行**（含日文/繁体的同义写法，见 _STUDIO_KEYS）：
+    infobox 里的 `製作` 是**制作委员会**（一长串出资方），不是制作公司，
+    拿它当公司名会得到无意义的文本。取不到就返回空串 —— 该条目在海报墙的
+    "制作公司"栏里不出现，不拿别处的数据凑。
+
+    取到的名字先经词表归一（`京都アニメーション` = `京都动画` = `Kyoto
+    Animation`），再按 `studio_label` 拼上中文名 —— 于是同一种写法的
+    不同拼写会**并成同一个筛选项**，面板上看到的是
+    「京都アニメーション（京阿尼）」这种一眼能认出来的形式。
+    表外的公司原样保留（`Project No.9` 就显示 `Project No.9`）。
+
+    合作署名（`WIT STUDIO×CloverWorks`）拆成多个名字、用 ` / ` 连接 ——
+    海报墙按 ` / ` 拆开来分别匹配，按其中任一家都能筛到。
+    """
+    for row in subject.get("infobox") or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("key", "")).strip() not in _STUDIO_KEYS:
+            continue
+        value = row.get("value")
+        # 与别名行同样：value 可能是 [{"v": str}, ...] 也可能是纯字符串
+        if isinstance(value, list):
+            items = [str(v.get("v", "")).strip()
+                     for v in value if isinstance(v, dict)]
+        elif isinstance(value, str):
+            items = [value.strip()]
+        else:
+            items = []
+        labels: list[str] = []
+        for part in items:
+            for name in _STUDIO_SPLIT.split(part):
+                label = studio_label(name)
+                if label and label not in labels:
+                    labels.append(label)
+        if labels:
+            return " / ".join(labels)
+    return ""
+
+
+#: `/v0/subjects/{id}/persons` 里"动画制作"这个关系名的各种写法
+_STUDIO_RELATIONS = frozenset({
+    "动画制作", "アニメーション制作", "アニメ制作", "动画制作公司",
+})
+
+
 class BangumiClient:
     """对 https://api.bgm.tv 的轻量封装。"""
 
@@ -239,7 +552,11 @@ class BangumiClient:
 
     # ---------- 业务 ----------
     def search_subjects(self, keyword: str, limit: int = 10) -> list[dict]:
-        """POST /v0/search/subjects。type=2 限定动画。"""
+        """POST /v0/search/subjects。type=2 限定动画。
+
+        **返回的每条都带 `infobox`**（实测），其中「别名」行就是我们要的
+        别名列表 —— 见模块级 `extract_aliases()`。**零额外请求**。
+        """
         body = {"keyword": keyword, "filter": {"type": [2]}}
         data = self._post("/v0/search/subjects", json=body)
         if isinstance(data, dict):
@@ -249,6 +566,60 @@ class BangumiClient:
     def get_subject(self, subject_id: int) -> dict:
         bgm_log.bind_subject(subject_id)
         return self._get(f"/v0/subjects/{subject_id}")
+
+    # ---------- 制作公司（动画制作）----------
+    def studio_from_persons(self, subject_id: int) -> str:
+        """`GET /v0/subjects/{id}/persons` → 动画制作公司；取不到返回空串。
+
+        **为什么还要这个端点**（踩坑记录）：infobox 里那一行 `动画制作`
+        **只有一部分条目有** —— 实测 冰菓（27364）的 v0 infobox 42 行里
+        压根没有「动画制作」（只有 `製作` = 制作委员会）。而 Bangumi 网页
+        左栏显示的「动画制作: 京都アニメーション」来自**制作人员**这份数据，
+        它只在这个端点里（`relation == "动画制作"`，`type=2` 表示公司）。
+        只读 infobox 的话，覆盖率约三分之一，冰菓这种名作反而漏掉。
+
+        多个公司（合作署名）用 ` / ` 连接，与 infobox 那条路保持一致。
+        """
+        try:
+            rows = self._get(f"/v0/subjects/{subject_id}/persons")
+        except Exception as e:
+            # 拉不到不算错误：公司是展示性数据，缺了就缺了（扫描不因此中断）
+            log.warning("拉取制作人员失败 subject_id=%s: %s", subject_id, e)
+            return ""
+        if not isinstance(rows, list):
+            return ""
+        # 优先取公司（type=2）；只有个人署名时再退回全体
+        companies = [
+            str(r.get("name") or "").strip()
+            for r in rows
+            if isinstance(r, dict)
+            and str(r.get("relation") or "").strip() in _STUDIO_RELATIONS
+            and r.get("type") == 2
+        ]
+        if not companies:
+            companies = [
+                str(r.get("name") or "").strip()
+                for r in rows
+                if isinstance(r, dict)
+                and str(r.get("relation") or "").strip() in _STUDIO_RELATIONS
+            ]
+        labels: list[str] = []
+        for name in companies:
+            label = studio_label(name)
+            if label and label not in labels:
+                labels.append(label)
+        return " / ".join(labels)
+
+    def studio_for(self, subject: dict, subject_id: int) -> str:
+        """条目响应 → 制作公司：先解析 infobox（**零额外请求**），缺失时再查一次。
+
+        优先 infobox 是因为多数情况下它就在搜索响应里（扫描时白拿）；
+        只有它没有「动画制作」时才多发一个 `/persons` 请求 ——
+        实测约三分之二的条目需要这一下（见 studio_from_persons 的说明）。
+        结果由调用方写进数据库，之后不再请求。
+        """
+        studio = extract_studio(subject or {})
+        return studio or self.studio_from_persons(subject_id)
 
     def get_episodes(
         self,

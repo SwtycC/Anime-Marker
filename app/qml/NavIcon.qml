@@ -25,7 +25,8 @@ import QtQuick.Effects
 Item {
     id: root
 
-    /// 图标种类：grid（海报墙）/ play（在看）/ clock（动态）/ rss（订阅）/ gear（设置）/ search（搜索）
+    /// 图标种类：grid（海报墙）/ play（在看）/ clock（动态）/ rss（订阅）/ gear（设置）/
+    /// search（搜索）/ chevron（展开箭头，非选中时朝下，展开后由调用方旋转 180°）
     property string kind: "grid"
     /// 图标颜色（由 NavBar 按选中 / 悬停 / 常态传入）
     property color color: Theme.textSecondary
@@ -47,6 +48,7 @@ Item {
                                     : kind === "rss"    ? "rss"
                                     : kind === "gear"   ? "settings"
                                     : kind === "search" ? "search"
+                                    : kind === "chevron" ? "chevron-down"
                                     : ""
     readonly property string svgUrl: svgName !== "" && iconsBase !== ""
                                      ? iconsBase + svgName + ".svg" : ""

@@ -18,6 +18,7 @@
 | `rss.svg` | 导航栏 · 订阅 |
 | `settings.svg` | 导航栏 · 设置 |
 | `search.svg` | 海报墙搜索胶囊（`SearchPill.qml`，24×24 画布）|
+| `chevron-down.svg` | 海报墙标签筛选胶囊（`TagFilterPill.qml`，展开后旋转 180°）|
 | `pen.svg` | 详情页 · 标签编辑按钮 |
 | `close-small.svg` | 备用 |
 

@@ -89,15 +89,24 @@ def download(
     url: str,
     session: requests.Session | None = None,
     timeout: float = 15.0,
+    label: str = "",
 ) -> Path:
     """下载封面到缓存目录，返回本地路径。失败返回占位图路径。
 
     参数名沿用 `subject_id`，但**实际调用方传的是 bangumi_id**
     （scanner / match 都是），文件名因此是 `covers/<bangumi_id>.<ext>`。
+
+    参数 `label`：动漫名，**仅用于日志**（不参与路径计算）。
+    传了它，日志才会打出是哪一部 —— 排查时只看到一个裸 id
+    （如 `subject_id=506672`）根本不知道对应哪部番，得再去查库。
+    调用方拿得到名字时都该传（scanner 与 match 都从搜索结果里取）。
     """
     dst = cover_path_for(subject_id, url)
     if dst.exists():
         return dst
+
+    # 日志前缀：有名字就带上，格式与 bangumi_api 的 `（名字 bgm=id）` 一致
+    tag = f"（{label} bgm={subject_id}）" if label else f"（bgm={subject_id}）"
 
     s = session or requests
     try:
@@ -108,8 +117,8 @@ def download(
             for chunk in resp.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
-        log.info("封面下载完成 subject_id=%s path=%s", subject_id, dst)
+        log.info("封面下载完成%s path=%s", tag, dst)
         return dst
     except Exception as e:
-        log.warning("封面下载失败 subject_id=%s url=%s err=%s", subject_id, url, e)
+        log.warning("封面下载失败%s url=%s err=%s", tag, url, e)
         return PLACEHOLDER

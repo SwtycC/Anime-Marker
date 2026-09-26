@@ -14,16 +14,29 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from app.core.bangumi_api import extract_aliases
+
 log = logging.getLogger(__name__)
 
 # ---- 评分权重 ----
 SCORE_EXACT = 100        # 名称完全一致
 SCORE_CONTAIN = 60       # 互相包含
 SCORE_PREFIX = 55        # 前缀一致（应对「X～副标题～ 第3季」这类长名）
+SCORE_ALIAS_EXACT = 78   # 别名完全一致（低于正式名，见下方说明）
+SCORE_ALIAS_CONTAIN = 45 # 别名互相包含
 SCORE_WORD_OVERLAP = 20  # 有共同词
 SCORE_SEASON_MATCH = 40  # 季数一致
 SCORE_TYPE_MATCH = 30    # 条目类型一致（TV/剧场版）
 SCORE_EP_NEAR = 20       # 集数接近
+
+# 别名命中为什么要**低于**正式名（实测权衡）：
+# 别名是更宽的口径 —— 一个条目可能有七八个别名，且包含"ANOHANA"这种
+# 会被别的作品撞上的简称。若与正式名同权，会引入新的误匹配：
+#   「未闻花名」+别名100+季数40 = 140，而正确条目若只因别名命中就同分，
+#   两者的 gap 会被压到阈值以下而转人工（反而更糟）。
+# 取值依据：别名一致(78) + 季数一致(40) = 118 > 默认接受线 60 ✓；
+# 而仅别名包含(45) + 季数(40) = 85 > 60 ✓，仍能救回"俗称 vs 全名"的情形。
+# 同时 78 < 100，保证同一关键词下**正式名命中的候选一定胜出**。
 # ---- 惩罚项 ----
 PENALTY_DERIVATIVE = 50  # 同人 / MAD / 剪辑
 PENALTY_SHORT_CLIP = 40  # OP / ED / PV / CM / 预告
@@ -252,10 +265,24 @@ def score_subject(
     season_mode: str = "cn",
     keyword_season: Optional[int] = None,
 ) -> tuple[int, str]:
-    """给单个 Bangumi 候选打分，返回 (分数, 理由)。"""
+    """给单个 Bangumi 候选打分，返回 (分数, 理由)。
+
+    **别名的参与方式（实测踩坑）**：别名与正式名**分开打分、按各自权重取最大**，
+    而不是混在一个池子里。原因：
+
+    1. 权重不同 —— 别名是更宽的口径（一个条目常有七八个），命中应略低于
+       正式名（见 SCORE_ALIAS_* 的说明），否则会引入新的误匹配。
+    2. "名称比对过滤"（下面那段）要求候选**去季数后仍匹配**，别名同样要过
+       这一关，否则「ANOHANA」会把它季数不同的条目也放进来。
+    3. 别名一致(78) 高于 `SCORE_CONTAIN`(60)：这是因为**正式名包含**这条
+       本身已能救回不少场景，而"俗称 vs 全名"（未闻花名 ↔ 我们仍未知道…）
+       只能靠别名 —— 所以别名的"完全一致"必须给到够高的档位。
+    """
     name = subject.get("name", "") or ""
     name_cn = subject.get("name_cn", "") or ""
     candidates = [n for n in (name_cn, name) if n]
+    # 别名单独一份：打分权重与"名称比对过滤"都要区别对待
+    aliases = extract_aliases(subject)
 
     score = 0
     reasons: list[str] = []
@@ -277,6 +304,21 @@ def score_subject(
             if kw_words and cand_words and (kw_words & cand_words):
                 best_name_score = max(best_name_score, SCORE_WORD_OVERLAP)
 
+    # 别名打分：只给"完全一致 / 互相包含"两档，**不给词级重合**
+    # （别名数量多，词级重合会大幅抬高低质量候选的分数）
+    best_alias_score = 0
+    matched_alias = ""
+    for alias in aliases:
+        na = normalize(alias)
+        if not na or not norm_kw:
+            continue
+        if na == norm_kw:
+            if SCORE_ALIAS_EXACT > best_alias_score:
+                best_alias_score, matched_alias = SCORE_ALIAS_EXACT, alias
+        elif norm_kw in na or na in norm_kw:
+            if SCORE_ALIAS_CONTAIN > best_alias_score:
+                best_alias_score, matched_alias = SCORE_ALIAS_CONTAIN, alias
+
     # ---- 名称比对过滤：必须"作品名"匹配，不能只靠季数雷同 ----
     # 例：关键词「第一季」与「我叫MT 第一季」都含「第一季」，但作品无关，
     # 若仅凭此给 60 分，会让大量无关作品挤进候选并干扰正确条目。
@@ -285,10 +327,12 @@ def score_subject(
         if not kw_main:
             # 关键词本身就是纯季数（无作品名）→ 无法据此判断作品，直接否决
             return SCORE_IRRELEVANT, f"关键词仅含季数，无法确定作品（{keyword}）"
-        if best_name_score > 0:
-            # 关键词含作品名 → 要求候选去季数后也与之匹配
+        if best_name_score > 0 or best_alias_score > 0:
+            # 关键词含作品名 → 要求候选去季数后也与之匹配。
+            # **别名同样要过这一关**：否则「ANOHANA」会把它季数不同的
+            # 同名衍生条目一并放行，与"季数是硬条件"的既有约定冲突。
             matched_main = False
-            for cand in candidates:
+            for cand in candidates + aliases:
                 cand_main = _strip_season(cand, season_mode)
                 if not cand_main:
                     continue
@@ -297,9 +341,24 @@ def score_subject(
                     break
             if not matched_main:
                 best_name_score = 0
+                best_alias_score = 0
+
+    # 别名命中并入主分（取两者较大者，因为它们是**同一个维度**的两种口径，
+    # 不该叠加 —— 叠加会让"名称+别名都命中"的条目被虚高抬分）
+    if best_alias_score > best_name_score:
+        best_name_score = best_alias_score
+        best_alias_hit = matched_alias
+    else:
+        best_alias_hit = ""
     # 主名比对兜底：名称未能直接命中时，去掉季数后再比（应对长副标题）
+    #
+    # **别名命中时不要走这里**：兜底会把 best_name_score 覆盖成正式名的
+    # `_main_name_score` 结果（通常更低或为 0），等于把别名的贡献抹掉。
+    # 别名已是可用结论，无需再用正式名兜底。
     best_reason = ""
-    if best_name_score < SCORE_CONTAIN:
+    if best_alias_hit:
+        best_reason = f"别名命中：{best_alias_hit}"
+    elif best_name_score < SCORE_CONTAIN:
         for cand in candidates:
             s, why = _main_name_score(keyword, cand, season_mode)
             if s > best_name_score:
