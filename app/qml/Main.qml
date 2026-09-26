@@ -22,8 +22,27 @@ import QtQuick.Layouts
 ApplicationWindow {
     id: window
 
-    width: 1120
-    height: 720
+    // 初始尺寸由 Python 算好后注入（`windowStartup`，见 QmlApp.run 的说明）。
+    //
+    // **为什么不写死**（踩坑：启动瞬间下半截黑边）：窗口一旦 `visible: true`
+    // 就会立刻渲染首帧，而 Python 侧改尺寸是在 QML 加载**之后**才做的。
+    // 早期这里写死 1120×720、随后被改到 860 高，新长出来的那 140px
+    // 来不及绘制 → 下半截先显示为黑色（实测反馈："打开的一瞬间下半部分有黑边"）。
+    // 现在尺寸随主题一起在 load 之前注入，首帧就是最终尺寸。
+    //
+    // 兜底：注入缺失时（如组件被单独加载、或注入那段被误改）回退到
+    // 原先的一组安全值，`_fit_window_to_columns()` 仍会在加载后纠正。
+    readonly property var _startupSize:
+        (typeof windowStartup !== "undefined" && windowStartup)
+        ? windowStartup
+        : ({ "width": 1120, "height": 720, "x": -1, "y": -1 })
+
+    width: _startupSize.width
+    height: _startupSize.height
+    // 位置也一起注入（Python 那边按屏幕可用区居中算好）。
+    // 为负 = "拿不到屏幕信息"，此时不设 x/y，交给窗口管理器自己摆。
+    x: _startupSize.x >= 0 ? _startupSize.x : x
+    y: _startupSize.y >= 0 ? _startupSize.y : y
     minimumWidth: 900
     minimumHeight: 560
     visible: true

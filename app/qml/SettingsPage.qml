@@ -100,13 +100,40 @@ Item {
         return isNaN(v) ? fallback : v
     }
 
+    /// 只保存**一个键**（点选即生效的开关用）。
+    ///
+    /// **为什么不直接调 save()**：`save()` 会 `collect()` 全部字段并写盘 ——
+    /// 用户在别的输入框里可能正敲了一半（比如改到一半的代理地址），
+    /// 点一下这个开关就把它一并提交了，属于"我没点保存却保存了" ✗。
+    /// 这里只提交当前这一项，其余保持原样。
+    function saveOne(key, value) {
+        if (typeof settingsBridge === "undefined" || !settingsBridge) {
+            root.statusMessage("设置桥接不可用")
+            return false
+        }
+        var v = {}
+        v[key] = value
+        var ok = settingsBridge.saveAll(v)
+        // **不调 loadConfig()**：那会把所有输入框重置成库里的值，
+        // 用户正在别处编辑的内容会被清掉。cfg 缓存由调用方的
+        // `setValue()` 负责更新（它才是 QML 里改 var 属性的正确姿势）。
+        if (ok)
+            root.statusMessage("已保存")
+        else
+            root.statusMessage("保存失败（详见日志）")
+        return ok
+    }
+
     // ---- 保存 ----
     function collect() {
         var v = {}
         // Bangumi
         v["bangumi.token"] = tokenField.text.trim()
         v["bangumi.username"] = usernameField.text.trim()
-        v["bangumi.api_base"] = apiBaseField.text.trim() || "https://api.bgm.tv"
+        // 注意这里**不写 apiBaseField.text**：那一栏是只读的固定值，
+        // 但旧 config.ini 里可能存着用户早先填过的其它地址 —— 必须由
+        // 这里主动覆盖成官方地址，否则"界面上显示官方、实际还在用旧值"。
+        v["bangumi.api_base"] = "https://api.bgm.tv"
         v["bangumi.proxy"] = proxyField.text.trim()
         v["bangumi.ep_timeline_count"] = epTimelineField.value
         v["bangumi.auto_upload"] = autoUploadBox.checked
@@ -123,8 +150,8 @@ Item {
         v["monitor.poll_interval"] = pollIntervalField.value
         v["monitor.trigger_threshold"] = thresholdField.value
         // 扫描
-        v["scanner.season_patterns"] = seasonModeSeg.currentValue
-        v["scanner.season_display"] = seasonDisplaySeg.currentValue
+        // 季数识别 / 多季展示**不再由界面提供**（改为固定方案，写在代码里），
+        // 因此不参与 collect —— 否则这里引用已删除的控件会直接报错。
         v["scanner.accept_score"] = acceptScoreField.value
         v["scanner.accept_gap"] = acceptGapField.value
         // qBittorrent
@@ -321,50 +348,32 @@ Item {
                 FormRow {
                     width: parent.width
                     label: "Access Token"
-                    // ---- 帮助按钮「浮在输入框左外侧」----
+                    // 说明走 FormRow 内置的 `?` 弹窗 —— **与其他每一行完全同源**。
                     //
-                    // 布局意图：输入框**严格占满内容列**（左边与其它栏对齐，
-                    // 右边也齐平），按钮用负 x 伸进左侧的**标签区**。
-                    //
-                    // 可行性：FormRow 的标签列固定 132px，而标签文字
-                    // 「Access Token」只占约 90px，右侧留有约 40px 空档 ——
-                    // 足够放一个 20px 的小圆。这样既不占用输入框的宽度，
-                    // 也不影响任何一栏的对齐。
-                    //
-                    // 踩坑记录（前两版都因此返工）：
+                    // 踩坑记录（前三版都因此返工）：
                     //   ① 按钮放左侧**并参与布局**（输入框 left: 按钮.right）
                     //      → Token 输入框比其它栏右移「按钮宽 + 间距」，
                     //        四栏左边缘参差不齐（实测偏差 28px）。
                     //   ② 按钮放输入框右侧 → 左侧对齐了，但按钮与「检测」
                     //      按钮挤在右侧同一列，视觉上"操作区"偏重，且
                     //      Token 输入框比其它栏窄了 28px。
-                    // 本版把按钮**移出布局流**（负偏移 + 绝对定位），
-                    // 因此四个输入框的 x 完全一致（实测偏差 0px）。
-                    Item {
+                    //   ③ 按钮用负偏移（`x: -width - spacing`）浮到标签区
+                    //      → 输入框确实占满了内容列，但按钮位置是按
+                    //      "内容列左边缘 − 28px" 算的，而其它行的按钮锚在
+                    //      **标签列右边缘**；两者相差十几像素，于是第一行的
+                    //      `?` 明显比下面几行靠右（实测截图可见）✗。
+                    // 现在改成 `helpAction`：按钮仍由 FormRow 统一摆放
+                    // （与其余各行**在同一 x 上**），但点击打开的是自带的
+                    // tokenDialog —— 那一版里有"一键打开生成页"的按钮，
+                    // 内置的纯文本弹窗给不了这个能力。
+                    helpAction: tokenDialog
+                    AppTextField {
+                        id: tokenField
+                        objectName: "tokenField"
+                        text: root.getValue("bangumi.token", "")
                         width: parent.width
-                        height: 34
-
-                        AppTextField {
-                            id: tokenField
-                            objectName: "tokenField"
-                            text: root.getValue("bangumi.token", "")
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.verticalCenter: parent.verticalCenter
-                            echoPassword: true
-                            placeholder: "从 next.bgm.tv/demo/access-token 生成"
-                        }
-
-                        // 负偏移伸到标签区。按钮宽 20 + 间距 8 = 28px，
-                        // 而标签右侧空档约 40px，因此不会压到 "Access Token" 文字。
-                        HelpButton {
-                            id: tokenHelpBtn
-                            objectName: "tokenHelpBtn"
-                            x: -width - Theme.spacingSm
-                            anchors.verticalCenter: parent.verticalCenter
-                            tooltip: "如何获取 Access Token"
-                            onClicked: tokenDialog.open()
-                        }
+                        echoPassword: true
+                        placeholder: "从 next.bgm.tv/demo/access-token 生成"
                     }
                 }
 
@@ -396,12 +405,20 @@ Item {
                 FormRow {
                     width: parent.width
                     label: "API 地址"
+                    // **只读**：程序只兼容 Bangumi 官方 API，不做镜像/自建
+                    // 服务端的适配 —— 允许改的话，用户填一个非官方地址后
+                    // 会得到各种难以归因的失败（字段缺失、鉴权方式不同、
+                    // 返回结构不一致），排查成本远高于"直接不让改"。
+                    //
+                    // `text` 也不再从配置读：旧 config.ini 里可能存着用户
+                    // 早先填过的其它地址，读出来会显示成一个"看起来能改、
+                    // 实际不用"的值。这里直接钉死官方地址。
                     AppTextField {
                         id: apiBaseField
                         objectName: "apiBaseField"
-                        text: root.getValue("bangumi.api_base", "")
+                        text: "https://api.bgm.tv"
                         width: parent.width
-                        placeholder: "https://api.bgm.tv"
+                        readOnly: true
                     }
                 }
 
@@ -435,25 +452,21 @@ Item {
                     // 所以这里调大调小都不会多打或少打请求，也不会删数据。
                     // 早期这个数兼作抓取范围（"凑够 N 条即停"），导致排在
                     // 后面的上百部番永远拉不到 —— 已废弃。
-                    hint: "「动态」页首屏显示最近 N 条，向下滚动可加载更多（同步范围不受影响）"
-                    Row {
-                        spacing: Theme.spacingMd
-                        NumberStepper {
-                            id: epTimelineField
-                            objectName: "epTimelineField"
-                            value: root.getFloat("bangumi.ep_timeline_count", 30)
-                            minimum: 0
-                            maximum: 300
-                            step: 5          // 需求：按一下 ±5
-                            suffix: "条"
-                            width: 180
-                        }
-                        Text {
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: "0 = 关闭「动态」页的逐集记录"
-                            color: Theme.textTertiary
-                            font.pixelSize: Theme.fontXs
-                        }
+                    // 说明全部收进 `?` 弹窗（见 FormRow 的说明）。
+                    // 其中「0 = 关闭」原本是输入框右边的一行小字，也一并挪进来：
+                    // 它属于"这个值怎么理解"，与其余说明是同一类信息。
+                    hint: "「动态」页首屏显示最近 N 条，向下滚动可加载更多"
+                          + "（同步范围不受影响）。\n\n"
+                          + "0 = 关闭「动态」页的逐集记录。"
+                    NumberStepper {
+                        id: epTimelineField
+                        objectName: "epTimelineField"
+                        value: root.getFloat("bangumi.ep_timeline_count", 30)
+                        minimum: 0
+                        maximum: 300
+                        step: 5          // 需求：按一下 ±5
+                        suffix: "条"
+                        width: 180
                     }
                 }
 
@@ -612,37 +625,31 @@ Item {
                 FormRow {
                     width: parent.width
                     label: "全屏后等待"
-                    // 结构照搬「Access Token」那一行：按钮用负偏移移出布局流，
-                    // 因此控件左边缘与其余各行严格对齐（见 tokenField 处注释）。
-                    //
-                    // **宽度不能锚满**：这里刻意不设 anchors.left/right ——
-                    // NumberStepper 自带 implicitWidth(220)，与「轮询间隔」
-                    // 「触发阈值」等其余数值框同宽；早期写成左右锚满会让
-                    // 本行独占整条宽度，与相邻行视觉不齐。
-                    Item {
-                        width: fullscreenSettleField.implicitWidth
-                        height: 34
-
-                        NumberStepper {
-                            id: fullscreenSettleField
-                            objectName: "fullscreenSettleField"
-                            anchors.fill: parent
-                            value: root.getFloat("launcher.fullscreen_settle", 3.0)
-                            minimum: 0
-                            maximum: 10
-                            step: 0.5
-                            decimals: 1
-                            suffix: "秒"
-                        }
-
-                        HelpButton {
-                            id: settleHelpBtn
-                            objectName: "settleHelpBtn"
-                            x: -width - Theme.spacingSm
-                            anchors.verticalCenter: parent.verticalCenter
-                            tooltip: "全屏与等待时间说明"
-                            onClicked: settleDialog.open()
-                        }
+                    // 用 FormRow 内置的 `?` 弹窗（见 FormRow 的说明），
+                    // 不再手写 HelpButton + 负偏移 + 外置 Dialog。
+                    hint: "为什么播放前要先全屏？\n\n"
+                          + "小黄鸭的捕获按「捕获那一刻的窗口尺寸」出画："
+                          + "窗口化会出现黑边、最大化会帧数不稳，只有真全屏才正常。"
+                          + "所以播放前会先按「全屏快捷键」把 PotPlayer 切到全屏。"
+                          + "若你在 PotPlayer 里改过全屏键（F5 → 基本 → 快捷键"
+                          + " 里搜「全屏」），这里要填成一致的值。\n\n"
+                          + "「全屏后等待」是做什么的？\n\n"
+                          + "PotPlayer 达到全屏尺寸后，可能仍在切换渲染模式。"
+                          + "此时过早就发送插帧快捷键，小黄鸭虽然当场抓到了窗口，"
+                          + "但随后的渲染模式切换会让捕获失效 —— "
+                          + "表现为「全屏后右上角有帧数，一开始播放就没了」。\n\n"
+                          + "这个等待就是为了让渲染模式切换完成后再发插帧键。"
+                          + "实测 1 秒不够、3 秒稳定，故默认 3 秒；"
+                          + "机器较慢或播放器启动慢时可调大。"
+                    NumberStepper {
+                        id: fullscreenSettleField
+                        objectName: "fullscreenSettleField"
+                        value: root.getFloat("launcher.fullscreen_settle", 3.0)
+                        minimum: 0
+                        maximum: 10
+                        step: 0.5
+                        decimals: 1
+                        suffix: "秒"
                     }
                 }
 
@@ -688,33 +695,12 @@ Item {
                     hint: "季数识别与匹配阈值改动后需重新扫描"
                 }
 
-                FormRow {
-                    width: parent.width
-                    label: "季数识别"
-                    SegmentedControl {
-                        id: seasonModeSeg
-                        objectName: "seasonModeSeg"
-                        currentValue: root.getValue("scanner.season_patterns", "cn")
-                        options: [
-                            { "label": "第X季 / S1 / Season 1", "value": "cn" },
-                            { "label": "额外识别罗马数字 II / III", "value": "all" }
-                        ]
-                    }
-                }
-
-                FormRow {
-                    width: parent.width
-                    label: "多季展示"
-                    SegmentedControl {
-                        id: seasonDisplaySeg
-                        objectName: "seasonDisplaySeg"
-                        currentValue: root.getValue("scanner.season_display", "flat")
-                        options: [
-                            { "label": "平铺", "value": "flat" },
-                            { "label": "聚合", "value": "grouped" }
-                        ]
-                    }
-                }
+                // 注：「季数识别」「多季展示」两个选项已**移除**。
+                // 它们改为固定方案（`cn` = 第X季 / S1 / Season 1，
+                // `flat` = 平铺），不再让用户选 —— 见 scanner.ScannerBridge
+                // 与 qml_app 里写死的取值，以及 config.DEFAULTS 的说明。
+                // 保留这两个键在 DEFAULTS 里，是为了兼容旧 config.ini
+                // （用户库里可能已存过值，删掉键会让 ConfigParser 报错）。
 
                 FormRow {
                     width: parent.width
@@ -955,81 +941,9 @@ Item {
         }
     }
 
-    // ==================== 全屏与等待时间说明弹窗 ====================
-    Dialog {
-        id: settleDialog
-        modal: true
-        anchors.centerIn: parent
-        width: 560
-        padding: Theme.spacingXl
-        title: "全屏与等待时间说明"
-
-        background: Rectangle {
-            color: Theme.surfaceBg
-            border.width: Theme.lineThin
-            border.color: Theme.border
-            radius: Theme.radiusMd
-        }
-
-        contentItem: Column {
-            width: parent.width
-            spacing: Theme.spacingMd
-
-            Text {
-                width: parent.width
-                text: "为什么播放前要先全屏？"
-                color: Theme.textPrimary
-                font.pixelSize: Theme.fontMd
-                font.bold: true
-            }
-
-            Text {
-                width: parent.width
-                text: "小黄鸭的捕获是按「捕获那一刻的窗口尺寸」出画的：" +
-                      "窗口化会出现黑边、最大化会帧数不稳，" +
-                      "只有真全屏才正常。所以播放前会先按「全屏快捷键」" +
-                      "把 PotPlayer 切到全屏。若你在 PotPlayer 里改过全屏键" +
-                      "（F5 → 基本 → 快捷键 里搜「全屏」），这里要填成一致的值。"
-                color: Theme.textSecondary
-                font.pixelSize: Theme.fontSm
-                lineHeight: 1.5
-                wrapMode: Text.WordWrap
-            }
-
-            Text {
-                width: parent.width
-                text: "「全屏后等待」是做什么的？"
-                color: Theme.textPrimary
-                font.pixelSize: Theme.fontMd
-                font.bold: true
-            }
-
-            Text {
-                width: parent.width
-                text: "PotPlayer 达到全屏尺寸后，可能仍在切换渲染模式。" +
-                      "此时过早就发送插帧快捷键，小黄鸭虽然当场抓到了窗口，" +
-                      "但随后的渲染模式切换会让捕获失效 —— " +
-                      "表现为「全屏后右上角有帧数，一开始播放就没了」。\n\n" +
-                      "这个等待就是为了让渲染模式切换完成后再发插帧键。" +
-                      "实测 1 秒不够、3 秒稳定，故默认 3 秒；" +
-                      "机器较慢或播放器启动慢时可调大。"
-                color: Theme.textSecondary
-                font.pixelSize: Theme.fontSm
-                lineHeight: 1.5
-                wrapMode: Text.WordWrap
-            }
-
-            Row {
-                anchors.right: parent.right
-
-                AppButton {
-                    text: "知道了"
-                    variant: "primary"
-                    onClicked: settleDialog.close()
-                }
-            }
-        }
-    }
+    // 注：原先这里有个手写的「全屏与等待时间说明」弹窗，现已并入 FormRow
+    // 内置的 `?` 弹窗 —— 说明文字直接写在那一行的 `hint` 属性里。
+    // 删除是为了避免"每加一处说明就手写一个 Dialog"的重复。
 
     // ==================== 底部操作栏（固定，不随滚动）====================
     //

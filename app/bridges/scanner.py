@@ -27,6 +27,14 @@ from app.core.scanner import ScanWorker
 
 log = logging.getLogger(__name__)
 
+# 季数识别与多季展示的**固定方案**（原先由设置页的两个分段选择器决定，
+# 现已移除界面、写死在此）。
+#
+# 放模块级常量而不是散在调用处：qml_app 也要用同一个值（它要据此决定
+# 海报墙的展示模式），两处必须一致 —— 写死两份字面量迟早会漂移。
+SEASON_MODE = "cn"        # 识别「第X季 / S1 / Season 1」，不含罗马数字
+SEASON_DISPLAY = "flat"   # 多季平铺（不聚合为系列卡片）
+
 
 class ScannerBridge(QObject):
     """扫描控制器。"""
@@ -126,8 +134,15 @@ class ScannerBridge(QObject):
             self._config.library_paths,
             self._api,
             self._db,
-            season_mode=self._config.get("scanner", "season_patterns", "cn"),
-            season_display=self._config.get("scanner", "season_display", "flat"),
+            # 这两项**已从界面移除，固定写死**（不再读配置）：
+            #   season_mode    = "cn"    → 识别「第X季 / S1 / Season 1」
+            #   season_display = "flat"  → 多季平铺展示
+            # 依据：两组选项实际是"一次选定就再也不改"的偏好，放在设置页
+            # 只增加决策负担；而 `all`（额外识别罗马数字）会显著抬高误匹配
+            # 风险，「聚合」也会让海报墙与"按季追番"的直觉不符。
+            # 配置键仍保留在 DEFAULTS 里，仅为兼容旧 config.ini（见那里说明）。
+            season_mode=SEASON_MODE,
+            season_display=SEASON_DISPLAY,
             accept_score=self._config.getint("scanner", "accept_score", 60),
             accept_gap=self._config.getint("scanner", "accept_gap", 20),
         )

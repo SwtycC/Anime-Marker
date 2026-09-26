@@ -27,6 +27,8 @@ from app.bridges import (
     InProgressBridge, LibraryBridge, MatchBridge, PlayerBridge, RssBridge,
     ScannerBridge, SettingsBridge,
 )
+# 季数识别 / 多季展示已写死（界面移除，见 scanner 里常量的说明）
+from app.bridges.scanner import SEASON_DISPLAY
 from app.core.bangumi_api import BangumiClient
 from app.core.config import Config
 from app.core.database import Database
@@ -140,10 +142,11 @@ class QmlApp:
         self.match_bridge.set_api(self.api)
         self.inprogress_bridge.set_api(self.api)
         self.library_bridge.set_api(self.api)
-        # 海报墙展示模式可能变了
-        self.library_bridge.set_display_mode(
-            self.config.get("scanner", "season_display", "flat")
-        )
+        # 海报墙展示模式：固定方案（见 SEASON_DISPLAY 的说明）。
+        # 原先这里读 `scanner.season_display`，但界面已移除该选项，
+        # 配置里可能是用户很久以前设过的旧值 —— 继续读会让"界面上
+        # 已经没有了、行为却还跟着旧值走"，所以直接取常量。
+        self.library_bridge.set_display_mode(SEASON_DISPLAY)
         # 「集级记录条数」可能被改小 —— 立即裁剪多余的旧记录，
         # 否则界面仍会显示上一次拉取的更多部内容（见 applyEpisodeCount）
         self.inprogress_bridge.applyEpisodeCount()
@@ -236,6 +239,18 @@ class QmlApp:
         ctx.setContextProperty("iconsBaseUrl", icons_base)
         log.info("图标目录：%s", icons_base)
 
+        # 海报圆角遮罩（PosterCard 用它把封面裁成四角圆角）。
+        #
+        # 为什么需要它：纯 QML 裁不了圆角（`clip` 只支持轴对齐矩形），
+        # MultiEffect 的 maskSource 又要求 source 真实渲染，几轮尝试后
+        # 只有"预制遮罩图"这条路可靠 —— 这正是 Qt Quick Controls 内部
+        # 也在用的做法（见 resources/poster_mask.png 的生成脚本说明）。
+        # 同样由 Python 注入：相对路径在开发态/打包态结构不同。
+        mask_url = QUrl.fromLocalFile(
+            str(resource_path("poster_mask.png"))).toString()
+        ctx.setContextProperty("posterMaskUrl", mask_url)
+        log.info("海报遮罩：%s", mask_url)
+
         # 启动主题：**必须在 engine.load() 之前注入**。
         #
         # Theme 单例在创建时（Main.qml 实例化的那一瞬间，早于首帧渲染）就会
@@ -246,14 +261,28 @@ class QmlApp:
         is_dark, accent = self._saved_theme()
         ctx.setContextProperty("themeStartup", {"dark": is_dark, "accent": accent})
 
+        # **启动尺寸也要在 load 之前注入**（踩坑：启动瞬间下半部分黑边）。
+        #
+        # 症状：软件打开的一瞬间，窗口下半截是黑的，随后才正常。
+        # 原因：`Main.qml` 里写死的初始尺寸是 1120×720，而真实尺寸由
+        # 下面的 `_fit_window_to_columns()` 事后用 `setProperty()` 改大
+        # （到 860 高）。时序是：
+        #     ① QML 加载完成 → 窗口**立即以 720 高可见**并渲染首帧
+        #     ② Python 把高度改成 860
+        #     ③ 新长出来的 140px 还没来得及绘制 → 那块显示为黑底
+        # 即"黑边"出现在**下方**，正是被拉高的那一段。
+        #
+        # 修法：把尺寸算好、随主题一起注入，让 QML 首次渲染就用最终尺寸
+        # （`_fit_window_to_columns` 仍保留，用于 QML 起来后兜底复核）。
+        ctx.setContextProperty("windowStartup", self._compute_window_size())
+
         self.theme_bridge = ThemeBridge(self.config)
         ctx.setContextProperty("themeBridge", self.theme_bridge)
 
         # 桥接层：QML 侧直接用 library / scanner 这两个名字
         self.scanner_bridge.set_api(self.api)
-        self.library_bridge.set_display_mode(
-            self.config.get("scanner", "season_display", "flat")
-        )
+        # 海报墙展示模式：固定方案（同上）
+        self.library_bridge.set_display_mode(SEASON_DISPLAY)
         # 扫描完成后：刷新海报墙 + 顺带同步「在看」与「动态」
         self.scanner_bridge.set_finished_hook(self._on_scan_finished)
         ctx.setContextProperty("library", self.library_bridge)
@@ -286,12 +315,14 @@ class QmlApp:
         return app.exec()
 
     # ---------- 窗口尺寸 ----------
-    def _fit_window_to_columns(self, window) -> None:
-        """初始窗口宽度 = 恰好放下 N 列海报卡片（与旧版 MainWindow._fit_to_screen 一致）。
+    def _compute_window_size(self) -> dict:
+        """算出启动尺寸与位置（纯函数，不改任何界面状态）。
 
-        背景：QML 的 `Flow` 会按可用宽度自动决定列数。若窗口宽度只是"够放 4 列多一点"，
-        就会出现「4 列 + 右侧一大片空白」的观感 —— 既浪费空间又不好看。
-        这里精确反推「N 列所需宽度」，让初始状态正好铺满且不留半列空白。
+        返回 `{"width", "height", "x", "y"}`，供两处使用：
+          ① `run()` 里注入给 QML 的 `windowStartup` —— **首帧就用正确尺寸**，
+             避免"先按 QML 里写死的 720 高显示、再被改大"导致的下半截黑边；
+          ② `_fit_window_to_columns()` —— QML 起来后复核一次（兜底：
+             万一注入没生效，这里仍能把窗口纠正到算出来的尺寸）。
 
         计算口径必须与 PosterWallPage 的 Flow 保持一致：
             窗口宽 = 左右 pagePadding × 2
@@ -322,20 +353,40 @@ class QmlApp:
             avail = screen.availableGeometry()
             target_w = min(content_w, int(avail.width() * 0.90))
             target_h = min(860, int(avail.height() * 0.85))
-        else:
-            target_w, target_h = content_w, 720
+            width = max(900, target_w)
+            height = max(560, target_h)
+            return {
+                "width": width,
+                "height": height,
+                "x": avail.x() + (avail.width() - width) // 2,
+                "y": avail.y() + (avail.height() - height) // 2,
+                "cols": cols,
+            }
+        # 拿不到屏幕信息（极罕见）：给一组安全值，居中留给窗口管理器
+        return {
+            "width": max(900, content_w),
+            "height": 720,
+            "x": -1,
+            "y": -1,
+            "cols": cols,
+        }
 
-        window.setProperty("width", max(900, target_w))
-        window.setProperty("height", max(560, target_h))
+    def _fit_window_to_columns(self, window) -> None:
+        """把窗口纠正到 `_compute_window_size()` 算出的尺寸（兜底复核）。
 
-        # 居中显示
-        if screen is not None:
-            avail = screen.availableGeometry()
-            window.setProperty(
-                "x", avail.x() + (avail.width() - window.property("width")) // 2)
-            window.setProperty(
-                "y", avail.y() + (avail.height() - window.property("height")) // 2)
-        log.info("窗口尺寸已适配 %s 列：%sx%s", cols, target_w, target_h)
+        **为什么首帧注入之后还要做一次**：QML 侧读 `windowStartup` 属于
+        "约定"，一旦那段绑定被改动或写错，窗口尺寸就会静默回到 QML 里
+        写死的值。这里在加载完成后复核一次，代价是两个 setProperty。
+        （与 `_apply_saved_theme()` 的关系同理：都是"启动注入 + 事后复核"。）
+        """
+        size = self._compute_window_size()
+        window.setProperty("width", size["width"])
+        window.setProperty("height", size["height"])
+        if size["x"] >= 0 and size["y"] >= 0:
+            window.setProperty("x", size["x"])
+            window.setProperty("y", size["y"])
+        log.info("窗口尺寸已适配 %s 列：%sx%s",
+                 size["cols"], size["width"], size["height"])
 
     # ---------- 主题 ----------
     def _saved_theme(self) -> tuple[bool, str]:

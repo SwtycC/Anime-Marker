@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Window      // Screen.devicePixelRatio（封面解码尺寸用）
 
 // 在看页（阶段 7）：Bangumi「动画 · 在看」列表 + 本地关联。
 //
@@ -183,6 +184,11 @@ Item {
                                     asynchronous: true
                                     cache: true
                                     visible: status === Image.Ready
+
+                                    // 44×62 的缩略图是 1200+ 宽原图的 28 倍缩小，
+                                    // 不给 sourceSize 会糊成一团（顺带省下解码内存）
+                                    sourceSize.width: Math.round(width * Screen.devicePixelRatio * 2)
+                                    sourceSize.height: Math.round(height * Screen.devicePixelRatio * 2)
                                 }
                             }
 

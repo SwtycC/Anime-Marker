@@ -63,9 +63,15 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "poll_on_start": "true",
     },
     "scanner": {
-        # 季数识别模式：cn=第X季/第X部/S1/Season 1；all=额外启用罗马数字
+        # ⚠ 以下两个键**已废弃**（界面移除、取值写死在 bridges/scanner.py
+        # 的 SEASON_MODE / SEASON_DISPLAY 常量里）。
+        #
+        # 为什么保留定义而不删除：用户的旧 config.ini 里可能已经存着这两行，
+        # 而 `ConfigParser` 在 DEFAULT 缺失时读取不会报错、但 `_init_defaults`
+        # 与 `settings.get()` 的兜底会依赖这里的键；贸然删掉会让老配置
+        # 在升级后出现"键存在却无默认"的不一致。留着它们（值即当前方案）
+        # 成本为零，且便于日后想恢复该设置时一眼找到。
         "season_patterns": "cn",
-        # 多季展示：flat=平铺（默认）；grouped=按系列聚合
         "season_display": "flat",
         # 自动匹配的最低分与最小差距（调高更保守）
         "accept_score": "60",

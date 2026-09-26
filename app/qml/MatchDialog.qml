@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Effects
+import QtQuick.Window      // Screen.devicePixelRatio（封面解码尺寸用）
 
 // 手动匹配对话框（原 ui/match_dialog.py 的 QML 版）。
 //
@@ -178,6 +179,11 @@ Window {
                                 fillMode: Image.PreserveAspectCrop
                                 asynchronous: true
                                 visible: status === Image.Ready
+
+                                // 36×48 的缩略图是 1200+ 宽原图的 34 倍缩小，
+                                // 不给 sourceSize 会糊成一团（顺带省下解码内存）
+                                sourceSize.width: Math.round(width * Screen.devicePixelRatio * 2)
+                                sourceSize.height: Math.round(height * Screen.devicePixelRatio * 2)
                             }
                         }
 

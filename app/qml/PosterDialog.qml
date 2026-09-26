@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Window      // Screen.devicePixelRatio（封面解码尺寸用）
 
 // 「更换海报」小窗（详情页顶部「更换海报」按钮 → Main.qml 打开）。
 //
@@ -143,6 +144,11 @@ Window {
                     fillMode: Image.PreserveAspectFit
                     asynchronous: true
                     visible: status === Image.Ready && source != ""
+
+                    // 解码尺寸取"物理像素的 2 倍"，别让整张大图靠一次双线性
+                    // 采样缩小（画质教训见 PosterCard.qml 的长注释）
+                    sourceSize.width: Math.round(width * Screen.devicePixelRatio * 2)
+                    sourceSize.height: Math.round(height * Screen.devicePixelRatio * 2)
                 }
 
                 Text {

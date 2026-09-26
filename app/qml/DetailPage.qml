@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Window      // Screen.devicePixelRatio（封面解码尺寸用）
 
 // 详情页：左封面 + 右信息与集数列表。
 //
@@ -260,6 +261,16 @@ Item {
                     fillMode: Image.PreserveAspectFit
                     asynchronous: true
                     visible: status === Image.Ready && source != ""
+
+                    // **必须给 `sourceSize`**（与海报墙同源的画质教训）：
+                    // 不给的话，1227×1736 的原图会整张传上 GPU，再靠**一次
+                    // 双线性采样**缩到 240×336（约 5 倍缩小），细节成片丢失、
+                    // 边缘出块状锯齿 —— 就是"详情页海报比原图糊"的原因。
+                    //
+                    // 倍数取"物理像素的 2 倍"：实测的拐点，少了偏糊、多了
+                    // 又重新锯齿。完整数据与推导见 PosterCard.qml 里的长注释。
+                    sourceSize.width: Math.round(width * Screen.devicePixelRatio * 2)
+                    sourceSize.height: Math.round(height * Screen.devicePixelRatio * 2)
                 }
 
                 Text {

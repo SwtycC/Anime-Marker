@@ -16,6 +16,12 @@ a = Analysis(
     binaries=[],
     datas=[
         ('resources/icons', 'resources/icons'),
+        # 海报圆角遮罩（PosterCard 用它把封面裁成"上圆下直"）。
+        # **必须单列**：它不在 resources/icons 里，而是在 resources/ 根下，
+        # 上面的目录条目覆盖不到。漏了它 → 打包后封面四角全变直角
+        # （MultiEffect 拿不到遮罩 → 遮罩失效），开发态却看不出问题。
+        # 由 paths.resource_path("poster_mask.png") 读取。
+        ('resources/poster_mask.png', 'resources'),
         # QML 界面文件：映射到 _MEIPASS/qml，与 paths.qml_dir() 的契约一致。
         # .qml 是运行时加载的，PyInstaller 静态分析发现不了，必须显式打包。
         ('app/qml', 'qml'),
