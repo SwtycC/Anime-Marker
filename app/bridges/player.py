@@ -157,6 +157,10 @@ class PlayerBridge(QObject):
         self._playing_title = ""
         self.playingChanged.emit()
 
+    def wait_pending_sync(self, ms: int = 3000) -> None:
+        """退出时等待后台的 Bangumi 同步线程（见 ProgressMonitor 同名方法）。"""
+        self._monitor.wait_pending_sync(ms)
+
     @Slot(int)
     def markWatched(self, episode_id: int) -> None:
         """手动标记某集为看过（仅本地，不推 Bangumi）。

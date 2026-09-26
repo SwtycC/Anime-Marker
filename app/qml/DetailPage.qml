@@ -736,11 +736,16 @@ Item {
                                     opacity: 0.6
                                 }
 
+                                // **双击**才播放（与本地播放器的习惯一致）。
+                                // 单击只负责 hover 高亮：集数行是"浏览对象"，
+                                // 播放是有副作用的动作（会拉起播放器和小黄鸭），
+                                // 单击误触的代价太大 —— 尤其这一列就在滚动区里，
+                                // 想滚一下列表结果点开了视频。
                                 MouseArea {
                                     id: epMouse
                                     anchors.fill: parent
                                     hoverEnabled: true
-                                    onClicked: root.playEpisode(modelData.id)
+                                    onDoubleClicked: root.playEpisode(modelData.id)
                                 }
                             }
                         }

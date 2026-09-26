@@ -17,7 +17,8 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import (Q_ARG, QMetaObject, QObject, QRunnable, Qt,
+                            QThreadPool, QTimer, Signal, Slot)
 
 import win32con
 import win32gui
@@ -82,6 +83,51 @@ def query_playback(hwnd: int) -> Optional[tuple[int, int]]:
     return None
 
 
+class _SyncRunnable(QRunnable):
+    """后台把「看完了一集」同步到 Bangumi，避免阻塞 UI 线程。
+
+    **为什么必须独立成线程**（实测：程序"未响应"）：调它的地方在
+    `_tick()` 的调用链上，而 `_tick` 由 QTimer 在 UI 线程驱动；
+    `mark_episode_watched` 带 `Retry(total=3, connect=3)` + `timeout=10s`，
+    网络不通时最坏阻塞 **30+ 秒**，期间界面完全冻结、连关播放器都卡住。
+    详见 `_trigger_watched` 里那段时间线。
+
+    **跨线程只做网络、不碰数据库**：`Database` 的所有访问都在主线程
+    （见 database 的 `_cursor` 全局锁说明），worker 里调 SQL 会引入锁竞争。
+    所以本类只负责 POST，结果（成功/失败）交回主线程由
+    `ProgressMonitor._on_sync_finished` 处理落库。
+
+    用 `QMetaObject.invokeMethod` 而不是直接调用回调：QRunnable 跑在池线程，
+    直接改 Qt 对象属性/发信号可能跨线程访问，交给主线程的事件循环最稳。
+    """
+
+    def __init__(self, monitor: "ProgressMonitor", ep: Episode,
+                 subject) -> None:
+        super().__init__()
+        self._monitor = monitor
+        self._ep = ep
+        self._subject = subject
+
+    @Slot()
+    def run(self) -> None:
+        err = ""
+        try:
+            self._monitor.api.mark_episode_watched(
+                self._subject.bangumi_id, self._ep.bangumi_ep_id)
+        except BangumiError as e:
+            err = str(e)
+        except Exception as e:          # pragma: no cover - 防御性
+            log.exception("同步到 Bangumi 异常 episode_id=%s", self._ep.id)
+            err = str(e)
+        # 回主线程收尾（写库 + 提示）
+        QMetaObject.invokeMethod(
+            self._monitor, "_on_sync_finished", Qt.QueuedConnection,
+            Q_ARG(int, self._ep.id),
+            Q_ARG(int, int(self._subject.bangumi_id)),
+            Q_ARG(str, self._subject.name_cn or self._subject.name or ""),
+            Q_ARG(str, err))
+
+
 class ProgressMonitor(QObject):
     """QTimer 驱动的进度监控器。"""
 
@@ -119,6 +165,13 @@ class ProgressMonitor(QObject):
         self._last_pos: Optional[int] = None
         # 连续读不到进度的次数（用于"静默失败"时给一次提示）
         self._misses = 0
+        # 与 Bangumi 同步的**后台**线程池。
+        #
+        # 用池而不是"每次新建 QThread"：看完一集就发一个请求，一部番十几集
+        # 会建十几个线程；池复用少量线程即可。maxThreadCount 限制为 2 ——
+        # 同步是"一集一个"的低频动作，没必要并发太多去撞 Bangumi 的限流。
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(2)
 
     def apply_config(
         self,
@@ -164,6 +217,25 @@ class ProgressMonitor(QObject):
         self._timer.stop()
         self._episode = None
         log.info("停止监控")
+
+    def wait_pending_sync(self, ms: int = 3000) -> None:
+        """等待后台同步线程结束（退出时调用）。
+
+        **为什么需要**：同步放在线程池里跑，程序退出时若不等待，正在进行的
+        POST 会被硬切断；更重要的是它的**收尾回调（写库）在主线程**，
+        主线程一结束就永远不会执行 —— 表现为"看完这集、Bangumi 上也标了，
+        本地 `watched_episodes` 却缺这一行"（下次「上传」小窗里又冒出来）。
+
+        给一个上限而不是无限等：网络卡住时不能让退出流程永久挂住，
+        超时就放弃（那一条留待下次同步补齐，不影响已提交的标记）。
+        """
+        try:
+            if self._pool is not None and self._pool.activeThreadCount() > 0:
+                log.info("等待 %s 个后台同步线程结束…",
+                         self._pool.activeThreadCount())
+                self._pool.waitForDone(ms)
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("等待后台同步线程失败：%s", e)
 
     # ---------- 内部 ----------
     def _tick(self) -> None:
@@ -294,15 +366,45 @@ class ProgressMonitor(QObject):
             # 关掉自动上传：只留本地记录，等用户在小窗里勾选上传
             log.info("自动上传已关闭，episode_id=%s 仅记录本地（可在动态页「上传」补传）", ep.id)
             return
-        try:
-            self.api.mark_episode_watched(subject.bangumi_id, ep.bangumi_ep_id)
-        except BangumiError as e:
-            log.warning("同步到 Bangumi 失败（本地记录已保留，可用「上传」补齐）: %s", e)
-            self.error.emit(f"Bangumi 标记失败（本地已记录，可用「上传」补齐）：{e}")
+        # ---- 3. 网络同步：**必须放到后台线程**（见下方"致命踩坑"）----
+        #
+        # **致命踩坑（实测：程序"未响应"）**：这里是 `_tick()` 的调用链，
+        # 而 `_tick` 由 QTimer 在 **UI 线程** 驱动。早期直接在下面同步调
+        # `api.mark_episode_watched()`，该请求带 `Retry(total=3, connect=3)`
+        # 且 timeout=10s —— **最坏情况在 UI 线程里阻塞 30+ 秒**：
+        #
+        #     16:23:07  第 1 次重试（connect timeout 10s）
+        #     16:23:18  第 2 次重试
+        #     16:23:30  第 3 次重试
+        #     16:23:40  最终失败        ← 这 33 秒界面完全冻结
+        #     16:23:42  用户关 PotPlayer 的操作也卡住 → "程序未响应"
+        #
+        # 网络正常时这个 POST 只要几百毫秒，所以平时看不出来；一旦
+        # `api.bgm.tv` 连不上（连接超时，而非 5xx）就必然复现。
+        #
+        # 修法：交给线程池，UI 线程立刻返回。失败/成功仍走同一套处理
+        # （提示 + 写回本地），只是时机变成"稍后"。
+        self._pool.start(_SyncRunnable(self, ep, subject))
+
+    @Slot(int, int, str, str)
+    def _on_sync_finished(self, episode_id: int, bangumi_id: int,
+                          subject_name: str, error: str) -> None:
+        """后台同步的收尾（**在主线程执行**，见 _SyncRunnable 的说明）。
+
+        - `error` 非空 → 后台 POST 失败：本地记录早已写好（`_trigger_watched`
+          第 1 步），这里只提示用户可用「上传」补齐。
+        - 成功 → 写回 `watched_episodes` + 清该条目的同步水位，
+          这两步都碰数据库，因此必须留在主线程（见 _SyncRunnable 的边界说明）。
+        """
+        if error:
+            log.warning("同步到 Bangumi 失败（本地记录已保留，可用「上传」补齐）: %s",
+                        error)
+            self.error.emit(f"Bangumi 标记失败（本地已记录，可用「上传」补齐）：{error}")
             return
-        log.info("已同步到 Bangumi：episode_id=%s（条目 %s 第 %s 集）",
-                 ep.id, subject.bangumi_id, ep.ep_index)
-        # ---- 3. 把这一集写回本地「已同步」表 ----
+
+        log.info("已同步到 Bangumi：episode_id=%s（条目 %s）", episode_id, bangumi_id)
+
+        # ---- 把这一集写回本地「已同步」表 ----
         #
         # **为什么必须写回**（踩坑）：`watched_episodes` 是「**从 Bangumi 拉回来的**
         # 已标记集」；而这里是「**推过去**」—— 只 POST 不写回，这张表就永远缺这一行。
@@ -315,12 +417,18 @@ class ProgressMonitor(QObject):
         # 与手动补传走同一条路（见 InProgressBridge._on_upload_finished）：
         # upsert 后动态页立刻出现 `bgm` 标记，不必等下一次集级同步。
         # `watched_at` 取**上传时刻**，与 Bangumi 网页记录的时间一致。
+        ep = self.db.get_episode(episode_id)
+        if ep is None:
+            # 条目在同步期间被删了（重扫 / 手动删除）：无事可做
+            log.info("episode_id=%s 已不存在，跳过写回（Bangumi 标记已生效）",
+                     episode_id)
+            return
         try:
             self.db.upsert_watched_episodes([{
                 "bangumi_ep_id": int(ep.bangumi_ep_id),
                 "subject_id": int(ep.subject_id),
-                "bangumi_id": int(subject.bangumi_id),
-                "subject_name": subject.name_cn or subject.name or "",
+                "bangumi_id": int(bangumi_id),
+                "subject_name": subject_name,
                 "ep_index": ep.ep_index or 0,
                 "ep_name": ep.title or "",
                 "watched_at": datetime.now().astimezone().isoformat(
@@ -332,7 +440,7 @@ class ProgressMonitor(QObject):
         # 让这条目的集级记录下次刷新时重新同步，否则刚标的这一集要等
         # 收藏行变化或 30 天超期兜底才会出现在动态页（见 sync_candidates）
         try:
-            self.db.clear_ep_sync_state_for(int(subject.bangumi_id))
+            self.db.clear_ep_sync_state_for(int(bangumi_id))
         except Exception as e:
             log.warning("让条目 %s 的集级记录重新同步失败（不影响标记）: %s",
-                        subject.bangumi_id, e)
+                        bangumi_id, e)

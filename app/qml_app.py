@@ -153,6 +153,41 @@ class QmlApp:
         self.player_bridge.apply_config()
         log.info("配置已应用，服务已重建")
 
+    def _on_scan_finished(self) -> None:
+        """扫描完成的收尾：刷新海报墙，并**顺带同步「在看」与「动态」**。
+
+        **为什么要在这里带上后两者**：它们的数据源是 Bangumi 的收藏接口
+        （见 InProgressBridge），与本地扫描没有直接关系 —— 但用户在"新装
+        / 重扫"之后想要的是一份**完整可用**的界面，而不是"海报墙满了、
+        在看页和动态页还是空的、得再手动点两次刷新"。
+
+        扫描本来就是"批量联网"的重操作，把它俩挂上只多一个请求批次
+        （收藏列表 1 次 + 集级记录增量几十次），不会让等待体感变长；
+        反过来，用户少点两次、也少一次"为什么这里是空的"的困惑。
+
+        顺序：**先刷新海报墙**（纯本地、瞬间完成），再发起网络同步 ——
+        这样扫描一结束界面立刻有内容，在看页随后自行填充。
+
+        **未配置 Token 时跳过网络同步**：在看/动态的数据全部来自 Bangumi
+        的收藏接口，没有 Token 必然 401（`get_me` 拿不到 username 就报
+        "无法确定 Bangumi 用户名"）。扫到那一步只是白跑一趟、并在状态栏
+        留下一条看不懂的报错 —— 用户此时该看到的是"去设置里填 Token"，
+        而不是一条网络失败。海报墙不受影响（纯本地）。
+        """
+        self.library_bridge.reload()
+
+        token = (self.config.bangumi_token or "").strip()
+        if not token:
+            log.info("未配置 Bangumi Token，跳过「在看 / 动态」同步"
+                     "（海报墙已刷新；如需同步请在设置里填写 Token）")
+            return
+        try:
+            self.inprogress_bridge.refresh()
+            log.info("扫描完成，已顺带发起「在看 / 动态」同步")
+        except Exception as e:
+            # 同步失败不影响扫描结果本身（海报墙已刷新），只记警告
+            log.warning("扫描后自动同步「在看 / 动态」失败（可手动刷新）: %s", e)
+
     def _on_scan_requested(self) -> None:
         """设置页点「保存并扫描」。"""
         if self.scanner_bridge.running:
@@ -219,8 +254,8 @@ class QmlApp:
         self.library_bridge.set_display_mode(
             self.config.get("scanner", "season_display", "flat")
         )
-        # 扫描完成后刷新海报墙数据
-        self.scanner_bridge.set_finished_hook(self.library_bridge.reload)
+        # 扫描完成后：刷新海报墙 + 顺带同步「在看」与「动态」
+        self.scanner_bridge.set_finished_hook(self._on_scan_finished)
         ctx.setContextProperty("library", self.library_bridge)
         ctx.setContextProperty("scanner", self.scanner_bridge)
         ctx.setContextProperty("settingsBridge", self.settings_bridge)
@@ -349,6 +384,12 @@ class QmlApp:
             self.library_bridge.waitTagWorker()
         except Exception as e:  # pragma: no cover - 防御性
             log.warning("等待标签拉取结束失败：%s", e)
+        # 后台的「看完同步到 Bangumi」也要等：它的收尾（写回 watched_episodes）
+        # 在主线程，不等就永远不会执行（见 ProgressMonitor.wait_pending_sync）
+        try:
+            self.player_bridge.wait_pending_sync()
+        except Exception as e:  # pragma: no cover - 防御性
+            log.warning("等待后台同步结束失败：%s", e)
         try:
             self.db.close()
         except Exception as e:  # pragma: no cover - 防御性
