@@ -21,8 +21,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
-from PySide6.QtCore import QObject, Property, QThread, Signal, Slot
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QObject, Property, QThread, QUrl, Signal, Slot
+from PySide6.QtGui import QDesktopServices, QImage
 from PySide6.QtWidgets import QFileDialog
 
 from app.core.bangumi_api import COLLECT_TYPE_DOING, is_studio_name
@@ -574,6 +574,36 @@ class LibraryBridge(QObject):
             return {}
         return self._subject_to_dict(s) if s else {}
 
+    @Slot(int, result=bool)
+    def openSubjectPage(self, subject_id: int) -> bool:
+        """在系统默认浏览器里打开该条目的 Bangumi 页面。
+
+        地址形如 `https://bangumi.tv/subject/<bangumi_id>`（详情页标题右侧
+        的链接按钮用）。返回是否成功发起打开。
+
+        **为什么用本地主键而不是直接传 URL**（两条理由）：
+          ① QML 不该知道站点地址 —— 域名将来若变（bangumi.tv / bgm.tv），
+             改一处即可；
+          ② 传 URL 等于给 QML 开了"打开任意链接"的口子，这里只放行
+             "本条目在官方站点的页面"这一种语义。
+
+        没有 bangumi_id 的条目（pending / 未匹配）直接返回 False，
+        QML 侧据此不显示按钮 —— 避免点开一个 404 页面。
+        """
+        try:
+            s = self._db.get_subject(subject_id)
+        except Exception as e:
+            log.exception("读取条目 %s 失败: %s", subject_id, e)
+            return False
+        bangumi_id = int(s.bangumi_id or 0) if s else 0
+        if bangumi_id <= 0:
+            log.info("条目 %s 未关联 Bangumi，无法打开网页", subject_id)
+            return False
+        url = f"https://bangumi.tv/subject/{bangumi_id}"
+        ok = QDesktopServices.openUrl(QUrl(url))
+        log.info("打开 Bangumi 页面：%s（%s）", url, "成功" if ok else "失败")
+        return bool(ok)
+
     @Slot(int, result="QVariantList")
     def episodes(self, subject_id: int) -> list[dict]:
         """条目的集数列表（详情页用），按 ep_index 升序。"""
@@ -1066,6 +1096,10 @@ class LibraryBridge(QObject):
             # 分别匹配（QML 侧 itemStudios）。没有的条目为空串 —— 在
             # "制作公司"筛选栏里不出现，不拿别处的数据凑。
             "studio": s.studio or "",
+            # 集数是否为「按顺序」与官方配对（scanner._align_by_order 写入）。
+            # 详情页打开时据此弹黄色提示：这种对应是数量一致下的猜测，
+            # 没有按号匹配可靠。
+            "epAlignOrder": (s.ep_align or "") == "order",
             "matchState": s.match_state or "auto",
             "totalEps": int(s.total_eps or 0),
             "folderPath": s.folder_path or "",

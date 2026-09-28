@@ -258,7 +258,14 @@ class MatchBridge(QObject):
         except BangumiError as e:
             log.warning("拉取集数失败（不影响手动匹配）: %s", e)
             return
-        ep_map = {e.get("sort") or e.get("ep"): e for e in bgm_eps}
+        # 键统一转 float（与 scanner._fill_episodes 同一套口径）：
+        # 本地 ep_index 是 float，接口 sort 可能是 int / 字符串，不转会静默 miss
+        ep_map: dict[float, dict] = {}
+        for e in bgm_eps:
+            try:
+                ep_map.setdefault(float(e.get("sort") or e.get("ep")), e)
+            except (TypeError, ValueError):
+                continue
         try:
             for ep in self._db.list_episodes(self._subject_id):
                 bgm = ep_map.get(ep.ep_index)

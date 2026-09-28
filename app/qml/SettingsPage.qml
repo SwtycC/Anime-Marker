@@ -38,6 +38,100 @@ Item {
         flick.contentY = Math.max(0, Math.min(y, flick.contentHeight - flick.height))
     }
 
+    /// 滚动到指定控件（按 objectName）并短暂高亮 —— 详情页黄色警示
+    /// 「点击前往设置关闭」的落地动作：不止切到设置页，还要直接落到
+    /// 那个开关上，省得用户在一长串表单里自己找。
+    function revealField(fieldId) {
+        function find(item, depth) {
+            if (depth > 12 || !item || !item.children)
+                return null
+            for (var i = 0; i < item.children.length; i++) {
+                var c = item.children[i]
+                if (c.objectName === fieldId)
+                    return c
+                var r = find(c, depth + 1)
+                if (r)
+                    return r
+            }
+            return null
+        }
+        var w = find(root, 0)
+        if (!w)
+            return false
+
+        // **必须等到布局真正算完**（实测踩坑：第一次从详情页跳过来时
+        // 高亮框横向撑出页面、第二次起才正确）。
+        //
+        // 本页平时被 StackLayout 藏着，点击浮条那一刻才把 visible 打开，
+        // 此时 `FormRow` 的 `width: parent.width` 之类绑定**还没重新求值**
+        // —— 立刻读 w.width 拿到的是「按内容撑开的隐式宽度」，比表单宽
+        // 得多，框于是横跨整行、左边还溢出到页面外。
+        //
+        // `Qt.callLater` / `Timer(0)` 都**不保证布局已 polish**（它们只
+        // 表示"本帧事件循环稍后"），所以两层 callLater 也修不了。
+        //
+        // 可靠时机是**窗口真正渲染完一帧**：把测量工作挂到 window 的
+        // `afterRendering` 上（渲染后几何必定已定），触发一次就断开关联。
+        // 这是"等布局稳定"最硬的保证，不依赖任何时序猜测。
+        root._pendingReveal = w
+        var win = root.Window.window
+        if (win) {
+            win.afterRendering.connect(root._onAfterRendering)
+            // 主动请求一帧：窗口若空闲（无动画）不会自己重绘，
+            // 不请求的话 afterRendering 可能永远不来
+            win.requestUpdate()
+        } else {
+            // 极端情况（页面被单独加载、没有所属窗口）：退回定时器兜底
+            revealTimer.target = w
+            revealTimer.restart()
+        }
+        return true
+    }
+
+    /// revealField 待定位的目标控件（等下一帧渲染完成后消费，见上）
+    property var _pendingReveal: null
+
+    function _onAfterRendering() {
+        var win = root.Window.window
+        if (win)
+            win.afterRendering.disconnect(root._onAfterRendering)
+        var w = root._pendingReveal
+        root._pendingReveal = null
+        if (w)
+            root._revealTo(w)
+    }
+
+    /// 无窗口时的兜底定时器（正常路径不走这里）
+    Timer {
+        id: revealTimer
+        interval: 0
+        repeat: false
+        property var target: null
+        onTriggered: {
+            if (target)
+                root._revealTo(target)
+        }
+    }
+
+    /// revealField 的后半段：在布局稳定后滚动到目标。
+    ///
+    /// **高亮框交给控件自己画**（踩坑）：早期在设置页里算"控件视觉范围"
+    /// 再放一个外部矩形 —— 但设置页的开关是 `FormRow` 子项，会被拉伸到
+    /// 整行宽，`width` / `implicitWidth` / `childrenRect` / `FontMetrics`
+    /// 全都拿不到"轨道 + 文字"那段真实范围，框于是横跨整行、甚至左边
+    /// 溢出页面外（首次跳转时尤其明显）。
+    ///
+    /// 正解：调用控件自带的 `flash()`（见 CheckBoxLine.qml）—— 高亮矩形
+    /// 锚在轨道与文字上，天然贴合本体，外部不需要知道任何尺寸。
+    function _revealTo(w) {
+        var pos = w.mapToItem(flick.contentItem, 0, 0)
+        scrollTo(pos.y - 16)          // 上方留一点呼吸位
+        if (typeof w.flash === "function")
+            w.flash()
+        else
+            revealBox.flashAt(pos, w)   // 无内置高亮的控件走通用兜底
+    }
+
     /// 诊断用：按 id 设置控件值（自动化测试脚本调用）
     function debugSet(fieldId, value) {
         // 通过 children 递归查找 objectName 匹配的控件
@@ -154,6 +248,7 @@ Item {
         // 因此不参与 collect —— 否则这里引用已删除的控件会直接报错。
         v["scanner.accept_score"] = acceptScoreField.value
         v["scanner.accept_gap"] = acceptGapField.value
+        v["scanner.ep_align_order"] = epAlignOrderBox.checked
         // qBittorrent
         v["qbittorrent.host"] = qbHostField.text.trim() || "127.0.0.1"
         v["qbittorrent.port"] = qbPortField.value
@@ -204,6 +299,7 @@ Item {
 
     Flickable {
         id: flick
+        objectName: "settingsFlick"   // 诊断/探针用（revealField 的滚动断言）
         anchors.fill: parent
         clip: true
         contentWidth: width
@@ -236,6 +332,57 @@ Item {
             }
         }
 
+        // 「前往设置」入口的定位高亮框（revealField 放置，见函数说明）。
+        // Rectangle 本身不接收鼠标事件，盖在表单上不影响操作；
+        // z:10 压过内容层，边框用主题色 —— 与浮条/选中态同一套视觉语言。
+        Rectangle {
+            id: revealBox
+            objectName: "settingsRevealBox"   // 诊断/探针用
+            x: 0
+            y: 0
+            width: 0
+            height: 0
+            z: 10
+            radius: Theme.radiusMd
+            color: "transparent"
+            border.color: Theme.accent
+            border.width: Theme.lineThick
+            opacity: 0
+
+            // 亮起 → 停留 → 淡出：闪烁感来自与 0 的落差，不打扰后续操作
+            SequentialAnimation {
+                id: revealFlash
+                NumberAnimation {
+                    target: revealBox
+                    property: "opacity"
+                    to: 1
+                    duration: 120
+                }
+                PauseAnimation { duration: 1000 }
+                NumberAnimation {
+                    target: revealBox
+                    property: "opacity"
+                    to: 0
+                    duration: 400
+                }
+            }
+
+            /// 通用兜底：给**没有内置 flash()** 的控件（文本框、步进器…）
+            /// 在内容坐标系里框出它的位置。
+            /// 这些控件本来就不占满整行，用自身 width/height 是准确的。
+            function flashAt(pos, w) {
+                var pad = 8
+                var boxX = Math.max(content.x, pos.x - pad)
+                var boxRight = Math.min(content.x + content.width,
+                                        pos.x + w.width + pad)
+                revealBox.x = boxX
+                revealBox.y = pos.y - pad
+                revealBox.width = Math.max(0, boxRight - boxX)
+                revealBox.height = w.height + pad * 2
+                revealFlash.restart()
+            }
+        }
+
         // 用 Column + 显式宽度，而不是 ColumnLayout。
         //
         // 原因：ColumnLayout 作为 Flickable 的直接子项时，其尺寸不由父级
@@ -244,6 +391,7 @@ Item {
         // 改用 Column + 每行显式 width 后布局稳定。
         Column {
             id: content
+            objectName: "settingsContent"   // 诊断/探针用（revealBox 的横向边界）
             x: Theme.pagePadding
             y: Theme.pagePadding
             width: flick.width - Theme.pagePadding * 2
@@ -732,6 +880,23 @@ Item {
                             step: 5
                             width: 140
                         }
+                    }
+                }
+
+                FormRow {
+                    width: parent.width
+                    label: "集数按顺序对应"
+                    // 兜底配对（scanner._align_by_order）：官方序号与本地
+                    // 编号**完全对不上**、但集数数量一致时，按排序位置配对
+                    // 并改用官方序号（如 Re:零 第三季：官方 51~58 vs
+                    // 本地 [01]~[08]）。本质是"数量一致下的猜测"，没有按号
+                    // 匹配可靠 —— 命中的条目打开详情页会弹黄色提示。
+                    hint: "本地编号与官方对不上但集数数量一致时按顺序配对；命中条目打开详情页会有黄色提示"
+                    CheckBoxLine {
+                        id: epAlignOrderBox
+                        objectName: "epAlignOrderBox"
+                        checked: root.getBool("scanner.ep_align_order", true)
+                        text: "启用（关闭后对不上号的集保持本地编号，标题用文件名）"
                     }
                 }
             }

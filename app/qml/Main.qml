@@ -255,8 +255,9 @@ ApplicationWindow {
         // 为什么走浮条而不是状态栏：状态栏在窗口最底部、字小色淡，用户
         // 注意力在标签行上，看不到；浮条浮在内容上方且能变琥珀色
         // （warn=true，如"该标签已存在"），一眼可见。
-        function onStatusMessage(text, warn) {
-            banner.show(text, warn)
+        // `action` 非空（如 "settings"）时浮条可点击跳转（见 banner.show）。
+        function onStatusMessage(text, warn, action) {
+            banner.show(text, warn, action)
         }
     }
 
@@ -444,6 +445,13 @@ ApplicationWindow {
             statusBar.stopProgress()
             statusBar.setMessage(
                 "扫描完成：匹配 " + matched + " 个，待确认 " + pending + " 个", 8000)
+            // 详情页正开着时重取：单条目重扫（详情页「+」按钮）会改写集数
+            // 序号/标题/匹配状态，不刷新的话用户看到的还是旧列表
+            // （与 player.onWatched 的处理同理）。
+            if (detailPage.subjectId > 0
+                    && window.currentPage === 0
+                    && browseStack.currentIndex === 1)
+                detailPage.load(detailPage.subjectId)
         }
 
         function onFailed(msg) {
@@ -690,6 +698,9 @@ ApplicationWindow {
         //   warn   —— 琥珀色底（"该标签已存在"这类需要注意但不致命的提示）
         // 用 `warn` 而不是 `dangerColor`：重复添加不是错误，红字会显得过重。
         property bool warn: false
+        // 可选动作（show() 的第三参）："settings" = 点击浮条跳转设置页。
+        // 空串 = 普通提示，不可点击（MouseArea disabled，不挡下层点击）。
+        property string action: ""
 
         // 位置：**窗口顶部居中**，浮在内容之上，不占布局空间。
         //
@@ -756,11 +767,31 @@ ApplicationWindow {
         }
 
         /// 显示提示。`warn` 为 true 时用琥珀色（重复 / 需注意）。
-        function show(text, warn) {
+        /// `action` 传 "settings" 时浮条可点击 → 跳转设置页
+        /// （目前只有「集数按顺序对应」的警示在用）。
+        function show(text, warn, action) {
             banner.warn = warn === true
+            banner.action = (action === "settings") ? "settings" : ""
             bannerText.text = text
             banner.opacity = 1
             bannerTimer.restart()
+        }
+
+        // 点击浮条 → 执行 action（跳设置页）并收起。
+        // 只在带 action 时启用：普通提示的浮条区域不拦截下层点击。
+        MouseArea {
+            anchors.fill: parent
+            enabled: banner.action !== ""
+            cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+            onClicked: {
+                if (banner.action === "settings") {
+                    window.gotoPage(4)      // 4 = 设置页（见页面索引表）
+                    // 不止切页，还要滚动到那个开关并高亮（否则用户要在一
+                    // 整页表单里自己找「集数按顺序对应」）
+                    settingsPage.revealField("epAlignOrderBox")
+                }
+                banner.opacity = 0
+            }
         }
     }
 

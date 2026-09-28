@@ -20,7 +20,7 @@ from app.utils.paths import database_path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS subjects (
     series_name  TEXT,                       -- 所属系列（用于聚合展示）
     aliases      TEXT,                       -- infobox 别名，用换行分隔（见下方注释）
     studio       TEXT,                       -- 动画制作公司（规范名，见 bangumi_api.STUDIO_ALIASES）
+    ep_align     TEXT,                       -- 集数对应方式：''=按号（默认）/'order'=按顺序（可能不准）
     match_state  TEXT DEFAULT 'auto',        -- auto / manual / pending
     updated_at   TEXT
 );
@@ -204,6 +205,9 @@ class Subject:
     studio: str
     match_state: str
     updated_at: str
+    # 集数对应方式（v7+）：'' / NULL = 按号（默认）；'order' = 按顺序配对。
+    # 带默认值：旧调用方按位置构造不受影响，Subject(**dict(row)) 也能对上。
+    ep_align: str = ""
 
 
 @dataclass
@@ -376,6 +380,15 @@ class Database:
         if "studio" not in cols:
             log.info("迁移：subjects 增加 studio 列")
             self._conn.execute("ALTER TABLE subjects ADD COLUMN studio TEXT")
+        # v7：subjects 新增 ep_align（集数对应方式标记）。
+        #
+        # 'order' = 该条目的集数是**按顺序**与官方配对的（官方序号与本地
+        # 文件编号完全对不上、但数量一致时的兜底，见 scanner._align_by_order）
+        # —— 这种对应没有按号匹配可靠，详情页打开时会弹黄色提示提醒用户。
+        # 旧库该列为 NULL，与 '' 同义（按号对应），无降级问题。
+        if "ep_align" not in cols:
+            log.info("迁移：subjects 增加 ep_align 列")
+            self._conn.execute("ALTER TABLE subjects ADD COLUMN ep_align TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -428,6 +441,18 @@ class Database:
             cur.execute(
                 "UPDATE subjects SET cover_path=?, updated_at=? WHERE id=?",
                 (cover_path, _now(), subject_id),
+            )
+
+    def set_subject_ep_align(self, subject_id: int, by_order: bool) -> None:
+        """标记该条目的集数是按号还是按顺序与官方对应的（详情页警示用）。
+
+        每次扫描 `_fill_episodes` 都会重写：这次按顺序配对、下次重扫按号
+        对上了，标记会自动清除，不会永久残留。
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE subjects SET ep_align=? WHERE id=?",
+                ("order" if by_order else "", subject_id),
             )
 
     # ---------- 条目别名 ----------

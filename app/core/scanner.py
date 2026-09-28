@@ -250,12 +250,40 @@ def _is_noise_word(text: str) -> bool:
 _EP_CN_RE = re.compile(r"第\s*(\d+(?:\.\d+)?)\s*[话集回話]")
 # 「EP01」「E01」（要求前面不是字母，避免命中 MAD 里的随机串）
 _EP_EN_RE = re.compile(r"(?i)\bE[P]?\s*0*(\d+(?:\.\d+)?)\b")
+
+# 完结标记（可拼进各集数正则）：
+# 「[66END]」「66 END」「(12完)」「[25 Fin]」—— 完结集常在集数后跟标记。
+# **必须允许它**（实测踩坑）：数字正则原本要求"数字后面是边界/结尾"，
+# 而 [66END] 里 66 后面紧贴字母 END，三层正则全部失配 → 这一集解析不出
+# 集号，落进兜底桶被顺延成 max+0.5（Re:零 S3 的 66 集显示成 65.5）。
+# 注意标记后的边界检查（尾部 $ / 前瞻 (?![\w.])）仍然生效，所以
+# 「2 endings」这类普通英文单词不会误命中。
+_EP_END_MARK = r"(?:\s*(?:END|FIN|完|終|终))?"
+
 # 以数字结尾：整名就是数字（01.mkv）或「... - 01」「[01]」「 01」等。
 # 用 (?<!\d) 保证「12」整体被捕获（写成 [\s\-_\[\]]0*(\d+)$ 会切掉首位数字，
 # 把 12.mkv 解析成 2）。
-_EP_TAIL_RE = re.compile(r"(?<!\d)0*(\d+(?:\.\d+)?)(?:v\d+)?$")
-# 独立数字（前后都不是字母数字）：如「[01]」夹在括号中
-_EP_MID_RE = re.compile(r"(?<![\w.])0*(\d+(?:\.\d+)?)(?:v\d+)?(?![\w.])")
+_EP_TAIL_RE = re.compile(
+    r"(?<!\d)0*(\d+(?:\.\d+)?)(?:v\d+)?" + _EP_END_MARK + r"\s*$",
+    re.IGNORECASE)
+# 纯数字括号块：[01]、[01v2]、[66END]、（05）—— 发布组对集数的标准写法。
+# **括号内必须只有集数（可带 v2 版本号 / 完结标记）**，不能放宽成
+# "括号内含数字"：[AVC-8bit 1080p AAC] 会被抠出 8 / 1080 这类画质参数。
+# 注意这不能替代 _EP_MID_RE（它要求括号紧贴集数），两者取值范围不同。
+_EP_BRACKET_RE = re.compile(
+    r"[\[【(（]\s*0*(\d+(?:\.\d+)?)(?:v\d+)?\s*" + _EP_END_MARK + r"\s*[\]】)）]",
+    re.IGNORECASE)
+# 独立数字（前后都不是字母数字）：如「[01]」夹在括号中、「66END 1080p」
+_EP_MID_RE = re.compile(
+    r"(?<![\w.])0*(\d+(?:\.\d+)?)(?:v\d+)?" + _EP_END_MARK + r"(?![\w.])",
+    re.IGNORECASE)
+
+# 括号块集数的可信度上限（实测踩坑）：
+# 「(2021) 01」里的年份、「[1080]」里的画质参数也会命中 _EP_BRACKET_RE。
+# 正片集数几乎不可能 ≥200（超长篇也多为重播编号），超过上限的一律不进
+# 括号层级 —— 它们仍会被 _EP_MID_RE 当低可信度候选捡回来，只是不再
+# 抢占高可信度位置。
+_EP_BRACKET_MAX = 199.5
 
 # 附属内容关键词：命中即视为「非正片」，不参与集数编号（预告/菜单/OP/ED 等）
 # 说明：仅按文件名匹配，不影响目录级归并（目录归并见 matcher.is_extra_dir）
@@ -285,38 +313,134 @@ def is_extra_file(name: str) -> bool:
     return any(re.search(p, stem) for p in EXTRA_FILE_PATTERNS)
 
 
-def extract_ep_index(name: str) -> Optional[float]:
-    """从文件名中提取集数序号（正片集数）。不属正片的返回 None。
+def extract_ep_candidates(name: str) -> list[float]:
+    """从文件名提取**全部**集数候选，按可信度从高到低排列。
 
-    支持 01 / 第1话 / EP01 / 12.5。
+    为什么返回候选列表而不是单一值（实测踩坑）：
+    「[Sakurato] 86—Eitisnikkusu— [01v2][AVC-8bit 1080p AAC][CHS]」这类
+    **标题本身就是数字**的文件名，标题里的 86 与括号里的 01 都是
+    "看起来合法"的集数 —— 只取第一个命中的话，86 排在前面、整部作品
+    每一集都会被解析成 86（详情页左列全显示"86"就是这一原因）。
+
+    调用方应拿候选列表去 Bangumi 官方集数表里对号（`_pick_ep_index`）：
+    能对上官方集数的候选才是真集数；对不上时退回最高可信度候选
+    （与旧行为一致，用于未匹配条目 / 接口缺数据的兜底）。
+
+    层级（从高到低）：
+      ① 「第X话/集/回」 —— 写法明确，唯一候选
+      ② 预告/菜单/NCOP/PV 等附属内容 → 无候选（不参与编号）
+      ③ EP01 / E01
+      ④ 数字结尾（01.mkv、- 01）
+      ⑤ 纯数字括号块 [01] / [01v2] / （05）
+      ⑥ 其余独立数字（标题里的 86、裸写的 01 等）—— 兜底
     """
     stem = Path(name).stem
+    cands: list[float] = []
 
-    # ① 明确的「第 X 话/集/回」写法优先
+    # ① 明确的「第 X 话/集/回」写法 —— 可信度最高，直接定案
     m = _EP_CN_RE.search(stem)
     if m:
-        return float(m.group(1))
+        return [float(m.group(1))]
 
     # ② 附属内容（预告/菜单/NCOP/PV…）不参与编号，避免它们占掉 max_idx
     #    导致后续 SP 顺延到更大的序号上（正片 6 → 6.5/7/7.5…）
     if is_extra_file(stem):
-        return None
+        return []
 
     # ③ EP01 / E01
     m = _EP_EN_RE.search(stem)
     if m:
-        return float(m.group(1))
+        return [float(m.group(1))]
 
     # ④ 数字结尾（含整名就是数字的 01.mkv）
     m = _EP_TAIL_RE.search(stem)
     if m:
-        return float(m.group(1))
+        cands.append(float(m.group(1)))
 
-    # ⑤ 独立数字（如「[01]」夹在括号中）
-    m = _EP_MID_RE.search(stem)
-    if m:
-        return float(m.group(1))
-    return None
+    # ⑤ 纯数字括号块（发布组标准命名，如 [01v2]）。
+    #    放在"数字结尾"之后：「[1080] 01.mkv」应取结尾的 01 而非画质 1080；
+    #    但必须放在"独立数字"之前：86 的案例里若先跑独立数字，
+    #    标题里的 86 会抢在 [01v2] 之前命中。
+    #    超过可信度上限的（1080 / 2021 这类画质参数、年份）跳过。
+    for m in _EP_BRACKET_RE.finditer(stem):
+        val = float(m.group(1))
+        if val <= _EP_BRACKET_MAX:
+            cands.append(val)
+
+    # ⑥ 其余独立数字 —— 兜底，可信度最低，靠官方集数表消歧
+    for m in _EP_MID_RE.finditer(stem):
+        cands.append(float(m.group(1)))
+
+    return cands
+
+
+def extract_ep_index(name: str) -> Optional[float]:
+    """单一集号（保留的旧接口）：取最高可信度候选。
+
+    新代码请改用 `extract_ep_candidates` + `_pick_ep_index` ——
+    标题带数字的作品名（86、11eyes…）必须靠官方集数表消歧，
+    单一值无法表达"这里有两个候选"。
+    """
+    cands = extract_ep_candidates(name)
+    return cands[0] if cands else None
+
+
+def _pick_ep_index(
+    candidates: list[float], ep_map: dict[float, dict]
+) -> Optional[float]:
+    """从候选集号里挑出真集数：优先挑能对上官方集数表的那个。
+
+    对不上时（SP、接口缺集、未匹配条目没有 ep_map）退回最高可信度
+    候选 —— 与旧版行为一致，保证无接口数据时仍可编号。
+    """
+    if not candidates:
+        return None
+    for c in candidates:
+        if c in ep_map:
+            return c
+    return candidates[0]
+
+
+def _align_by_order(
+    main_videos: list[tuple[float, Path]],
+    ep_map: dict[float, dict],
+    number_matched: bool,
+) -> tuple[list[tuple[float, Path]], bool]:
+    """官方集数与本地序号**完全对不上**但数量一致时，按顺序配对。
+
+    背景（实测）：Re:零 第三季在 Bangumi 被拆成「袭击篇」「反击篇」
+    两个条目，官方 sort 跨篇章连续（袭击篇 51~58、反击篇 59~66），而
+    字幕组的文件名按本篇章从 [01] 编起 —— 按号匹配全部落空，集标题
+    永远回填不上（详情页左列显示的是本地序号 1~8、右边一排文件名）。
+
+    做法：两个列表都按各自序号排好、数量又一致，那么第 k 个本地文件
+    就对应第 k 个官方集数，并把 **ep_index 改成官方序号** —— 与
+    Bangumi 网页、动态、订阅页「已看集数」的口径保持一致
+    （字幕组的 01 实际是官方第 51 话）。改号后 `ep_map.get(idx)` 顺理
+    成章命中，标题与 bangumi_ep_id 走正常回填路径，无需特判。
+
+    **触发条件必须同时满足**：
+      1. 有官方集数表（ep_map 非空 —— 未匹配条目没有）；
+      2. 本地正片数 == 官方正片数；
+      3. 按号匹配**一个都没命中**（number_matched=False）。
+         第 3 条是安全阀：只要有一部分按号对上了，说明两套编号大体
+         一致，对不上的少数派多半是 SP/特别篇 —— 此时按顺序硬配反而
+         会把已经正确的对应打乱（例如本地 03~06、官方 1/2/4/5，
+         4、5 按号命中是**正确**的，顺序配对却会错开）。
+
+    返回 `(配对后的列表, 是否发生了按顺序配对)` —— 后者写入
+    `subjects.ep_align`，详情页打开时会弹黄色提示「对应可能不准确」
+    （毕竟它是猜测，不是按号实锤）。
+    """
+    if not ep_map or number_matched:
+        return main_videos, False
+    if not main_videos or len(main_videos) != len(ep_map):
+        return main_videos, False
+    by_sort = sorted(ep_map.items())
+    return [
+        (sort_key, video)
+        for (sort_key, _bgm), (_local_idx, video) in zip(by_sort, main_videos)
+    ], True
 
 
 def is_season_like(name: str, season_mode: str = "cn") -> bool:
@@ -410,13 +534,25 @@ class ScanWorker(QThread):
         season_display: str = "flat",
         accept_score: int = 60,
         accept_gap: int = 20,
+        align_by_order: bool = True,
+        only_folder: Optional[Path] = None,
     ) -> None:
         super().__init__()
         self.library_paths = [Path(p) for p in library_paths]
         self.api = api
         self.db = db
+        # 「单个重新扫描」（详情页的按钮）：只处理这一个目录，不遍历媒体库。
+        #
+        # **为什么复用整个 ScanWorker 而不是另写一条流程**：单扫与全扫
+        # 在"匹配 → 写库 → 填集数 → 打标记"上完全一致，差别只在**候选来源**。
+        # 另写一份必然与主流程漂移（集数对齐、别名、公司、tag 这些增量
+        # 迟早漏掉）。这里只替换候选来源，其余原样复用。
+        self.only_folder = Path(only_folder) if only_folder else None
         self.season_mode = season_mode
         self.season_display = season_display
+        # 官方序号对不上但数量一致时，是否允许按顺序兜底配对
+        # （设置页「集数按顺序对应」开关，scanner.ep_align_order）
+        self.align_by_order = align_by_order
         self.matcher = SubjectMatcher(
             api, season_mode=season_mode, accept_score=accept_score
         )
@@ -455,6 +591,28 @@ class ScanWorker(QThread):
 
     # ========== 一、目录遍历（递归下探） ==========
     def _collect_candidates(self) -> Iterable[ScanCandidate]:
+        # 单目录重扫：只从目标目录下探，且**直接以它为根**（不再要求它是
+        # 媒体库的子目录 —— 用户可能改过媒体库路径，旧条目仍应能单扫）。
+        if self.only_folder is not None:
+            folder = self.only_folder
+            if not folder.exists():
+                log.warning("单条目扫描：目录不存在 %s", folder)
+                return
+            if folder.is_file():
+                # 根目录散落文件的条目：folder_path 是父目录，实际文件是它本身
+                yield ScanCandidate(
+                    folder_path=folder.parent,
+                    video_files=[folder],
+                    keywords=[clean_title(folder.stem)],
+                    series_name="",
+                )
+                return
+            # 从目标目录**的一层子目录**开始下探（含目录自身产出的候选）：
+            # 直接把 folder 交给 _walk 会把它当"系列根"，其上级系列名丢失；
+            # 这里按"folder 本身被视为系列根"处理，与全扫时的层级一致。
+            yield from self._walk(folder, series_name="", depth=0)
+            return
+
         for root in self.library_paths:
             if not root.exists():
                 log.warning("根目录不存在：%s", root)
@@ -722,7 +880,20 @@ class ScanWorker(QThread):
                 bgm_eps = self.api.get_episodes(bangumi_id)
             except BangumiError:
                 pass
-        ep_map = {e.get("sort") or e.get("ep"): e for e in bgm_eps}
+        # 官方集数表：键 = 官方序号（sort 优先、ep 兜底），值 = 接口集对象。
+        # 用途有二：① 集标题回填（name_cn / name）；② `_pick_ep_index`
+        # 的候选消歧 —— 文件名里有多个疑似集号时（如标题带数字的
+        # 「86—Eitisnikkusu— [01v2]」），能对上官方集数的那个才是真集号。
+        #
+        # 键统一转成 float：本地解析出的是 float，而接口 JSON 的 sort 可能
+        # 是 int 或个别情况下的字符串，不转会静默查不到（并且不报错）。
+        ep_map: dict[float, dict] = {}
+        for e in bgm_eps:
+            try:
+                key = float(e.get("sort") or e.get("ep"))
+            except (TypeError, ValueError):
+                continue
+            ep_map.setdefault(key, e)
 
         # 三类文件：
         #   main  —— 正片（有明确集数序号）
@@ -731,15 +902,28 @@ class ScanWorker(QThread):
         main_videos: list[tuple[float, Path]] = []
         extra_videos: list[tuple[str, Path]] = []
         plain_videos: list[tuple[str, Path]] = []
+        number_matched = False    # 是否有文件按号命中了官方集数表
         for v in cand.video_files:
-            idx = extract_ep_index(v.name)
+            idx = _pick_ep_index(extract_ep_candidates(v.name), ep_map)
             if idx is not None:
+                if idx in ep_map:
+                    number_matched = True
                 main_videos.append((idx, v))
             elif is_extra_file(v.name):
                 extra_videos.append((v.stem, v))
             else:
                 plain_videos.append((v.stem, v))
         main_videos.sort(key=lambda x: x[0])
+        # 官方序号与本地编号完全对不上但数量一致 → 按顺序配对并改用官方
+        # 序号（Re:零 袭击篇：本地 [01]~[08] vs 官方 51~58，见 _align_by_order）。
+        # 受设置页「集数按顺序对应」开关控制（scanner.ep_align_order）：
+        # 关闭时跳过，保持本地编号；此时把 ep_align 标记也一并清掉 ——
+        # 它的语义是"**当前**集数来自顺序配对"，功能关了就不该再警示。
+        if self.align_by_order:
+            main_videos, aligned_by_order = _align_by_order(
+                main_videos, ep_map, number_matched)
+        else:
+            aligned_by_order = False
         extra_videos.sort(key=lambda x: x[0])
         plain_videos.sort(key=lambda x: x[0])
 
@@ -778,3 +962,12 @@ class ScanWorker(QThread):
                 file_path=str(v),
             )
             next_extra_idx += 0.5
+
+        # 记录「集数是按顺序对应的」这一事实：详情页打开时弹黄色提示
+        # 「可能不准确」。每次填充都会重写 —— 下次重扫若按号对上了，
+        # 标记自动清除（见 Database.set_subject_ep_align）。
+        try:
+            self.db.set_subject_ep_align(subject_id, aligned_by_order)
+        except Exception as e:  # pragma: no cover - 标记失败不影响集数写入
+            log.warning("写入集数对应方式标记失败 subject_id=%s: %s",
+                        subject_id, e)

@@ -1,0 +1,4 @@
+<!-- fill/stroke 必须为白色：MultiEffect 的 colorization 按「源亮度」相乘，黑色/深色永远染不出颜色（见本目录 README） -->
+<!-- 「重新扫描」图标：一个近乎整圈的圆弧 + 两个箭头，形如循环刷新。
+     沿用本目录的描边式风格（stroke=#FFFFFF，round 端点/接头）。 -->
+<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M13.2 8a5.2 5.2 0 1 1-1.9-4" fill="none" stroke="#FFFFFF" stroke-width="1.5" stroke-linecap="round"/><path d="M11.6 1.4v2.9H8.7" fill="none" stroke="#FFFFFF" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>

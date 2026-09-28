@@ -16,6 +16,7 @@ ScanWorker 是 QThread 子类，其信号跨线程发射；这里用一层 QObje
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QObject, Property, Signal, Slot
@@ -145,6 +146,10 @@ class ScannerBridge(QObject):
             season_display=SEASON_DISPLAY,
             accept_score=self._config.getint("scanner", "accept_score", 60),
             accept_gap=self._config.getint("scanner", "accept_gap", 20),
+            # 「集数按顺序对应」开关：与 accept_score 一样在**每次启动扫描**
+            # 时现读 —— 设置页保存后下一次扫描即生效，无需重启。
+            align_by_order=self._config.getbool(
+                "scanner", "ep_align_order", True),
         )
         worker.progress_changed.connect(self._on_progress)
         worker.item_matched.connect(self._on_matched)
@@ -156,6 +161,66 @@ class ScannerBridge(QObject):
         self._set_running(True)
         worker.start()
         log.info("扫描已启动，媒体库：%s", self._config.library_paths)
+
+    @Slot(int)
+    def startSubject(self, subject_id: int) -> None:
+        """单个条目重新扫描（详情页「添加」按钮）。
+
+        **为什么需要它**：全量扫描要把整个媒体库跑一遍（每个条目都要
+        发 Bangumi 请求），只为了刷新一部番的集数/标题/别名太浪费。
+        这里只处理该条目自己的目录。
+
+        与 `start()` 共用同一套 worker 与信号：进度、日志、完成回调、
+        finished 通知全都照旧 —— 界面无需为单扫写第二套处理逻辑。
+
+        注意 `library_paths` 传空列表：单扫不看媒体库配置（用户可能已
+        改过路径，而这条旧条目仍应能刷新），候选来源由 `only_folder` 决定。
+        """
+        if self._running:
+            log.info("扫描进行中，忽略单条目扫描请求")
+            self.logMessage.emit("扫描正在进行中，请稍候")
+            return
+        if self._api is None:
+            self.failed.emit("Bangumi API 未初始化")
+            return
+
+        subj = self._db.get_subject(subject_id)
+        if subj is None:
+            self.failed.emit("条目不存在")
+            return
+        folder = (subj.folder_path or "").strip()
+        if not folder:
+            self.failed.emit("该条目没有记录目录路径，无法重新扫描")
+            return
+
+        self._api = self._api or BangumiClient()
+        self._matched = 0
+        self._pending = 0
+        self._current = 0
+        self._total = 0
+
+        worker = ScanWorker(
+            [],                       # 不用媒体库路径（见方法说明）
+            self._api,
+            self._db,
+            season_mode=SEASON_MODE,
+            season_display=SEASON_DISPLAY,
+            accept_score=self._config.getint("scanner", "accept_score", 60),
+            accept_gap=self._config.getint("scanner", "accept_gap", 20),
+            align_by_order=self._config.getbool(
+                "scanner", "ep_align_order", True),
+            only_folder=Path(folder),
+        )
+        worker.progress_changed.connect(self._on_progress)
+        worker.item_matched.connect(self._on_matched)
+        worker.log_message.connect(self._on_log)
+        worker.finished_ok.connect(self._on_ok)
+        worker.failed.connect(self._on_failed)
+
+        self._worker = worker
+        self._set_running(True)
+        worker.start()
+        log.info("单条目扫描已启动：subject_id=%s（%s）", subject_id, folder)
 
     @Slot()
     def cancel(self) -> None:

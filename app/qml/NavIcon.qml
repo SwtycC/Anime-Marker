@@ -49,6 +49,8 @@ Item {
                                     : kind === "gear"   ? "settings"
                                     : kind === "search" ? "search"
                                     : kind === "chevron" ? "chevron-down"
+                                    : kind === "link"   ? "link"
+                                    : kind === "back"   ? "arrow-left"
                                     : ""
     readonly property string svgUrl: svgName !== "" && iconsBase !== ""
                                      ? iconsBase + svgName + ".svg" : ""

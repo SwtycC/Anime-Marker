@@ -12,12 +12,18 @@ Item {
     signal backRequested()
     /// 提示消息（由 Main.qml 转成窗口底部浮条）。
     /// `warn` = true 时浮条用琥珀色（如"该标签已存在"）。
-    signal statusMessage(string text, bool warn)
+    /// `action` = 可选动作："settings" → 浮条可点击、跳转设置页
+    /// （其余发射点不传即为 undefined，浮条按普通提示处理）。
+    signal statusMessage(string text, bool warn, string action)
 
     property int subjectId: 0
     property var subject: ({})
     property var episodes: []
     property var siblings: []
+    // 扫描是否进行中（含全量扫描与单条目重扫）—— 用来禁用「重新扫描」按钮，
+    // 避免并发扫描（ScannerBridge 本身也会拒绝，这里只是把状态前置到界面）
+    readonly property bool scannerRunning:
+        (typeof scanner !== "undefined" && scanner) ? scanner.running : false
     // 外部 SVG 图标的目录基地址（与 NavIcon 同一来源，见 QmlApp 注入）
     property string iconsBase: typeof iconsBaseUrl !== "undefined"
                                ? iconsBaseUrl : ""
@@ -42,6 +48,15 @@ Item {
         if (root.tagRows.length === 0 && (root.subject.bangumiId || 0) > 0
                 && typeof library !== "undefined" && library)
             library.requestTagFetch(root.subjectId)
+        // 「按顺序对应」的条目**每次载入都弹**黄色警示（warn=true → 琥珀色
+        // 浮条）。集数是官方序号与本地编号对不上、仅凭数量一致猜出来的
+        // 配对（见 scanner._align_by_order），没有按号匹配可靠 —— 打开时
+        // 都应当提醒一句「可能不准确」，避免用户误以为序号/标题是实锤。
+        // 带 action="settings"：浮条可点击，直达设置页开关（Main.qml 处理）。
+        if (root.subject.epAlignOrder === true)
+            root.statusMessage(
+                "该条目的集数是按顺序对应的（本地编号与官方序号不一致），可能不准确 · 点击前往设置关闭",
+                true, "settings")
         epFlick.contentY = 0
     }
 
@@ -219,21 +234,65 @@ Item {
             Layout.fillWidth: true
             spacing: Theme.spacingMd
 
-            AppButton {
-                text: "← 返回"
+            // 返回：圆形描边图标按钮（无文字，悬停双环交叉动画，
+            // 颜色跟随主题色 —— 见 BackButton.qml）
+            BackButton {
+                objectName: "backButton"
+                Layout.alignment: Qt.AlignVCenter
                 onClicked: root.backRequested()
             }
 
             Item { Layout.fillWidth: true }
 
-            AppButton {
+            // 三个操作按钮统一用 DetailButton（胶囊 + 悬停主题色 + 字距拉开
+            // + 按下下沉，见 DetailButton.qml）。
+            DetailButton {
+                objectName: "posterButton"
                 text: "更换海报"
                 onClicked: root.posterRequested(root.subjectId)
             }
 
-            AppButton {
+            DetailButton {
+                objectName: "rematchButton"
                 text: "重新匹配"
                 onClicked: root.rematchRequested(root.subjectId)
+            }
+
+            // 重新扫描该条目：只跑这一个目录（不遍历媒体库），
+            // 用于"手动改了文件名/补了缺失集/换了资源组后刷新元数据"。
+            // 扫描进行中禁用（避免并发，ScannerBridge 本身也会拒绝）。
+            Row {
+                Layout.alignment: Qt.AlignVCenter
+                spacing: Theme.spacingSm
+
+                // 纯图标模式：图标取代「重新扫描」文字（更紧凑，与左侧
+                // 两个胶囊按钮同高，视觉重心一致）。
+                // `tooltip` 由组件自身承载 —— **不要在外面再叠 MouseArea**，
+                // 那会抢走 hover 事件、让悬停动画失效（踩坑见 DetailButton.qml）。
+                DetailButton {
+                    objectName: "rescanButton"
+                    text: ""
+                    iconSource: root.iconsBase + "refresh.svg"
+                    tooltip: "重新扫描该条目"
+                    enabled: !root.scannerRunning
+                    anchors.verticalCenter: parent.verticalCenter
+                    onClicked: {
+                        if (typeof scanner === "undefined" || !scanner)
+                            return
+                        scanner.startSubject(root.subjectId)
+                        root.statusMessage("正在重新扫描该条目…")
+                    }
+                }
+
+                // 进度指示：扫描中在按钮右侧转圈（视觉上把"正在重扫"
+                // 与刚才那次点击关联起来；DetailButton 自身禁用变灰）
+                AddButton {
+                    objectName: "rescanSpinner"
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: root.scannerRunning
+                    size: 20
+                    spinning: true
+                }
             }
         }
 
@@ -288,15 +347,81 @@ Item {
                 Layout.fillHeight: true
                 spacing: Theme.spacingSm
 
-                Text {
+                // 标题行：标题 + 右侧「打开 Bangumi 页面」链接按钮。
+                // 标题要占满剩余宽度（fillWidth），按钮固定在右侧不参与拉伸。
+                RowLayout {
                     Layout.fillWidth: true
-                    text: root.subject.title || ""
-                    color: Theme.textPrimary
-                    font.pixelSize: Theme.fontXl
-                    font.weight: Font.DemiBold
-                    wrapMode: Text.WordWrap
-                    elide: Text.ElideRight
-                    maximumLineCount: 2
+                    spacing: Theme.spacingSm
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: root.subject.title || ""
+                        color: Theme.textPrimary
+                        font.pixelSize: Theme.fontXl
+                        font.weight: Font.DemiBold
+                        wrapMode: Text.WordWrap
+                        elide: Text.ElideRight
+                        maximumLineCount: 2
+                    }
+
+                    // 跳转 Bangumi 对应条目页（如 https://bangumi.tv/subject/633836）
+                    //
+                    // **只在该条目已关联 Bangumi 时显示**：未匹配/pending 条目
+                    // 没有 bangumi_id，点开只会得到 404（判断依据与后端
+                    // openSubjectPage 的拒绝条件一致，两处都拦一道）。
+                    Item {
+                        id: bgmLinkButton
+                        objectName: "bgmLinkButton"   // 诊断/探针用
+                        Layout.alignment: Qt.AlignTop | Qt.AlignRight
+                        implicitWidth: 24
+                        implicitHeight: 24
+                        visible: (root.subject.bangumiId || 0) > 0
+
+                        readonly property bool _hovered: linkMouse.containsMouse
+
+                        NavIcon {
+                            anchors.fill: parent
+                            kind: "link"
+                            color: bgmLinkButton._hovered
+                                   ? Theme.accent : Theme.textTertiary
+                            opacity: bgmLinkButton._hovered ? 1 : 0.75
+                            Behavior on opacity {
+                                NumberAnimation { duration: Theme.durFast }
+                            }
+                        }
+
+                        // 悬停时在图标下加一条主题色下划线，强化"可点链接"的暗示
+                        Rectangle {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            anchors.bottom: parent.bottom
+                            width: parent.width * 0.7
+                            height: Theme.lineThin
+                            radius: height / 2
+                            color: Theme.accent
+                            opacity: bgmLinkButton._hovered ? 1 : 0
+                            Behavior on opacity {
+                                NumberAnimation { duration: Theme.durFast }
+                            }
+                        }
+
+                        MouseArea {
+                            id: linkMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                if (typeof library === "undefined" || !library)
+                                    return
+                                if (!library.openSubjectPage(root.subjectId))
+                                    root.statusMessage(
+                                        "该条目未关联 Bangumi，无法打开页面")
+                            }
+
+                            ToolTip.visible: containsMouse
+                            ToolTip.delay: 600
+                            ToolTip.text: "在 Bangumi 查看"
+                        }
+                    }
                 }
 
                 Text {
