@@ -304,6 +304,85 @@ EXTRA_FILE_PATTERNS = [
 ]
 
 
+# ---- 附加内容（SP / OVA / NCOP / 特典…）识别 ----
+#
+# 这些都不是"正片集数"，而是**附加内容**，各自有独立的编号语义。
+# 常见写法（实测覆盖）：
+#    [DMG][OVERLORD_II][SP05][1080P]...       → 标签 SP05
+#    [DMG][OVERLORD][SP08 END][720P]...       → 标签 SP08
+#    [Group][Show][OVA01][1080p]...           → 标签 OVA01
+#    [Group][Show][OAD2][1080p]...            → 标签 OAD2
+#    [DMG]... NCOP3 [BDRip]...                → 标签 NCOP3
+#    [DMG]... NCED2 [BDRip]...                → 标签 NCED2
+#    [DMG]... WEB予告 #02 [BDRip]...           → 标签 WEB予告 #02
+#    [Group][Show][特典1]...                   → 标签 特典1
+#    [Group][Show][SP][1080p]...              → 无序号，按出现顺序补号
+#
+# **必须在正片解析之前判定**：`SP05` 里的 `05` 会被 `_EP_MID_RE` 命中，
+# 若先走正片分支，SP 会被当成第 5 集与正片撞号。
+_EXTRA_RE = re.compile(
+    r"(?i)(?<![a-z0-9])"
+    r"(?P<kind>"
+    r"SP|OVA|OAD|EX|"                       # 英文缩写
+    r"NC(?:OP|ED)|"                         # NCOP / NCED（无字幕 OP/ED）
+    r"WEB予告|予告|预告|PV|CM|Trailer|Preview|Teaser|"
+    r"特典|映像特典|番外篇|番外|花絮|访谈|菜单|Making|Interview"
+    r")"
+    # 序号与关键词之间可能有分隔符：`SP01`、`SP 01`、`WEB予告 #02`、`特典-1`
+    r"[\s#\-_]*"
+    r"(?P<num>\d{1,3})?"                    # 可选序号（**保留前导零**）
+)
+
+
+def extract_extra_index(name: str) -> Optional[str]:
+    """从文件名提取「附加内容」的显示标签（如 `SP01` / `OVA2` / `NCOP3`）。
+
+    不是附加内容返回 None，交由正片逻辑处理。
+
+    **返回标签而不是数值**（实测需求）：用户要求"文件名写啥就是啥" ——
+    `SP01` 显示成 `SP01`（不抹掉前导零）、`OVA01` 显示成 `OVA01`、
+    `NCOP3` 显示成 `NCOP3`。数值装不下这些前缀，所以这里直接给字符串，
+    由 `episodes.ep_label` 列存储（见 database 的 v8 迁移）。
+
+    无序号时返回**光秃的关键词**（如 `SP`、`特典`），由调用方按出现顺序
+    补号（`SP` → `SP1`、下一个 → `SP2`），避免多个无序号项互相覆盖。
+
+    排序用的数值另由 `extra_sort_index()` 给出（排在正片之后）。
+    """
+    stem = Path(name).stem
+    m = _EXTRA_RE.search(stem)
+    if not m:
+        return None
+    kind = m.group("kind")
+    num = m.group("num")
+    # 关键词统一大写（NCOP/SP/OVA 这类），中文/原文保持原样
+    kind = kind.upper() if kind.isascii() else kind
+    # 标签 = 原关键词 + 原序号（前导零保留）：`SP01`、`WEB予告02`、`特典1`
+    return f"{kind}{num}" if num else kind
+
+
+def extra_sort_index(label: str, pos: int, main_max: float) -> float:
+    """附加内容的**排序用数值**：排在正片之后，且彼此有序。
+
+    参数：
+        label    —— `extract_extra_index` 给出的标签（仅用于日志/调试）
+        pos      —— 该文件在**已排序的附加内容列表**里的位置（1 起）
+        main_max —— 正片的最大 ep_index（附加内容一律排在它之后）
+
+    为什么用 `pos` 而不是标签里的序号：序号在不同类型间会重复
+    （`SP1` 与 `OVA1` 都是 1），用它排序会让两个不同类型的内容撞到
+    同一个槽位、顺序不稳定；`pos` 是列表里的唯一位置，天然有序。
+
+    为什么不用负数（早期实现）：负数会把附加内容排到**正片之前**，
+    而用户的预期是"附加内容在正片下面"（实测反馈）。
+
+    为什么加 1000 的偏置：正片将来可能变多（长篇番 100+ 集），
+    直接把附加内容排在 `main_max + 1` 会与正片撞号；
+    偏置 1000 留足余量，且 1000 以内的附加内容数量足够。
+    """
+    return main_max + 1000 + pos
+
+
 def is_extra_file(name: str) -> bool:
     """文件名是否为附属内容（预告/菜单/NCOP/PV 等），不应参与正片集数编号。
 
@@ -536,11 +615,26 @@ class ScanWorker(QThread):
         accept_gap: int = 20,
         align_by_order: bool = True,
         only_folder: Optional[Path] = None,
+        extra_show: bool = True,
+        extra_numbering: bool = True,
     ) -> None:
         super().__init__()
         self.library_paths = [Path(p) for p in library_paths]
         self.api = api
         self.db = db
+        # 附加内容**是否入库**（设置页「附加内容显示」开关，scanner.extra_show）。
+        #
+        # 关闭时：SP/OVA/NCOP/特典… 既不识别为附加内容、也**不落进兜底桶**
+        # —— 直接从本次扫描里剔除。这样它们既不出现在集数列表里，也不会
+        # 被顺延成「13.5 集」这种假集号（那种做法只是"换个方式显示"，
+        # 依然占着列表位置，用户要的是"彻底不出现"）。
+        # 排序值里的 max_idx 也因此只按正片算 —— 与剔除后的结果一致。
+        self.extra_show = extra_show
+        # 附加内容独立编号（左列显示 `SP01`/`OVA01`/`NCOP3`…，排序排在正片后）。
+        # 关闭时走旧行为：落进兜底桶、在正片之后顺延 13.5/14/14.5…
+        # 见 config.DEFAULTS 的 extra_numbering 说明。
+        # 仅在上面的 extra_show 打开时才有意义（外层关了里面就无从谈起）。
+        self.extra_numbering = extra_numbering
         # 「单个重新扫描」（详情页的按钮）：只处理这一个目录，不遍历媒体库。
         #
         # **为什么复用整个 ScanWorker 而不是另写一条流程**：单扫与全扫
@@ -607,10 +701,26 @@ class ScanWorker(QThread):
                     series_name="",
                 )
                 return
-            # 从目标目录**的一层子目录**开始下探（含目录自身产出的候选）：
-            # 直接把 folder 交给 _walk 会把它当"系列根"，其上级系列名丢失；
-            # 这里按"folder 本身被视为系列根"处理，与全扫时的层级一致。
-            yield from self._walk(folder, series_name="", depth=0)
+            # **推断上级系列名**（实测踩坑）：
+            #
+            # 单扫不能像全扫那样从媒体库根逐层下探，只能"以目标目录为起点"。
+            # 但目标目录本身可能是**季数目录**（典型：`Overlord\S2`），
+            # 此时它的父目录名（`Overlord`）才是系列名。
+            #
+            # 早期这里直接 `_walk(folder, series_name="")`，把 `S2` 当成了
+            # 系列根 —— 于是：
+            #   ① 关键词退化成 `['S2']`（丢掉作品名），搜索出一堆无关/近似
+            #      条目，前二名差距不足而反复转人工（实测日志：
+            #      `[S2] 名称+60 季数一致(2)+40 类型一致+30` → 差距 15）；
+            #   ② `series_name` 存成空串，详情页「同系列」切换失效。
+            #
+            # 判据与 `_walk` 里"向下传递系列名"的第 ① 条一致：目录名像季数
+            # /篇章时，沿用上层系列名。这里没有"上层传下来的 series_name"，
+            # 就用父目录名充当（父目录名不像季数才有意义，否则继续上溯一层）。
+            parent_hint = ""
+            if is_season_like(folder.name, self.season_mode):
+                parent_hint = folder.parent.name
+            yield from self._walk(folder, series_name=parent_hint, depth=0)
             return
 
         for root in self.library_paths:
@@ -719,8 +829,23 @@ class ScanWorker(QThread):
             keywords.append(f"{parent} {current}")
             # ② 仅当前（外传/独立作品）
             keywords.append(current)
-            # ③ 仅父级（兜底）
-            keywords.append(parent)
+            # ③ 仅父级（兜底）—— **仅当"当前"不是纯季数标记时才加**
+            #
+            # 实测踩坑（Overlord 四季合并成一个条目）：目录结构是
+            # `Overlord/S1`、`S2`、`S3`、`S4`，四季各自生成
+            # 「Overlord S1」…「Overlord S4」 + 兜底「Overlord」。
+            # 而 Bangumi 上第一季标题就叫「OVERLORD」（无季数标记）、
+            # 集数又同为 13 —— 兜底候选让它对四个季度都拿最高分，
+            # 四季全部匹配到第一季，再按 bangumi_id 合并成一个 subject
+            # （详情页集数重复 1,1,1,1,2,2…）。
+            #
+            # 判据：`current` 是纯季数标记时（S3 / 第二季 / III…），
+            # 裸父级候选**没有任何区分四季的能力**，留着只会制造撞车。
+            # 真正的兜底作用由 ① 的「父级 + 季数」承担 —— 它搜不到时
+            # 说明该季在 Bangumi 上确实没有独立条目，那也该转人工确认，
+            # 而不是悄悄归到第一季。
+            if not self._is_season_only(current):
+                keywords.append(parent)
         elif parent:
             keywords.append(parent)
             # 打包层提取出的信息若与父级不同，补一个「父级 + 提取值」
@@ -895,15 +1020,43 @@ class ScanWorker(QThread):
                 continue
             ep_map.setdefault(key, e)
 
-        # 三类文件：
-        #   main  —— 正片（有明确集数序号）
-        #   extra —— 附属内容（预告/菜单/NCOP/PV…），序号顺延排在正片之后
-        #   plain —— 既非正片又非附属（无法识别集数的视频），序号顺延排在最后
+        # 四类文件：
+        #   main   —— 正片（有明确集数序号）
+        #   extras —— 附加内容（SP/OVA/NCOP/特典…），带自己的显示标签，
+        #             序号排在正片之后
+        #   extra  —— 未能识别为附加内容、但明显不是正片的（顺延兜底）
+        #   plain  —— 既非正片又非附属（无法识别集数的视频），序号顺延在最后
         main_videos: list[tuple[float, Path]] = []
+        extras_videos: list[tuple[str, Path]] = []      # (显示标签, 文件)
         extra_videos: list[tuple[str, Path]] = []
         plain_videos: list[tuple[str, Path]] = []
         number_matched = False    # 是否有文件按号命中了官方集数表
         for v in cand.video_files:
+            # ⓪ 附加内容整体关闭（设置页「附加内容显示」）：**直接跳过该文件**。
+            #
+            # 必须早于下面所有分支：不能识别成附加内容（①），也不能落到
+            # 「不是正片但像附属」的兜底桶（②）—— 那些兜底同样会把文件
+            # 写进集数列表（只是换个编号），而这里的语义是"完全不要"。
+            #
+            # 代价：这些文件的历史播放记录会因收尾的 prune 一起清理
+            # （重扫时该 subject 下只有本次写入的行存活）。这是"开关关掉
+            # 后集数列表里不再出现任何附加内容"的必然结果。
+            if not self.extra_show:
+                if extract_extra_index(v.name) is not None:
+                    continue
+                if is_extra_file(v.name):
+                    continue
+            # ① 附加内容优先判定：**必须在正片解析之前**
+            #
+            # 原因：`extract_ep_candidates` 对「...SP05...」会命中内部数字
+            # （SP05 里的 05），若先走正片分支，SP 会被当成第 5 集，
+            # 与真正的第 5 集撞号。实测早期版本这些内容干脆解析不出集号、
+            # 落进兜底桶被顺延成「13.5 集」这种假编号（截图反馈）。
+            label = (extract_extra_index(v.name)
+                     if self.extra_numbering else None)
+            if label is not None:
+                extras_videos.append((label, v))
+                continue
             idx = _pick_ep_index(extract_ep_candidates(v.name), ep_map)
             if idx is not None:
                 if idx in ep_map:
@@ -914,6 +1067,45 @@ class ScanWorker(QThread):
             else:
                 plain_videos.append((v.stem, v))
         main_videos.sort(key=lambda x: x[0])
+        # ---- 附加内容：先补号、再排序 ----
+        #
+        # **顺序不能反**（实测踩坑）：先排序的话，无序号项的排序键只能
+        # 取一个哨兵值（如 -1），会排到同类的最前面 —— 补号后变成
+        # `SP4` 却排在 `SP01` 前面，列表看起来是乱的。
+        #
+        # 补号规则：**按关键词分组**（`[SP][SP]` → SP1/SP2；
+        # `[NCOP][SP]` → NCOP1/SP1），从 1 开始往上找第一个空位，
+        # 避免不同类互相占号，也避免与已有的 `SP01`/`SP02` 撞车。
+        if extras_videos:
+            used_by_kind: dict[str, set[int]] = {}
+            for label, _ in extras_videos:
+                m = re.search(r"(\d+)$", label)
+                if m:
+                    kind = re.sub(r"\d+$", "", label)
+                    used_by_kind.setdefault(kind, set()).add(int(m.group(1)))
+            filled_extras: list[tuple[str, Path]] = []
+            for label, v in extras_videos:
+                if re.search(r"\d+$", label):
+                    filled_extras.append((label, v))
+                    continue
+                used = used_by_kind.setdefault(label, set())
+                n = 1
+                while n in used:
+                    n += 1
+                used.add(n)
+                filled_extras.append((f"{label}{n}", v))
+            extras_videos = filled_extras
+
+        # 排序：按（关键词, 序号）—— 先按类型分组（NCOP…、OVA…、SP…），
+        # 同类型内按序号升序。**不能只按序号排**：不同类型会互相交错
+        # （NCOP1/NCOP2/SP01/SP02… 混着显示很难读）。
+        def _extras_sort_key(item: tuple[str, Path]) -> tuple[str, float]:
+            label, _ = item
+            m = re.search(r"(\d+)$", label)
+            return (re.sub(r"\d+$", "", label),
+                    float(m.group(1)) if m else 0.0)
+
+        extras_videos.sort(key=_extras_sort_key)
         # 官方序号与本地编号完全对不上但数量一致 → 按顺序配对并改用官方
         # 序号（Re:零 袭击篇：本地 [01]~[08] vs 官方 51~58，见 _align_by_order）。
         # 受设置页「集数按顺序对应」开关控制（scanner.ep_align_order）：
@@ -931,37 +1123,110 @@ class ScanWorker(QThread):
         max_idx = max((i for i, _ in main_videos), default=0)
         next_extra_idx = max_idx + 0.5
 
+        # 记录本次写入/更新的所有 episodes.id —— 收尾时据此清理陈旧行
+        # （见方法末尾"清理陈旧记录"的说明）。用实例属性而不是局部变量：
+        # 写入分散在下面四个循环里，逐个传参太啰嗦。
+        self._written_episode_ids: set[int] = set()
+
         for idx, v in main_videos:
             bgm = ep_map.get(idx) or {}
-            self.db.upsert_episode(
+            self._written_episode_ids.add(self.db.upsert_episode(
                 subject_id=subject_id,
                 bangumi_ep_id=bgm.get("id"),
                 ep_index=idx,
+                # **必须显式清空 ep_label**（踩坑）：`upsert_episode` 的
+                # `DO UPDATE SET` 只覆盖**传入的列**，没传的列保留旧值 ——
+                # 于是"开关从独立编号切到顺延编号后重扫"时，同一文件的
+                # 旧标签（SP01）会一直留着（实测反馈"关闭后重新扫描，
+                # 依旧存在 SP"）。正片传空串覆盖。
+                ep_label="",
                 title=bgm.get("name_cn") or bgm.get("name") or v.stem,
                 file_path=str(v),
-            )
+            ))
+
+        # ---- 附加内容（SP / OVA / NCOP / 特典…）----
+        #
+        # 三个设计点：
+        #   ① **显示标签**存进 `ep_label`（`SP01`/`OVA01`/`NCOP3`…）——
+        #      用户要求"文件名写啥就是啥"，前导零也保留；
+        #   ② **排序值**排在正片之后（`extra_sort_index`），符合"附加内容
+        #      在正片下面"的直觉（早期用负数排在正片之前，实测反馈要改）；
+        #   ③ **标题**优先取接口数据（`type != 0` 的条目），拿不到用文件名。
+        #      实测 Bangumi 的 /v0/episodes 目前不返回 SP（`type=1` 查询
+        #      返回 0 条、`total` 也不含），所以实际走文件名分支 —— 这段
+        #      映射留着：接口哪天补上，标题自动恢复，不必再改一遍。
+        extra_title_map: dict[float, dict] = {}
+        for e in bgm_eps:
+            try:
+                if int(e.get("type") or 0) == 0:
+                    continue
+                extra_title_map[float(e.get("sort") or e.get("ep"))] = e
+            except (TypeError, ValueError):
+                continue
+
+        # 附加内容的排序值：序号取标签内的数字（`SP01` → 1、`NCOP3` → 3），
+        # 取不到时用累计计数兜底（无序号项已在上面补过号，正常不会走到）。
+        # 注意序号在**不同类型间会重复**（SP1 与 OVA1 都是 1），
+        # 所以排序值再叠加一个"类型内计数"才能保证彼此不撞 —— 用 enumerate
+        # 的全局序号做偏置，天然唯一且保持列表顺序。
+        for pos, (label, v) in enumerate(extras_videos, start=1):
+            m = re.search(r"(\d+)\s*$", label)
+            seq = int(m.group(1)) if m else pos
+            bgm = extra_title_map.get(float(seq)) or {}
+            self._written_episode_ids.add(self.db.upsert_episode(
+                subject_id=subject_id,
+                bangumi_ep_id=bgm.get("id"),
+                ep_index=extra_sort_index(label, pos, max_idx),
+                ep_label=label,
+                title=bgm.get("name_cn") or bgm.get("name") or v.stem,
+                file_path=str(v),
+            ))
 
         # 预告/菜单/NCOP 等：排在正片之后，不占用正片编号
         for title, v in extra_videos:
-            self.db.upsert_episode(
+            self._written_episode_ids.add(self.db.upsert_episode(
                 subject_id=subject_id,
                 bangumi_ep_id=None,
                 ep_index=next_extra_idx,
+                ep_label="",          # 显式清空旧标签（理由见正片分支）
                 title=title,
                 file_path=str(v),
-            )
+            ))
             next_extra_idx += 0.5
 
         # 兜底：其余识别不出含义的视频，继续顺延（避免互相覆盖 file_path）
         for title, v in plain_videos:
-            self.db.upsert_episode(
+            self._written_episode_ids.add(self.db.upsert_episode(
                 subject_id=subject_id,
                 bangumi_ep_id=None,
                 ep_index=next_extra_idx,
+                ep_label="",          # 显式清空旧标签（理由见正片分支）
                 title=title,
                 file_path=str(v),
-            )
+            ))
             next_extra_idx += 0.5
+
+        # ---- 清理陈旧记录（重扫时必须做）----
+        #
+        # `upsert_episode` 以 `file_path` 为唯一键、**只增不改**，所以：
+        #   ① 用户在文件夹里删掉的集，重扫后那一行仍留在库里；
+        #   ② 集数规则变化（如开关从"独立编号"切到"顺延编号"）时，
+        #      同一文件会以新编号再写一行，**旧编号的行成为孤儿** ——
+        #      表现为"关掉开关重扫，SP 还在"（实测反馈）。
+        #
+        # 修法：以**本次扫描实际产生的行 id 集合**为准，删掉该 subject 下
+        # 不在集合里的行。这比"重扫前先清空"更安全：清空会先删掉全部行，
+        # 万一中间失败（网络中断导致提前 return），用户会看到空的集数列表；
+        # 而"先写后删"任何时刻都有一份完整数据。
+        try:
+            alive_ids = self._written_episode_ids
+            if alive_ids:
+                removed = self.db.prune_episodes(subject_id, alive_ids)
+                if removed:
+                    log.info("清理陈旧集数记录 subject_id=%s：%s 条",
+                             subject_id, removed)
+        except Exception as e:  # pragma: no cover - 清理失败不影响集数写入
+            log.warning("清理陈旧集数记录失败 subject_id=%s: %s", subject_id, e)
 
         # 记录「集数是按顺序对应的」这一事实：详情页打开时弹黄色提示
         # 「可能不准确」。每次填充都会重写 —— 下次重扫若按号对上了，

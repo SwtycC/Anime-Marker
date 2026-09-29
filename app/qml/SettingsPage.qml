@@ -260,6 +260,8 @@ Item {
         v["scanner.accept_score"] = acceptScoreField.value
         v["scanner.accept_gap"] = acceptGapField.value
         v["scanner.ep_align_order"] = epAlignOrderBox.checked
+        v["scanner.extra_show"] = extraShowBox.checked
+        v["scanner.extra_numbering"] = extraNumberingBox.checked
         // qBittorrent
         v["qbittorrent.host"] = qbHostField.text.trim() || "127.0.0.1"
         v["qbittorrent.port"] = qbPortField.value
@@ -979,6 +981,57 @@ Item {
                             step: 5
                             width: 140
                         }
+                    }
+                }
+
+                FormRow {
+                    width: parent.width
+                    label: "附加内容显示"
+                    // **最外层的附加内容开关**：关掉后 SP / OVA / NCOP /
+                    // 特典 / 予告… 这些文件在集数列表里**完全消失**
+                    // （不是"换个编号显示"，是整条记录都不写）。
+                    // 见 config.DEFAULTS 的 extra_show 与 ScanWorker 的说明。
+                    // 它同时是下面「附加内容独立编号」的**前提** ——
+                    // 关闭时那一行会置灰（见 extraNumberingBox 的 enabled）。
+                    hint: "关闭后 SP / OVA / NCOP / 特典等附加内容不显示在集数列表里"
+                    CheckBoxLine {
+                        id: extraShowBox
+                        objectName: "extraShowBox"
+                        checked: root.getBool("scanner.extra_show", true)
+                        text: "启用（关闭后附加内容完全不显示，仅保留正片）"
+                        // 关闭时联动置灰下面的编号开关（见该行说明）
+                        onToggled: function (checked) {
+                            root.setValue("scanner.extra_show", checked)
+                        }
+                    }
+                }
+
+                FormRow {
+                    width: parent.width
+                    label: "附加内容独立编号"
+                    // Bangumi 的集数接口只返回正片（实测 type=1 的 SP 返回
+                    // 0 条），所以 SP/OVA/NCOP 这类附加内容拿不到官方标题、
+                    // 只能用文件名。但至少给它们**正确的显示标签**：
+                    // 文件名写 `SP01` 就显示 `SP01`、写 `OVA01` 就显示
+                    // `OVA01`（前导零也保留），并排在正片之后。
+                    // 早期它们完全不被识别，落进兜底桶被顺延成「13.5 集」
+                    // 这种假集号，与正片混在同一序列里。
+                    hint: "SP/OVA/NCOP/特典等按文件名显示（SP01、OVA01…），排在正片之后"
+                    CheckBoxLine {
+                        id: extraNumberingBox
+                        objectName: "extraNumberingBox"
+                        checked: root.getBool("scanner.extra_numbering", true)
+                        // **联动置灰**：上面的「附加内容显示」一关，附加内容
+                        // 根本不会入库，这里选"怎么编号"就没意义了，因此
+                        // 禁用（CheckBoxLine 内部会整体降透明度 + 关掉鼠标
+                        // 事件，见其 `enabled` 处理）。值本身保留，等外层
+                        // 重新打开时原样恢复。
+                        //
+                        // 绑定读的是 `extraShowBox.checked`（控件当前状态）
+                        // 而不是 root.cfg 里的值：用户改了还没点保存时，
+                        // 置灰也应当立刻跟着变。
+                        enabled: extraShowBox.checked
+                        text: "启用（关闭后附加内容在正片之后顺延编号）"
                     }
                 }
 

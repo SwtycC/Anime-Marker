@@ -20,7 +20,7 @@ from app.utils.paths import database_path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS episodes (
     file_path      TEXT UNIQUE,
     watched        INTEGER DEFAULT 0,
     watch_progress REAL DEFAULT 0,
-    watched_at     TEXT
+    watched_at     TEXT,
+    ep_label       TEXT                      -- 非正片的显示标签（SP01/OVA01/NCOP3…）
 );
 
 CREATE INDEX IF NOT EXISTS idx_episodes_subject ON episodes(subject_id);
@@ -221,6 +222,9 @@ class Episode:
     watched: bool
     watch_progress: float
     watched_at: str
+    # 非正片的显示标签（`SP01` / `OVA01` / `NCOP3` / `WEB予告 #01`…）。
+    # 正片为空串。带默认值：旧库该列为 NULL，`Episode(**dict(row))` 也能对上。
+    ep_label: str = ""
 
 
 @dataclass
@@ -389,6 +393,20 @@ class Database:
         if "ep_align" not in cols:
             log.info("迁移：subjects 增加 ep_align 列")
             self._conn.execute("ALTER TABLE subjects ADD COLUMN ep_align TEXT")
+        # v8：episodes 新增 ep_label（非正片的显示标签）。
+        #
+        # 用途：SP / OVA / NCOP / 特典 这类"附加内容"的序号是**字符串**语义
+        # （`SP01`、`OVA01`、`NCOP3`），而 `ep_index` 是 REAL 装不下前缀。
+        # 早期把它们顺延成 13.5 / 14 这种假集号（实测截图），既与正片混淆、
+        # 也显示成"第 13.5 集"。现在用 ep_index 只负责排序，
+        # ep_label 负责显示（见 scanner._fill_episodes 与 DetailPage.fmtIndex）。
+        # 旧库该列为 NULL —— 老数据没有标签，QML 侧回落到数值显示，无降级问题。
+        ep_cols = {
+            r["name"] for r in self._conn.execute("PRAGMA table_info(episodes)")
+        }
+        if "ep_label" not in ep_cols:
+            log.info("迁移：episodes 增加 ep_label 列")
+            self._conn.execute("ALTER TABLE episodes ADD COLUMN ep_label TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -724,6 +742,31 @@ class Database:
     def clear_subject_episodes(self, subject_id: int) -> None:
         with self._cursor() as cur:
             cur.execute("DELETE FROM episodes WHERE subject_id=?", (subject_id,))
+
+    def prune_episodes(self, subject_id: int, keep_ids: set[int]) -> int:
+        """删除该条目下**不在 `keep_ids` 里**的集数记录，返回删除条数。
+
+        用途：重扫后清理陈旧行（见 scanner._fill_episodes 末尾的说明）。
+        `upsert_episode` 以 file_path 为唯一键、只增不改，因此：
+          - 用户删掉的集，重扫不会消失；
+          - 集数规则变化（开关切换）时旧编号的行会变成孤儿。
+        两者都会让详情页出现"已经不存在/重复的集"。
+
+        注意保留 `watched` 数据：这里删的是"本次扫描未产生"的行 ——
+        它们对应的文件已经不在磁盘上了，观看记录没有保留意义。
+
+        `keep_ids` 为空时**直接返回 0**（不做任何删除）：那意味着本次扫描
+        没产出任何集数（如目录暂时不可访问），删光会造成数据丢失。
+        """
+        if not keep_ids:
+            return 0
+        marks = ",".join("?" for _ in keep_ids)
+        with self._cursor() as cur:
+            cur.execute(
+                f"DELETE FROM episodes WHERE subject_id=? AND id NOT IN ({marks})",
+                [subject_id, *keep_ids],
+            )
+            return int(cur.rowcount)
 
     def find_subject_by_bangumi_id(self, bangumi_id: int) -> Optional[int]:
         """按 Bangumi ID 查本地 subject 主键（F18 本地关联）。"""

@@ -838,15 +838,21 @@ Item {
 
                                     Text {
                                         anchors.verticalCenter: parent.verticalCenter
-                                        width: 46
-                                        text: root.fmtIndex(modelData.epIndex)
+                                        // 76：整数集最多 3 位（"999"）本不需要
+                                        // 这么宽，但附加内容的标签可能较长
+                                        // （"WEB予告 #02"、"映像特典1"）。
+                                        // 用固定宽度而不是自适应，是为了让所有
+                                        // 行的标题左边界对齐（列表更整齐）。
+                                        width: 76
+                                        text: root.fmtIndex(modelData)
                                         color: Theme.textTertiary
                                         font.pixelSize: Theme.fontSm
+                                        wrapMode: Text.NoWrap
                                     }
 
                                     Text {
                                         anchors.verticalCenter: parent.verticalCenter
-                                        width: parent.width - 46 - markLabel.width
+                                        width: parent.width - 76 - markLabel.width
                                                - Theme.spacingMd * 3
                                         text: modelData.title
                                         color: modelData.watched
@@ -928,8 +934,18 @@ Item {
         return parts.join(" · ")
     }
 
-    function fmtIndex(v) {
-        // 12 → "12"，12.5 → "12.5"（去掉多余的 .0）
+    /// 集数左列显示文本。
+    ///
+    /// **优先用 `epLabel`**（非正片的显示标签）：SP / OVA / NCOP 这类附加
+    /// 内容的 `epIndex` 只是"排在正片之后"的排序值（main_max+1000+n），
+    /// 显示出来会变成「SP 是第 1013 集」这种莫名其妙的东西。
+    /// 标签由后端从文件名原样提取（`SP01` 就是 `SP01`，前导零保留）。
+    ///
+    /// 没有标签时按正片处理：直接显示序号（12 → "12"、12.5 → "12.5"）。
+    function fmtIndex(item) {
+        if (item && item.epLabel)
+            return item.epLabel
+        var v = item && item.epIndex !== undefined ? item.epIndex : item
         return (Math.round(v * 100) / 100).toString()
     }
 

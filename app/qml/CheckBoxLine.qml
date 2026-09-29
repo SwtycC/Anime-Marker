@@ -20,6 +20,20 @@ Item {
     property string text: ""
     property bool checked: false
 
+    // 禁用态：整体降透明度 + 不再响应鼠标。
+    //
+    // 用途：**联动置灰** —— 如设置页「附加内容独立编号」在「附加内容显示」
+    // 关闭时无效（外层关了，编号方式无从谈起），此时要把这一行灰掉，
+    // 而不是留一个"点得动却没效果"的开关。
+    //
+    // 两个细节：
+    //   ① 透明度加在组件**根项**上：本组件在 FormRow 里被拉伸到整行宽，
+    //      但透明是逐像素的，视觉范围仍只有"轨道 + 文字"那块；
+    //   ② MouseArea 要显式 `enabled: root.enabled` —— 只设 opacity 的话
+    //      MouseArea 照旧吃事件、开关照样能拨（"看起来灰、点得动"）。
+    opacity: enabled ? 1.0 : 0.45
+    Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
+
     signal toggled(bool checked)
 
     /// 触发一次"高亮闪烁"（供外部定位提示用，如设置页的 revealField）。
@@ -140,6 +154,9 @@ Item {
         id: trackMouse
         anchors.fill: parent
         hoverEnabled: true
+        // 禁用时**必须显式关掉**（见根项 opacity 处的说明）：否则只是
+        // "看起来灰"，鼠标移上去仍有悬停高亮、点击仍会翻转 checked。
+        enabled: root.enabled
         cursorShape: Qt.PointingHandCursor
         onClicked: {
             root.checked = !root.checked

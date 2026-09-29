@@ -66,6 +66,8 @@ class ScannerBridge(QObject):
         self._pending = 0
         # 扫描完成后由 QmlApp 注入的回调（用于刷新 LibraryBridge）
         self._on_finished_hook = None
+        # 本次扫描是否为「单条目重扫」（决定完成后要不要发起在看/动态同步）
+        self._single_scan = False
 
     def set_api(self, api: BangumiClient) -> None:
         self._api = api
@@ -150,6 +152,13 @@ class ScannerBridge(QObject):
             # 时现读 —— 设置页保存后下一次扫描即生效，无需重启。
             align_by_order=self._config.getbool(
                 "scanner", "ep_align_order", True),
+            # 「附加内容显示」开关（同上，启动扫描时现读）：关闭后 SP/OVA/
+            # NCOP… 完全不进集数列表（见 ScanWorker.extra_show 的说明）
+            extra_show=self._config.getbool(
+                "scanner", "extra_show", True),
+            # 「附加内容独立编号」开关（同上，启动扫描时现读）
+            extra_numbering=self._config.getbool(
+                "scanner", "extra_numbering", True),
         )
         worker.progress_changed.connect(self._on_progress)
         worker.item_matched.connect(self._on_matched)
@@ -158,6 +167,8 @@ class ScannerBridge(QObject):
         worker.failed.connect(self._on_failed)
 
         self._worker = worker
+        # 全量扫描：允许完成回调发起「在看/动态」同步（见 _on_ok）
+        self._single_scan = False
         self._set_running(True)
         worker.start()
         log.info("扫描已启动，媒体库：%s", self._config.library_paths)
@@ -210,6 +221,10 @@ class ScannerBridge(QObject):
             align_by_order=self._config.getbool(
                 "scanner", "ep_align_order", True),
             only_folder=Path(folder),
+            extra_show=self._config.getbool(
+                "scanner", "extra_show", True),
+            extra_numbering=self._config.getbool(
+                "scanner", "extra_numbering", True),
         )
         worker.progress_changed.connect(self._on_progress)
         worker.item_matched.connect(self._on_matched)
@@ -218,6 +233,9 @@ class ScannerBridge(QObject):
         worker.failed.connect(self._on_failed)
 
         self._worker = worker
+        # 标记为单条目扫描：完成回调据此决定**不发起**「在看/动态」同步
+        # （见 _on_ok 的说明）。
+        self._single_scan = True
         self._set_running(True)
         worker.start()
         log.info("单条目扫描已启动：subject_id=%s（%s）", subject_id, folder)

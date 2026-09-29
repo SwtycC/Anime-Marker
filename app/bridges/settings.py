@@ -37,6 +37,7 @@ ALLOWED_KEYS = {
     "monitor.poll_interval", "monitor.trigger_threshold", "monitor.title_regex",
     # 扫描与匹配
     "scanner.accept_score", "scanner.accept_gap", "scanner.ep_align_order",
+    "scanner.extra_show", "scanner.extra_numbering",
     # qBittorrent
     "qbittorrent.host", "qbittorrent.port", "qbittorrent.username",
     "qbittorrent.password", "qbittorrent.category", "qbittorrent.save_path",
@@ -68,6 +69,8 @@ FALLBACKS: dict[str, str] = {
     "scanner.accept_score": "60",
     "scanner.accept_gap": "30",
     "scanner.ep_align_order": "true",
+    "scanner.extra_show": "true",
+    "scanner.extra_numbering": "true",
     "qbittorrent.host": "127.0.0.1",
     "qbittorrent.port": "8080",
     "qbittorrent.username": "admin",

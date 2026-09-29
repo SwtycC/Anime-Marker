@@ -176,13 +176,23 @@ class QmlApp:
         "无法确定 Bangumi 用户名"）。扫到那一步只是白跑一趟、并在状态栏
         留下一条看不懂的报错 —— 用户此时该看到的是"去设置里填 Token"，
         而不是一条网络失败。海报墙不受影响（纯本地）。
+
+        **单条目重扫也跳过**（实测反馈）：详情页「重新扫描」只刷新一个
+        条目的元数据，与收藏列表毫无关系 —— 却要为此拉 175 条收藏 + 几十条
+        集级记录、耗时数秒，纯属浪费（用户点"重新扫描这一部"，不该看到
+        整个在看列表被重拉一遍）。单条目扫描的正确收尾只是重取该条目的
+        集数，那由 QML 侧的 `onFinished` 处理。
         """
         self.library_bridge.reload()
+
+        if getattr(self.scanner_bridge, "_single_scan", False):
+            log.info("单条目扫描完成，跳过「在看 / 动态」同步（与收藏列表无关）")
+            return
 
         token = (self.config.bangumi_token or "").strip()
         if not token:
             log.info("未配置 Bangumi Token，跳过「在看 / 动态」同步"
-                     "（海报墙已刷新；如需同步请在设置里填写 Token）")
+                     "（海报墙已刷新；如需同步请在设置里填 Token）")
             return
         try:
             self.inprogress_bridge.refresh()

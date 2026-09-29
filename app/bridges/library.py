@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from collections import OrderedDict
 from pathlib import Path
@@ -27,6 +28,8 @@ from PySide6.QtWidgets import QFileDialog
 
 from app.core.bangumi_api import COLLECT_TYPE_DOING, is_studio_name
 from app.core.database import Database, Episode, Subject
+# 同系列排序用：把「第X季 / S1 / II」统一解析成季数（见 series_siblings）
+from app.core.matcher import extract_season
 from app.utils.cover_cache import cover_path_for, known_cover_files
 from app.utils.cover_cache import download as download_cover
 from app.utils.paths import covers_dir
@@ -36,6 +39,39 @@ log = logging.getLogger(__name__)
 # 多季展示模式
 DISPLAY_FLAT = "flat"
 DISPLAY_GROUPED = "grouped"
+
+
+# 放送日期 tag 的形状：Bangumi 会给每个条目打一个「2015年7月」这样的 tag。
+# 兼容几种变体：`2015年7月` / `2015年7月番` / `2015-07` / `2015/07`
+_AIR_DATE_RE = re.compile(
+    r"(?<!\d)(\d{4})\s*[年\-/]\s*(\d{1,2})\s*月?")
+
+
+def _air_date_key(tags: list[str]) -> Optional[int]:
+    """从 tag 列表里提取放送日期，返回**可比较的整数** `YYYYMM`。
+
+    用途：同系列排序（见 `LibraryBridge.series_siblings`）。
+    返回 None 表示这些 tag 里没有日期信息。
+
+    **为什么要单独抽出来**：日期 tag 混在题材/公司等一堆 tag 里，位置不定
+    （实测 OVERLORD 第一季的「2015年7月」排在第 5 位、第四季排在第 2 位），
+    必须逐个匹配而不是只看某个固定位置。
+
+    只取**最早**的那个：个别条目会同时带「2022年7月」与「2022年」这类
+    年月不全的 tag，取最小月份组合最稳（年份相同、月份小的更接近真实首播）。
+    """
+    best: Optional[int] = None
+    for t in tags or []:
+        m = _AIR_DATE_RE.search(str(t))
+        if not m:
+            continue
+        year, month = int(m.group(1)), int(m.group(2))
+        if not (1900 <= year <= 2200 and 1 <= month <= 12):
+            continue
+        key = year * 100 + month
+        if best is None or key < best:
+            best = key
+    return best
 
 
 def as_file_url(path: str) -> str:
@@ -616,17 +652,53 @@ class LibraryBridge(QObject):
 
     @Slot(int, result="QVariantList")
     def series_siblings(self, subject_id: int) -> list[dict]:
-        """同系列的其他季（详情页「同系列」切换用）。"""
+        """同系列的其他季（详情页「同系列」切换用），按**放送时间**升序。
+
+        **排序演进（两次实测反馈）**：
+          ① 最初直接返回 `list_subjects()` 的顺序（`ORDER BY name_cn, name`
+             的字典序），而季数标记是中文数字 ——「第三季」「第二季」「第四季」
+             排出来就是三、二、四这种乱序。
+          ② 改为按 `extract_season(标题)` 排序后，带季数的正常了，但**第一季
+             仍排在最后** —— 因为它的标题就叫「OVERLORD」、没有任何季数标记，
+             提取不出数字，只能垫底。
+
+        最终方案：**以 tag 里的放送日期为主键**。
+        Bangumi 会给每个条目打一个形如「2015年7月」的 tag（实测 100% 存在，
+        且格式统一），它是"第几季"的**客观依据** —— 第一季的日期一定最早，
+        不依赖标题里有没有写季数。取不到日期时才回退到季数，再兜底字典序。
+
+        排序键 = (有无日期, 日期, 有无季数, 季数, 标题)，逐级兜底：
+          - 有日期的排前面，按日期升序（最早的季在最前）
+          - 无日期但有季数的次之
+          - 两者都没有的（剧场版/OVA/外传）排最后，按名称保持稳定
+        """
         try:
             cur = self._db.get_subject(subject_id)
             if cur is None or not (cur.series_name or "").strip():
                 return []
             series = cur.series_name.strip()
-            return [
-                self._subject_to_dict(s)
-                for s in self._db.list_subjects()
+            siblings = [
+                s for s in self._db.list_subjects()
                 if (s.series_name or "").strip() == series and s.id != subject_id
             ]
+            # 一次取全量 tag（海报墙也在用这个接口，避免逐条查库）
+            tags_map = self._db.all_subject_tags()
+
+            def sort_key(s) -> tuple:
+                title = s.name_cn or s.name or ""
+                tags = tags_map.get(s.id) or []
+                date_key = _air_date_key(tags)
+                season = extract_season(title, "all")
+                return (
+                    0 if date_key is not None else 1,
+                    date_key if date_key is not None else 0,
+                    0 if season is not None else 1,
+                    float(season) if season is not None else 0.0,
+                    title,
+                )
+
+            siblings.sort(key=sort_key)
+            return [self._subject_to_dict(s) for s in siblings]
         except Exception as e:
             log.exception("读取同系列失败: %s", e)
             return []
@@ -1117,6 +1189,11 @@ class LibraryBridge(QObject):
             "id": e.id,
             "subjectId": e.subject_id,
             "epIndex": float(e.ep_index or 0),
+            # 非正片的显示标签（`SP01`/`OVA01`/`NCOP3`/`WEB予告 #02`…）。
+            # 非空时 QML 侧直接显示它，**不显示 epIndex** —— 因为附加内容的
+            # 排序值（main_max + 1000 + n）只是给排序用的，"SP 显示成 1013"
+            # 毫无意义。正片该字段为空串，QML 侧照旧显示数字。
+            "epLabel": e.ep_label or "",
             "title": e.title or "",
             "filePath": e.file_path or "",
             "watched": bool(e.watched),

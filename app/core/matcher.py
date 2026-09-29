@@ -55,12 +55,9 @@ ACCEPT_GAP = 30
 # 但实测有害——同一部作品会被多个候选搜到，加分会让"脏关键词"胜出、
 # 反而把正确的短关键词（如纯中文名）压下去，且抬高二三名分数触发 gap 拦截。
 # 现改为：同一 Bangumi 条目取最高分；候选顺序仅在完全同分时决定。
-
-# 候选关键词的优先级加成：靠前的候选更可信，给予分数加成。
-# 目的：避免「父级名」这类宽泛候选（排在第 3 位）反超「父级+当前」的精确候选。
-# 例：苍海之泪篇的候选 ③「史莱姆这档事」会让 TV 条目得 130 分，
-#     超过剧场版的 110 分；加优先级加成后 ① 的 110+30 > ③ 的 130。
-KEYWORD_PRIORITY_BONUS = [30, 15, 0, 0, 0]
+#
+# （那个常量的定义已删除：它在移除该机制时被漏掉，成了从未被引用的死代码，
+#   2026-09 排查 Overlord 季数问题时发现并清理。）
 
 # Bangumi 条目类型
 SUBJECT_TYPE_ANIME = 2
@@ -371,25 +368,55 @@ def score_subject(
     if best_name_score <= 0:
         return SCORE_IRRELEVANT, f"名称不相关（{name_cn or name}）"
 
-    if best_name_score:
-        suffix = f"（{best_reason}）" if best_reason else ""
-        reasons.append(f"名称+{best_name_score}{suffix}")
-
-    score += best_name_score
-
-    # ---- 季数一致性（明确不符 → 一票否决）----
+    # ---- 季数一致性（明确不符 → 一票否决；无标记 → 降级）----
+    #
+    # 这一段**必须在 `score += best_name_score` 之前**：它会按季数情况
+    # 调整 best_name_score（降级）或直接否决，先加分就改不动了。
     if keyword_season is not None:
         subject_season = extract_season(name_cn or name, season_mode)
-        if subject_season == keyword_season:
-            score += SCORE_SEASON_MATCH
-            reasons.append(f"季数一致({keyword_season})+{SCORE_SEASON_MATCH}")
-        elif subject_season is not None:
+        if subject_season is not None and subject_season != keyword_season:
             # 季数明确不同：直接否决。季数是硬条件，
             # 「第一季」匹配到「第二季」属于错误结果，不应靠其他项补救。
             return (
                 SCORE_IRRELEVANT,
                 f"季数不符（条目={subject_season}，期望={keyword_season}）",
             )
+        if subject_season is None and best_name_score > SCORE_CONTAIN:
+            # **关键词带季数、候选却不带任何季数标记 → 名称分降级**
+            # （实测踩坑：OVERLORD 四季被合并成一个条目）。
+            #
+            # 场景：目录 S1~S4 的关键词分别是「Overlord S1」…「Overlord S4」，
+            # 而 Bangumi 上第一季的标题就叫「OVERLORD」（**不含任何季数
+            # 标记**）且集数同为 13 —— 于是它对**每一个**关键词都拿到
+            # 「名称完全一致 100 + 类型 30 + 集数接近 20 = 150」的最高分，
+            # 四季全部匹配到它（`search_best` 是跨所有关键词取最高分），
+            # `upsert_subject` 再按 bangumi_id 合并，最终四季文件堆在同一
+            # subject 下（详情页集数重复 1,1,1,1,2,2…）。
+            #
+            # 判据：关键词明确说了"要第 N 季"，一个没有季数标记的条目
+            # **无法证明自己是第 N 季** —— 它可能是第一季，也可能是总集篇。
+            # 因此不能给"名称完全一致"的满分：降一档到 `SCORE_CONTAIN`，
+            # 让真正标了季数的条目（「OVERLORD 第二季」145 分）胜出。
+            #
+            # 保守之处：**只降级、不否决**。无季数标记的条目仍可能以较低分
+            # 胜出 —— 当官方库里确实没有带季数的对应条目时这是对的
+            # （例如只有一季的番，目录名却写了「S1」）。
+            reasons.append(
+                f"无季数标记，名称分 {best_name_score}→{SCORE_CONTAIN}"
+                f"(关键词要求第{keyword_season}季)")
+            best_name_score = SCORE_CONTAIN
+
+    if best_name_score:
+        suffix = f"（{best_reason}）" if best_reason else ""
+        reasons.append(f"名称+{best_name_score}{suffix}")
+
+    score += best_name_score
+
+    # 季数一致的加分（上一段已处理"不符"与"无标记"两种情况）
+    if keyword_season is not None:
+        if extract_season(name_cn or name, season_mode) == keyword_season:
+            score += SCORE_SEASON_MATCH
+            reasons.append(f"季数一致({keyword_season})+{SCORE_SEASON_MATCH}")
 
     # 类型一致性：关键词像剧场版，条目也该像
     kw_movie = is_movie_like(keyword)

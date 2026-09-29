@@ -27,7 +27,11 @@ Item {
 
     property string label: ""
     property string hint: ""
-    property int labelWidth: 132
+    // 150（原 132）：要容下最长的标签「附加内容独立编号」——
+    // 7 个中文字约 98px + 右侧 `?` 按钮 20px + 间距，132 会把文字截成
+    // 「附加内容独立...」（实测截图反馈）。所有行共用此宽度，
+    // 因此输入框左边缘仍然对齐。
+    property int labelWidth: 150
     property int rowSpacing: Theme.spacingLg
 
     /// `?` 钮被点击时**额外**要执行的动作（可选）。
