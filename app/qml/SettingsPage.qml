@@ -161,6 +161,9 @@ Item {
             w.currentValue = String(value)
         } else if (tn.indexOf("CheckBoxLine") >= 0) {
             w.checked = (value === true || value === "true")
+        } else if (tn.indexOf("ShortcutRecorder") >= 0) {
+            // 录制组件没有 text 属性，写 value（诊断脚本用它模拟"手打"）
+            w.value = String(value)
         } else {
             w.text = String(value)
         }
@@ -248,8 +251,10 @@ Item {
         v["general.ls_path"] = lsField.text.trim()
         // 启动器
         v["launcher.enable_ls"] = enableLsBox.checked
-        v["launcher.ls_shortcut"] = lsShortcutField.text.trim()
-        v["launcher.fullscreen_shortcut"] = fullscreenShortcutField.text.trim()
+        // 录制组件暴露的属性名是 `value`（不是 `text`）——
+        // 录制结果已是规范格式（小写、+ 连接），只需去掉首尾空白
+        v["launcher.ls_shortcut"] = lsShortcutField.value.trim()
+        v["launcher.fullscreen_shortcut"] = fullscreenShortcutField.value.trim()
         v["launcher.fullscreen_settle"] = fullscreenSettleField.value
         // 监控
         v["monitor.poll_interval"] = pollIntervalField.value
@@ -848,26 +853,68 @@ Item {
                 FormRow {
                     width: parent.width
                     label: "插帧快捷键"
-                    AppTextField {
+                    // 说明走 FormRow 内置的 `?` 弹窗（与相邻各行同一交互）
+                    hint: "起播后要发给小黄鸭（Lossless Scaling）的「缩放开关」快捷键。\n\n"
+                          + "怎么填：\n"
+                          + "点一下输入框，然后直接在键盘上按出组合键即可，不用手打。"
+                          + "按下最后一个键就自动完成；按 Esc 取消。\n\n"
+                          + "要按成什么：\n"
+                          + "必须与小黄鸭里的绑定一致 —— 打开小黄鸭 →「设置」"
+                          + "→ 快捷键 →「缩放」，看它绑的是哪组键，这里就按哪组。"
+                          + "各版本默认值不同，以你机器上的为准。\n\n"
+                          + "推荐组合：\n"
+                          + "尽量用组合键（两个以上键同时按），并避开常用软件的"
+                          + "全局热键。例如 ctrl+alt+p 实测可用。\n\n"
+                          + "不要用的键：\n"
+                          + "ctrl+alt+l —— 那是 QQ 的「锁定 QQ」全局热键，"
+                          + "会被 QQ 抢先注册，小黄鸭也注册不上"
+                          + "（实测触发过一次 QQ 自我锁定）。\n\n"
+                          + "小提示：\n"
+                          + "应用会先按「全屏快捷键」、再等「全屏后等待」，"
+                          + "最后才发这个键 —— 顺序反了捕获会失效，"
+                          + "详见「全屏后等待」那一行的说明。"
+                    // 快捷键用**按键录制**而不是手打：这两个值会被原样交给
+                    // keyboard / pyautogui 发送，手打的大小写、空格、分隔符、
+                    // enter/return 任一不一致都会"发出去却收不到"，
+                    // 而现象只有"按了没反应"，极难排查。见 ShortcutRecorder.qml。
+                    ShortcutRecorder {
                         id: lsShortcutField
                         objectName: "lsShortcutField"
-                        text: root.getValue("launcher.ls_shortcut", "")
+                        value: root.getValue("launcher.ls_shortcut", "")
                         width: parent.width
-                        // 占位符与 DEFAULTS 保持一致：ctrl+alt+l 会和 QQ 的
-                        // 「锁定 QQ」全局热键冲突（会被 QQ 抢先注册）
-                        placeholder: "ctrl+alt+p"
+                        placeholder: "点击后按下组合键"
                     }
                 }
 
                 FormRow {
                     width: parent.width
                     label: "全屏快捷键"
-                    AppTextField {
+                    // 说明走 FormRow 内置的 `?` 弹窗
+                    hint: "播放前把 PotPlayer 切成真全屏用的快捷键。\n\n"
+                          + "为什么必须全屏：\n"
+                          + "小黄鸭的捕获按「捕获那一刻的窗口尺寸」出画 —— 窗口化"
+                          + "会出现黑边、最大化会帧数极不稳定，只有真全屏"
+                          + "（覆盖任务栏）才能拿到正常帧数。\n\n"
+                          + "怎么填：\n"
+                          + "点一下输入框，然后直接在键盘上按出组合键即可，不用手打。"
+                          + "按下最后一个键就自动完成；按 Esc 取消。\n\n"
+                          + "要按成什么：\n"
+                          + "PotPlayer 默认是 alt+enter。若你改过，按 F5 →「基本」"
+                          + "→「快捷键」里搜「全屏」，看它绑的是哪组键，"
+                          + "这里就按哪组 —— 不一致的话按了没反应，"
+                          + "表现为「插帧一直不开」。\n\n"
+                          + "触发顺序：\n"
+                          + "① 启动 PotPlayer 并开始播放\n"
+                          + "② 按「全屏快捷键」\n"
+                          + "③ 等「全屏后等待」秒\n"
+                          + "④ 按「插帧快捷键」\n"
+                          + "第 ③ 步存在的原因见「全屏后等待」那一行的说明。"
+                    ShortcutRecorder {
                         id: fullscreenShortcutField
                         objectName: "fullscreenShortcutField"
-                        text: root.getValue("launcher.fullscreen_shortcut", "")
+                        value: root.getValue("launcher.fullscreen_shortcut", "")
                         width: parent.width
-                        placeholder: "alt+enter"
+                        placeholder: "点击后按下组合键"
                     }
                 }
 
@@ -876,20 +923,16 @@ Item {
                     label: "全屏后等待"
                     // 用 FormRow 内置的 `?` 弹窗（见 FormRow 的说明），
                     // 不再手写 HelpButton + 负偏移 + 外置 Dialog。
-                    hint: "为什么播放前要先全屏？\n\n"
-                          + "小黄鸭的捕获按「捕获那一刻的窗口尺寸」出画："
-                          + "窗口化会出现黑边、最大化会帧数不稳，只有真全屏才正常。"
-                          + "所以播放前会先按「全屏快捷键」把 PotPlayer 切到全屏。"
-                          + "若你在 PotPlayer 里改过全屏键（F5 → 基本 → 快捷键"
-                          + " 里搜「全屏」），这里要填成一致的值。\n\n"
-                          + "「全屏后等待」是做什么的？\n\n"
+                    hint: "「全屏后等待」是做什么的？\n\n"
                           + "PotPlayer 达到全屏尺寸后，可能仍在切换渲染模式。"
                           + "此时过早就发送插帧快捷键，小黄鸭虽然当场抓到了窗口，"
                           + "但随后的渲染模式切换会让捕获失效 —— "
                           + "表现为「全屏后右上角有帧数，一开始播放就没了」。\n\n"
                           + "这个等待就是为了让渲染模式切换完成后再发插帧键。"
                           + "实测 1 秒不够、3 秒稳定，故默认 3 秒；"
-                          + "机器较慢或播放器启动慢时可调大。"
+                          + "机器较慢或播放器启动慢时可调大。\n\n"
+                          + "「为什么必须先全屏」「怎么核对播放器的全屏键」"
+                          + "见「全屏快捷键」那一行的说明。"
                     NumberStepper {
                         id: fullscreenSettleField
                         objectName: "fullscreenSettleField"

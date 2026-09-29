@@ -19,6 +19,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 from PySide6.QtWidgets import QFileDialog, QWidget
 
 from app.core.config import Config
+from app.utils import hotkey
 
 log = logging.getLogger(__name__)
 
@@ -184,6 +185,26 @@ class SettingsBridge(QObject):
         """QML 点「保存并扫描」时调用，交由 QmlApp 触发扫描。"""
         self.scanRequested.emit()
         return True
+
+    # ---------- 快捷键占用检测 ----------
+    @Slot(str, result="QVariant")
+    def hotkeyAvailable(self, shortcut: str) -> Any:
+        """检测快捷键是否未被其他软件占用。
+
+        **为什么要暴露给 QML**（实测踩坑）：`ctrl+alt+p` 被别的软件
+        （实测本机被占用）注册为全局热键后，Windows 会在按键到达窗口前
+        就拦掉 —— 用户录制时按下去毫无反应，而换成 `ctrl+alt+i` 立刻正常。
+        这类问题在 QML 里无从修复，只能**录完当场提示**，否则用户只会
+        看到"按了没反应"并反复重试。
+
+        返回三态（QML 侧对应 true / false / null）：
+             true  —— 空闲
+             false —— 已被占用（应提示换一个）
+             null  —— 无法判断（非 Windows / 组合无法解析），此时**不提示**，
+                      避免误报吓到用户
+        见 app/utils/hotkey.py 的说明。
+        """
+        return hotkey.is_available(shortcut)
 
     # ---------- 文件选择 ----------
     @Slot(str, result=str)
