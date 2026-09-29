@@ -707,6 +707,46 @@ class _UploadWorker(QThread):
         self.finished_upload.emit(ok, fail, uploaded)
 
 
+class _ResolveUserWorker(QThread):
+    """后台解析 Token 对应的 username（设置页「检测」按钮）。
+
+    独立成 QThread 的理由见 `InProgressBridge.resolveUsername` 的说明：
+    同步调用会把网络超时压在 UI 线程上，导致界面卡死。
+    """
+
+    # (ok, username, nickname, message)
+    done = Signal(bool, str, str, str)
+
+    def __init__(self, api: BangumiClient, parent=None) -> None:
+        super().__init__(parent)
+        self._api = api
+
+    def run(self) -> None:
+        try:
+            me = self._api.get_me()
+        except Exception as e:
+            log.warning("检测用户名失败: %s", e)
+            self.done.emit(False, "", "", f"请求失败：{e}")
+            return
+        if not me:
+            # get_me 内部已按 401/403 与网络失败分类记了日志；
+            # 这里给出面向用户的统一文案（Timeout 场景下文案会略偏，
+            # 但日志里有准确原因）
+            self.done.emit(False, "", "",
+                           "无法获取用户信息（Token 无效，或网络不通/需配置代理）")
+            return
+        username = (me.get("username") or "").strip()
+        nickname = me.get("nickname") or ""
+        if not username:
+            self.done.emit(False, "", nickname, "Token 对应账号没有 username")
+            return
+        # 明确对比 username 与昵称，消除"该填哪个"的困惑
+        msg = f"解析成功：用户 ID = {username}"
+        if nickname and nickname != username:
+            msg += f"（{nickname} 是昵称，不能填在这里）"
+        self.done.emit(True, username, nickname, msg)
+
+
 class InProgressBridge(QObject):
     """Bangumi「看过」收藏数据源（负责拉取与落库，展示交给 LibraryBridge）。"""
 
@@ -716,6 +756,9 @@ class InProgressBridge(QObject):
     finished = Signal(int)        # 拉到的条数
     failed = Signal(str)          # 错误文案
     message = Signal(str)         # 中间进度文案
+    # Token → username 解析完成：ok, username, nickname, message
+    # （设置页「检测」按钮用，异步回传，见 resolveUsername）
+    usernameResolved = Signal(bool, str, str, str)
 
     def __init__(
         self,
@@ -732,6 +775,8 @@ class InProgressBridge(QObject):
         self._worker: Optional[_FetchWorker] = None
         self._ep_worker: Optional[_EpisodeWorker] = None
         self._upload_worker: Optional[_UploadWorker] = None
+        # 持有「检测用户名」worker 的引用，防止被 GC（见 resolveUsername）
+        self._resolve_worker: Optional[_ResolveUserWorker] = None
         # 待传集的本地行（bangumi_ep_id → 行），上传成功后写回用
         self._upload_meta: dict[int, dict] = {}
         # 界面刷新节流：首次全量会写十几批，合并到最多 1 次/秒
@@ -1162,56 +1207,53 @@ class InProgressBridge(QObject):
         else:
             self.message.emit(f"补传完成：{ok} 条已同步到 Bangumi")
 
-    @Slot(str, result="QVariantMap")
-    def resolveUsername(self, token: str = "") -> dict:
-        """用指定 Token 解析当前账号的 username（供设置页「检测」按钮调用）。
+    @Slot(str)
+    def resolveUsername(self, token: str = "") -> None:
+        """用指定 Token 解析当前账号的 username（设置页「检测」按钮）。
+
+        **异步**（踩坑：早期是 `result="QVariantMap"` 同步返回，实测在
+        "没开代理"时点一下按钮界面直接卡死十几秒）：
+        QML 调用带 result 的 Slot 是**同步**的，`get_me()` 的 15s 超时
+        全部压在 UI 线程上 —— 窗口不重绘、按钮不响应，看起来就是崩溃。
+        现在改为「发起后台请求 + 结果用信号回传」，界面全程可交互。
 
         参数 `token`：要用于探测的 Token。传空串则用桥接层持有的 `api`
         （即已保存的配置）。传值时会**临时构造一个客户端**，不污染主 `api`，
         也不写盘 —— 用户可以放心地点「检测」而不会误改保存的配置。
 
-        返回：
-            { "ok": bool, "username": str, "nickname": str,
-              "id": int, "message": str }
-
-        为什么要这个接口：`/v0/users/{username}` 要的是 username 而不是
-        昵称，但用户在设置页看到的、能填的往往是昵称。给一个"一键检测"
-        的入口，可以把正确值直接回填，避免 404 之后一头雾水。
+        结果经 `usernameResolved(ok, username, nickname, message)` 发出。
         """
-        api = self._api
         token = (token or "").strip()
-        if token:
-            # 用输入框里的 Token 临时探测（不落盘、不动主 api）
-            api = BangumiClient(
-                token=token,
-                api_base=getattr(self._api, "api_base", "https://api.bgm.tv"),
-                proxy="",       # 代理沿用已保存配置即可，这里不重复读配置
-                timeout=15.0,
-            )
-        try:
-            me = api.get_me()
-        except Exception as e:
-            log.warning("检测用户名失败: %s", e)
-            return {"ok": False, "username": "", "nickname": "", "id": 0,
-                    "message": f"请求失败：{e}"}
-        if not me:
-            return {"ok": False, "username": "", "nickname": "", "id": 0,
-                    "message": "Token 无效或已过期，无法获取用户信息"}
-        username = (me.get("username") or "").strip()
-        nickname = me.get("nickname") or ""
-        if not username:
-            return {"ok": False, "username": "", "nickname": nickname, "id": 0,
-                    "message": "Token 对应账号没有 username"}
-        return {
-            "ok": True,
-            "username": username,
-            "nickname": nickname,
-            "id": int(me.get("id") or 0),
-            # 明确对比 username 与昵称，消除"该填哪个"的困惑
-            "message": f"解析成功：用户 ID = {username}"
-                       + (f"（{nickname} 是昵称，不能填在这里）"
-                          if nickname and nickname != username else ""),
-        }
+        # 探测用的客户端：Token 优先用输入框里的（用户可能改了还没保存），
+        # 其次用配置里已保存的。
+        #
+        # **代理必须一并带上**（踩坑）：早期这里写死 `proxy=""`，等于强制
+        # 直连 —— 用户配了代理也会被忽略。而 www.bgm.tv 直连不通是最常见
+        # 的情况，表现为"点检测半天没反应"。
+        #
+        # 注意 `BangumiClient` **不保存**原始的 token / proxy（只把它们写进
+        # session 的 header 与 proxies），所以这里从配置读，而不是从
+        # `self._api` 上取属性 —— 那些属性并不存在。
+        saved_token = self._config.get("bangumi", "token", "")
+        proxy = self._config.get("bangumi", "proxy", "")
+        base = getattr(self._api, "api_base", "https://api.bgm.tv")
+        probe = BangumiClient(
+            token=token or saved_token,
+            api_base=base,
+            proxy=proxy,
+            # 探测场景：**短超时 + 不重试**。
+            # 默认策略下连接超时要重试 4 次（10s × 4 ≈ 40 秒才给结论），
+            # 用户点一下「检测」会以为程序卡死。见 fast_probe 的说明。
+            timeout=6.0,
+            fast_probe=True,
+        )
+        worker = _ResolveUserWorker(probe, self)
+        worker.done.connect(self.usernameResolved.emit)
+        # 持有引用防 GC（与 _FetchWorker 同样的处理）
+        self._resolve_worker = worker
+        worker.start()
+
+    # ---------- 配置变更 ----------
 
     # ---------- 配置变更 ----------
     @Slot()

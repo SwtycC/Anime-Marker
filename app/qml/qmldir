@@ -27,3 +27,4 @@ PosterDialog 1.0 PosterDialog.qml
 BackButton 1.0 BackButton.qml
 AddButton 1.0 AddButton.qml
 DetailButton 1.0 DetailButton.qml
+ErrorToast 1.0 ErrorToast.qml

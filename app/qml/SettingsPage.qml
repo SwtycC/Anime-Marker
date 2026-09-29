@@ -222,8 +222,19 @@ Item {
     function collect() {
         var v = {}
         // Bangumi
-        v["bangumi.token"] = tokenField.text.trim()
-        v["bangumi.username"] = usernameField.text.trim()
+        var tokenNow = tokenField.text.trim()
+        v["bangumi.token"] = tokenNow
+        // username 栏是只读的（由 Token 解析后回填，见 detectUsername）。
+        // 它**不直接从输入框提交**，但要处理"Token 变了"这一情况：
+        //
+        //   Token 可能换成了另一个账号 —— 此时旧的 username 必须一起清掉。
+        //
+        // 清空后在看页会自动走 `get_me()` 用新 Token 重新解析（见
+        // inprogress.resolve_username 的 fallback 分支）。
+        var savedToken = root.getValue("bangumi.token", "")
+        if (tokenNow !== savedToken) {
+            v["bangumi.username"] = ""
+        }
         // 注意这里**不写 apiBaseField.text**：那一栏是只读的固定值，
         // 但旧 config.ini 里可能存着用户早先填过的其它地址 —— 必须由
         // 这里主动覆盖成官方地址，否则"界面上显示官方、实际还在用旧值"。
@@ -291,10 +302,89 @@ Item {
             root.statusMessage("桥接不可用，无法检测")
             return
         }
-        var r = inprogress.resolveUsername(tokenField.text.trim())
-        if (r.ok)
-            usernameField.text = r.username
-        root.statusMessage(r.message)
+        if (root.detecting) {
+            return                      // 防连点（请求本身要几秒）
+        }
+        root.detecting = true
+        // **异步**：早期这里同步等返回值，网络超时（没开代理时必然超时）
+        // 会把界面卡死十几秒（实测反馈）。
+        // 结果由 inprogress.usernameResolved 信号回传，
+        // 见下方 Connections。
+        root._pendingToken = tokenField.text.trim()
+        inprogress.resolveUsername(root._pendingToken)
+    }
+
+    /// 「检测」结果回传（异步）
+    function _onUsernameResolved(ok, username, nickname, message) {
+        root.detecting = false
+        if (ok) {
+            usernameField.text = username
+            // 解析成功即落盘 —— username 栏已改为只读，不参与 collect()，
+            // 这里是它**唯一**的写入路径（见 collect 里的说明）。
+            //
+            // 顺带把 Token 也存了：用户往往是"填好 Token → 点检测"，
+            // 若只存 username 不存 Token，配置里就会出现"username 有值、
+            // Token 为空"的半成品状态。
+            //
+            // 用**一次批量提交**而不是两次 saveOne：后者会各弹一条
+            // 「已保存」提示、闪两下（saveOne 的注释里也说明了它只为
+            // "单个开关"设计）。这里只提交这两项，不会误保存别处
+            // 正在编辑的字段。
+            if (typeof settingsBridge !== "undefined" && settingsBridge) {
+                settingsBridge.saveAll({
+                    "bangumi.token": root._pendingToken,
+                    "bangumi.username": username
+                })
+                // 同步本地缓存：collect() 里靠 `savedToken` 判断"Token 是否
+                // 变化"，缓存不同步会让下次「保存」误判为"换了 Token"
+                // 而把刚解析出来的 username 又清掉。
+                root.setValue("bangumi.token", root._pendingToken)
+                root.setValue("bangumi.username", username)
+            }
+            root.statusMessage("已解析并保存：" + username
+                               + (nickname ? "（" + nickname + "）" : ""))
+        } else {
+            // 失败：红框警告 + 不清空原有值（用户可能只是网络抖动）
+            root.showTokenError(message || "Token 校验失败")
+        }
+    }
+
+    /// 「检测」是否进行中（按钮禁用 + 文案变化，避免连点与"像卡住"）
+    property bool detecting: false
+    /// 本次检测使用的 Token（回传时写盘用，避免用户中途改了输入框）
+    property string _pendingToken: ""
+
+    Connections {
+        target: typeof inprogress !== "undefined" && inprogress
+                ? inprogress : null
+        function onUsernameResolved(ok, username, nickname, message) {
+            root._onUsernameResolved(ok, username, nickname, message)
+        }
+    }
+
+    /// 显示 Token / 配置校验失败的红色警告（失败时由 detectUsername 调用）
+    function showTokenError(msg) {
+        errorToast.show(msg)
+    }
+
+    // 红色错误提示：位置与「已解析并保存」那条粉色浮条**一致**
+    // （窗口顶部居中、距顶 14px，见 Main.qml 的 banner）。
+    //
+    // 为什么不用 bottom：两处提示条一上一下会让人以为是两个不同的东西；
+    // 统一放顶部居中后，"校验失败的红色"与"保存成功的粉色"出现在同一
+    // 位置，切换时视觉连续。
+    //
+    // 用**窗口坐标**（相对 Window.contentItem）而不是页面坐标：设置页在
+    // ColumnLayout 里、下方还有状态栏，用 `parent.top` 会算进页面偏移，
+    // 偏下 20 多像素，与 banner 对不齐。
+    ErrorToast {
+        id: errorToast
+        objectName: "errorToast"
+        parent: root.Window.window ? root.Window.window.contentItem : null
+        anchors.horizontalCenter: parent ? parent.horizontalCenter : undefined
+        anchors.top: parent ? parent.top : undefined
+        anchors.topMargin: 14
+        width: Math.min(560, implicitWidth)
     }
 
     Flickable {
@@ -528,7 +618,12 @@ Item {
                 FormRow {
                     width: parent.width
                     label: "用户 ID"
-                    hint: "username，不是昵称"
+                    // **只读**（与 API 地址同样的处理，见下方 apiBaseField）：
+                    // 该值由 Token 自动解析，不手填 —— 手填的 username 若
+                    // 与 Token 不属于同一账号，会出现"读别人的收藏、往自己
+                    // 账号写"的静默错位（见 inprogress.resolve_username 的
+                    // 说明），这是最难排查的一类问题。
+                    hint: "由 Token 自动解析，不可手填"
                     Row {
                         width: parent.width
                         spacing: Theme.spacingSm
@@ -538,13 +633,17 @@ Item {
                             objectName: "usernameField"
                             text: root.getValue("bangumi.username", "")
                             width: parent.width - detectBtn.width - Theme.spacingSm
-                            placeholder: "留空则自动从 Token 解析（推荐）"
+                            readOnly: true
+                            placeholder: "点右侧「检测」从 Token 解析"
                         }
 
                         AppButton {
                             id: detectBtn
                             anchors.verticalCenter: parent.verticalCenter
-                            text: "检测"
+                            // 进行中：禁用 + 改文案（请求最长 10s，
+                            // 没有反馈的话用户会以为点空了/卡死了）
+                            text: root.detecting ? "检测中…" : "检测"
+                            enabled: !root.detecting
                             onClicked: root.detectUsername()
                         }
                     }

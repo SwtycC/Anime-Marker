@@ -36,7 +36,6 @@ ALLOWED_KEYS = {
     # 监控
     "monitor.poll_interval", "monitor.trigger_threshold", "monitor.title_regex",
     # 扫描与匹配
-    "scanner.season_patterns", "scanner.season_display",
     "scanner.accept_score", "scanner.accept_gap", "scanner.ep_align_order",
     # qBittorrent
     "qbittorrent.host", "qbittorrent.port", "qbittorrent.username",
@@ -65,8 +64,7 @@ FALLBACKS: dict[str, str] = {
     "launcher.fullscreen_settle": "3.0",
     "monitor.poll_interval": "3",
     "monitor.trigger_threshold": "0.95",
-    "scanner.season_patterns": "cn",
-    "scanner.season_display": "flat",
+    # （季数识别 / 多季展示已移除，见 ALLOWED_KEYS 处的说明）
     "scanner.accept_score": "60",
     "scanner.accept_gap": "30",
     "scanner.ep_align_order": "true",

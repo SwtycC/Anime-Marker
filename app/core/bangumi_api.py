@@ -417,18 +417,34 @@ class BangumiClient:
         proxy: str = "",
         user_agent: str = USER_AGENT,   # 合规 UA 见 app/__init__.py 的说明
         timeout: float = 10.0,
+        fast_probe: bool = False,
     ) -> None:
         self.api_base = api_base.rstrip("/")
         self.timeout = timeout
         self.session = requests.Session()
-        retry = Retry(
-            total=3, connect=3, read=3,
-            backoff_factor=0.5,
-            status_forcelist=(429, 500, 502, 503, 504),
-            # PATCH 也要列进来：标记单集看过用的是 PATCH（见 mark_episode_watched）。
-            # 该操作是幂等的（把某集置为"看过"），重试不会产生副作用。
-            allowed_methods=frozenset(["GET", "POST", "PUT", "PATCH", "DELETE"]),
-        )
+        # **fast_probe：给"交互式探测"用的快速模式**（设置页「检测」按钮）。
+        #
+        # 为什么需要（实测踩坑）：默认的重试策略是 `total=3, connect=3`，
+        # 即连接超时会被重试 **4 次** —— 单次 10s 超时下总共要等约 40 秒。
+        # 后台批量任务能忍受（它只是慢），但用户点一下「检测」按钮却要
+        # 盯着转圈 40 秒，体感就是"卡死"。探测场景**不需要重试**：
+        # 一次连不上，结论就是"网络不通/需要代理"，重试 3 次不会改变结论。
+        if fast_probe:
+            retry = Retry(
+                total=0,
+                backoff_factor=0,
+                status_forcelist=(),
+                allowed_methods=frozenset(["GET"]),
+            )
+        else:
+            retry = Retry(
+                total=3, connect=3, read=3,
+                backoff_factor=0.5,
+                status_forcelist=(429, 500, 502, 503, 504),
+                # PATCH 也要列进来：标记单集看过用的是 PATCH（见 mark_episode_watched）。
+                # 该操作是幂等的（把某集置为"看过"），重试不会产生副作用。
+                allowed_methods=frozenset(["GET", "POST", "PUT", "PATCH", "DELETE"]),
+            )
         adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
