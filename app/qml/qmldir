@@ -29,3 +29,6 @@ AddButton 1.0 AddButton.qml
 DetailButton 1.0 DetailButton.qml
 ErrorToast 1.0 ErrorToast.qml
 ShortcutRecorder 1.0 ShortcutRecorder.qml
+BackToTopButton 1.0 BackToTopButton.qml
+FloatingActionButton 1.0 FloatingActionButton.qml
+AddAnimeDialog 1.0 AddAnimeDialog.qml

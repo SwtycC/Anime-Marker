@@ -22,6 +22,13 @@ Item {
 
     signal subjectClicked(int subjectId)
 
+    /// 「添加动漫」按钮被点击（由 Main.qml 打开 AddAnimeDialog）。
+    ///
+    /// 页面本身不弹窗、也不调后端：它只表达"用户想添加动漫"这一意图，
+    /// 窗体的创建/生命周期与后端调用统一放在 Main.qml（与 UploadDialog
+    /// 同一套做法）。
+    signal addAnimeRequested()
+
     // 进入详情页（由 Main.qml 处理）
     //
     // 防御性写法：library 是运行时注入的上下文属性，单独加载本文件
@@ -311,6 +318,111 @@ Item {
                 font.pixelSize: Theme.fontMd
             }
         }
+    }
+
+    // ---- 「返回顶部」悬浮按钮 ----
+    //
+    // **必须是 flick 的兄弟项**（不能放进 Flickable 的 content 里）：
+    // 放进去就成了滚动内容的一部分，往下滚时它自己也会被滚走，
+    // 也就谈不上"固定在右下角"了。这里与 headerBox 同一层，都"浮"在内容之上。
+    //
+    // 位置：底部**导航胶囊的右上方**——
+    //   水平：贴右边缘（留 pagePadding，并避让滚动条宽度）
+    //   垂直：导航胶囊顶边再往上一点
+    //   （导航胶囊顶边 = 底边往上 navBottomMargin + navPillHeight，
+    //     常量与 Main.qml 里 NavBar 的定位保持同一套）
+    //
+    // 显隐：只有真的向下滚过一段才出现。
+    // 判据用 `contentY > 阈值` 而不是 `contentHeight > height`：
+    // 后者在"内容只比视口高一点点"时也为真，会出现"刚进页面、没滚动
+    // 就顶着个按钮"的情况；前者才真正表达"用户已经滚下去了"。
+    // ---- 「添加动漫」悬浮按钮（**下方**）----
+    //
+    // 位置：与「返回顶部」上下排列，本按钮在**下**、返回顶部在上，
+    // 两者右边缘对齐（都贴右下角）。
+    //
+    // **间距如何保证"悬停一个不影响另一个"**：
+    //   ① 两个按钮之间留 4px：返回顶部锚在本按钮**上方**（见 backToTop）；
+    //   ② 关键是 `FloatingActionButton` 的命中区（MouseArea）
+    //      **只覆盖本体矩形、不含外圈那 4px 淡描边** —— 描边最容易互相
+    //      侵入，把命中区圈到描边上就会出现"鼠标明明在 A 上，B 也判定为
+    //      悬停"。这条在组件里已写死，此处配合间距即可。
+    //   ③ 悬停时本体只向**左**扩张（右边缘锚在页面右侧），不会向上/向下
+    //      压到另一个按钮。
+    FloatingActionButton {
+        id: addAnime
+        objectName: "addAnimeButton"       // 诊断/探针用
+        z: 2
+        icon: "plus"
+        label: "添加动漫"
+
+        anchors.right: parent.right
+        anchors.rightMargin: Theme.pagePadding
+                            + (vbar.visible ? vbar.width : 0)
+        // 底边与原先一样：导航胶囊顶边再往上一点
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: Theme.navBottomMargin + Theme.navPillHeight
+                              + Theme.spacingLg
+
+        onClicked: root.addAnimeRequested()
+    }
+
+    BackToTopButton {
+        id: backToTop
+        objectName: "backToTopButton"      // 诊断/探针用
+        z: 2                               // 高于 headerBox(1)，与导航同层
+        // 出现阈值：**只要往下滚过一点点就出现**。
+        //
+        // 原先是 `> pagePadding * 2`（48px），实测反馈"出现得有点慢" ——
+        // 用户滚过一两行卡片才见到按钮，感觉像"没及时响应"。
+        // 现在降到 16px：轻微下滑即出现（仍不是 0，避免在顶部边缘时
+        // 因惯性回弹反复闪烁）。
+        visible: flick.contentY > 16
+        opacity: visible ? 1 : 0
+        // 淡入用 durFast（更"跟手"）；淡出仍走 durNormal，避免刚回顶就
+        // 突兀消失。用两条 Behavior 无法区分方向，故统一取较快的 durFast。
+        Behavior on opacity {
+            NumberAnimation { duration: Theme.durFast }
+        }
+
+        anchors.right: parent.right
+        anchors.rightMargin: Theme.pagePadding
+                            + (vbar.visible ? vbar.width : 0)
+        // **垂直方向锚在「添加动漫」上方**（上下排列，本按钮在上）。
+        //
+        // 间距：两圆之间留 **14px**（历次调整：4 → 6 → 14）。
+        //
+        // 这次跨过了"两侧描边不再交叠"的临界点：本体间距 > 8px 时，
+        // 两圈各 4px 的淡描边之间也会空出一段，不再连成一片。
+        // 于是在这个值上，`bottomMargin` 变成了**正数**，不再被 Math.max 兜底
+        // —— 也就是说 Math.max 其实只是防止"填负数导致重叠"的保护，
+        // 计算式本身始终是 `目标间距 − 两侧留白`。
+        //
+        // `anchors.bottom: addAnime.top` 锚的是**组件根项的顶边**，而根项比
+        // 按钮本体每侧各多 `haloWidth`(4px，给那圈淡描边留的空间，
+        // 见 FloatingActionButton 的说明)，故实际看到的间距 =
+        //     bottomMargin + 4 + 4
+        // 这里把两边减掉，保证肉眼看到的是 14px。
+        anchors.bottom: addAnime.top
+        anchors.bottomMargin: Math.max(0, 14 - addAnime.haloWidth
+                                          - backToTop.haloWidth)
+
+        // 只发出意图，滚动行为归本页处理（见下方 scrollTopAnim）。
+        // 需要 scrollTopAnim / flick 都在作用域内，故用箭头函数式的直接调用。
+        onClicked: scrollTopAnim.restart()
+    }
+
+    /// 平滑滚回顶部。
+    ///
+    /// **不用 `flick.contentY = 0`**：那是瞬间跳变，在长列表里会让人一下
+    /// 失去位置感（想看的是"弹回去"的过程）。改为驱动 contentY 的动画。
+    NumberAnimation {
+        id: scrollTopAnim
+        target: flick
+        property: "contentY"
+        to: 0
+        duration: Theme.durSlow * 4
+        easing.type: Easing.OutCubic
     }
 
     // 筛选项变化时回到网格顶部：过滤后内容变短，原来的滚动位置会落在

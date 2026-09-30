@@ -617,11 +617,22 @@ class ScanWorker(QThread):
         only_folder: Optional[Path] = None,
         extra_show: bool = True,
         extra_numbering: bool = True,
+        no_match: bool = False,
     ) -> None:
         super().__init__()
         self.library_paths = [Path(p) for p in library_paths]
         self.api = api
         self.db = db
+        # 不做 Bangumi 匹配（「添加动漫」在未填 Token 时由 QML 传 True）：
+        # 跳过全部网络搜索，直接把目录里的视频作为本地条目入库。
+        # 见 bridges/scanner.addFolder 分支。
+        self.no_match = no_match
+        # 本次扫描**新建/更新**的 subject_id（按处理顺序）。
+        #
+        # 用途：`addFolder` 完成后要告诉 QML"刚加进来的是哪一条"，
+        # 以便直接跳详情页。worker 是独立线程，不能直接改桥接层属性，
+        # 因此在这里收集，由桥接层在 finished_ok 时读取。
+        self.created_subject_ids: list[int] = []
         # 附加内容**是否入库**（设置页「附加内容显示」开关，scanner.extra_show）。
         #
         # 关闭时：SP/OVA/NCOP/特典… 既不识别为附加内容、也**不落进兜底桶**
@@ -914,6 +925,32 @@ class ScanWorker(QThread):
     # ========== 二、匹配与入库 ==========
     def _process(self, cand: ScanCandidate) -> None:
         local_ep_count = len(cand.video_files)
+
+        # 「添加动漫」在**没填 Token** 时的路径：完全不联网，直接把目录里的
+        # 视频作为本地条目入库（match_state="manual"，bangumi_id=0）。
+        #
+        # 为什么用 manual 而不是 pending：pending 的语义是"匹配过、但结果
+        # 需要人工确认"（详情页会出现「⚠ 匹配待确认，请点右上角重新匹配」
+        # 的提示）。而这里是用户**主动选择不匹配**，并没有失败的匹配要他
+        # 处理，套用 pending 会凭空多出一条待办提示。manual 表示"由用户
+        # 指定/认可的状态"，与详情页 buildMeta 的「已手动指定」文案一致。
+        if self.no_match:
+            # **不能用 upsert_subject(bangumi_id=0)**（踩坑）：subjects 表的
+            # `bangumi_id` 有 UNIQUE 约束，而未匹配条目本就没有 bomgumi_id ——
+            # 用 0 当哨兵会导致**第二条未匹配番覆盖第一条**（0 只能存在一个）。
+            # 表里未匹配用的是 NULL（SQLite 的 UNIQUE 允许多个 NULL），
+            # 因此这里走 `upsert_local_subject`（按 folder_path 判重、写 NULL）。
+            subject_id = self.db.upsert_local_subject(
+                folder_path=str(cand.folder_path),
+                display_name=cand.display_name,
+                series_name=cand.series_name,
+                total_eps=len(cand.video_files),
+            )
+            self.created_subject_ids.append(subject_id)
+            self.log_message.emit(f"  ✓ 已加入（未匹配）：{cand.display_name}")
+            self._fill_episodes(subject_id, None, cand)
+            return
+
         result = self.matcher.search_best(cand.keywords, local_ep_count)
 
         if result.subject is None:
@@ -974,6 +1011,7 @@ class ScanWorker(QThread):
         except Exception as e:
             log.warning("写入条目标签失败 %s: %s", name_cn, e)
         self.log_message.emit(f"  ✓ {name_cn}（{result.score} 分：{result.reason}）")
+        self.created_subject_ids.append(subject_id)
         self.item_matched.emit(subject_id, name_cn)
         self._fill_episodes(subject_id, bangumi_id, cand)
 

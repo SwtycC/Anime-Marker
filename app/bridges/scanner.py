@@ -46,6 +46,12 @@ class ScannerBridge(QObject):
     logMessage = Signal(str)
     finished = Signal(int, int)             # matched, pending
     failed = Signal(str)
+    # 「添加动漫」完成：携带新入库条目的 subject_id（0 = 未入库，如待确认）
+    #
+    # 为什么要单独一个信号：这条路径由用户从弹窗发起、预期是"加完直接
+    # 进详情页"，需要知道**具体是哪一条**；而通用的 finished(matched,
+    # pending) 只给数量，QML 无从得知该跳去哪一条。
+    subjectAdded = Signal(int)
 
     def __init__(
         self,
@@ -68,6 +74,11 @@ class ScannerBridge(QObject):
         self._on_finished_hook = None
         # 本次扫描是否为「单条目重扫」（决定完成后要不要发起在看/动态同步）
         self._single_scan = False
+        # 本次是否为「添加动漫」（弹窗选目录发起）：
+        # 完成后把新条目 id 经 subjectAdded 回传，供 QML 直接进详情页
+        self._adding = False
+        # 本次「添加动漫」新入库的 subject_id（0 = 未入库）
+        self._added_subject_id = 0
 
     def set_api(self, api: BangumiClient) -> None:
         self._api = api
@@ -240,6 +251,138 @@ class ScannerBridge(QObject):
         worker.start()
         log.info("单条目扫描已启动：subject_id=%s（%s）", subject_id, folder)
 
+    @Slot(str, bool, result="QVariantMap")
+    def addFolder(self, folder: str, match: bool = True) -> dict:
+        """「添加动漫」：把一个**单个动漫目录**加入库。
+
+        与 `startSubject` 的区别：那个是对**已入库**条目重扫；这里是从零
+        把用户手选的一个目录走一遍"匹配 → 入库 → 填集数"。
+
+        参数：
+            folder —— 用户选择的目录（或单个视频文件）
+            match  —— 是否做 Bangumi 匹配。
+                      **没填 Token 时 QML 传 False**：此时不做网络匹配，
+                      只把目录里的视频作为本地条目入库。用户明确要求
+                      "没填 Token 就不匹配"。
+
+        **返回结构化结果**（原本只返回一个错误字符串，后来发现"已存在"
+        是第三种情况：既不是错误、也不该继续扫描，而是**提示 + 跳转**，
+        和"失败"的处理完全不同，字符串表达不了，于是改成 QVariantMap）：
+
+            { "ok": true }                         —— 已开始扫描
+            { "ok": false, "exists": true,
+              "subjectId": <int>, "name": <str> }  —— 该目录已在库中
+            { "ok": false, "message": <str> }      —— 其它失败（直接展示原因）
+        """
+        if self._running:
+            return {"ok": False, "message": "扫描正在进行中，请稍候"}
+
+        raw = (folder or "").strip()
+        if not raw:
+            return {"ok": False, "message": "请先选择动漫文件夹"}
+        # 先剥掉可能的首尾引号（用户可能从别处粘贴 `"F:\动漫\某某"` 这种带
+        # 引号的路径），再交给 Path 规整（`F:/x` 与 `F:\x` 都认）。
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+            raw = raw[1:-1].strip()
+        target = Path(raw)
+        if not target.exists():
+            return {"ok": False, "message": f"目录不存在：{target}"}
+        # 允许直接选单个视频文件（剧场版单文件的情形）
+        if not target.is_dir() and not target.is_file():
+            return {"ok": False, "message": f"不是有效的目录或文件：{target}"}
+
+        # ---- 「已存在的动漫」检查（在扫描之前）----
+        #
+        # 判定用 `folder_path` 精确匹配：与入库时的写法一致（`upsert_*`
+        # 都是直接存 `str(cand.folder_path)`），而 candidate 的 folder_path
+        # 对"单个动漫目录"就等于所选目录本身，因此能对上。
+        #
+        # 注意单文件的情形：那种条目的 folder_path 记的是**父目录**（见
+        # scanner 的 `if folder.is_file()` 分支），所以这里也按父目录查，
+        # 保持一致。
+        lookup = target.parent if target.is_file() else target
+        try:
+            existing = self._db.find_subject_by_folder(str(lookup))
+        except Exception as e:                      # pragma: no cover - 防御性
+            log.warning("查重失败 %s: %s", lookup, e)
+            existing = None
+        if existing is not None:
+            name = existing.name_cn or existing.name or str(lookup)
+            log.info("该目录已在库中：%s（subject_id=%s）", name, existing.id)
+            return {
+                "ok": False,
+                "exists": True,
+                "subjectId": int(existing.id),
+                "name": name,
+            }
+
+        if match and self._api is None:
+            return {"ok": False, "message": "Bangumi API 未初始化"}
+
+        # **拒绝"一选就是整个媒体库/"的情况**（用户诉求）：
+        # 选到 `F:/动漫` 这类**装着一堆动漫的父目录**时，若直接把它当一个
+        # 条目扫描，会把旗下所有番混成一条 —— 完全违背"添加单个动漫"的用意。
+        #
+        # 判据：该目录下**直接**含视频则为"单个动漫目录"（正常）；
+        # 若它自己不含视频、但**直接子目录**里有多个含视频的目录，说明选的是
+        # 父级容器，应提示用户往下选一层，而不是把整片库塞进一条。
+        #
+        # 注意这里只**拒绝而非自动展开**：自动展开会一次入库几十部番，
+        # 用户无从预期、也无法逐条确认；让他明确选一个更符合"单个添加"。
+        if target.is_dir():
+            from app.core.scanner import _videos_in
+            if not _videos_in(target, recursive=False):
+                subs = []
+                try:
+                    for sub in sorted(target.iterdir()):
+                        if sub.is_dir() and _videos_in(sub, recursive=True):
+                            subs.append(sub)
+                except OSError as e:
+                    return {"ok": False, "message": f"读取目录失败：{e}"}
+                if len(subs) > 1:
+                    return {"ok": False,
+                            "message": f"这个目录下有 {len(subs)} 个动漫文件夹，"
+                                       f"请选择其中一个再添加"}
+
+        self._api = self._api or BangumiClient()
+        self._matched = 0
+        self._pending = 0
+        self._current = 0
+        self._total = 0
+
+        worker = ScanWorker(
+            [],
+            self._api,
+            self._db,
+            season_mode=SEASON_MODE,
+            season_display=SEASON_DISPLAY,
+            accept_score=self._config.getint("scanner", "accept_score", 60),
+            accept_gap=self._config.getint("scanner", "accept_gap", 20),
+            align_by_order=self._config.getbool(
+                "scanner", "ep_align_order", True),
+            only_folder=target,
+            extra_show=self._config.getbool(
+                "scanner", "extra_show", True),
+            extra_numbering=self._config.getbool(
+                "scanner", "extra_numbering", True),
+            # 不做匹配时直接跳过网络搜索（见 ScanWorker.no_match 的说明）
+            no_match=not match,
+        )
+        worker.progress_changed.connect(self._on_progress)
+        worker.item_matched.connect(self._on_matched)
+        worker.log_message.connect(self._on_log)
+        worker.finished_ok.connect(self._on_ok)
+        worker.failed.connect(self._on_failed)
+
+        self._worker = worker
+        self._single_scan = True          # 单条添加不触发「在看/动态」同步
+        self._adding = True
+        self._added_subject_id = 0
+        self._set_running(True)
+        worker.start()
+        log.info("添加动漫已启动：%s（匹配=%s）", target, match)
+        return {"ok": True}
+
     @Slot()
     def cancel(self) -> None:
         """中止扫描（用户主动）。"""
@@ -284,6 +427,26 @@ class ScannerBridge(QObject):
                 self._on_finished_hook()
             except Exception as e:
                 log.exception("扫描完成回调失败: %s", e)
+
+        # 「添加动漫」：把新入库的条目 id 回传 QML（进详情页用）。
+        #
+        # 必须在 finished 之前发：QML 那边 onSubjectAdded 里会切到详情页，
+        # 而 onFinished 会刷新海报墙 —— 顺序反了会出现"先刷新列表、后跳页"
+        # 的闪烁。
+        #
+        # 取**最后一个**（正常情况下只有一个；万一用户选的目录被 _walk
+        # 拆出了多条，取最后一条至少保证进的是其中一个，而不是 0）。
+        if self._adding:
+            ids = self._worker.created_subject_ids if self._worker else []
+            self._added_subject_id = ids[-1] if ids else 0
+            self._adding = False
+            if self._added_subject_id:
+                log.info("添加动漫完成：subject_id=%s", self._added_subject_id)
+            else:
+                log.warning("添加动漫未产生条目（可能是空目录）")
+                self.logMessage.emit("该目录下没有找到可入库的视频")
+            self.subjectAdded.emit(self._added_subject_id)
+
         self.finished.emit(self._matched, self._pending)
 
     def _on_failed(self, msg: str) -> None:

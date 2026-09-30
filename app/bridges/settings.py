@@ -186,6 +186,19 @@ class SettingsBridge(QObject):
         self.scanRequested.emit()
         return True
 
+    @Slot(str, str, result=str)
+    def getValue(self, key: str, fallback: str = "") -> str:
+        """读单个配置项（QML 可调用）。
+
+        **为什么需要它**：下面还有个同功能的 `value()`，但它是**普通 Python
+        方法、没加 @Slot** —— QML 调用不了（会抛 TypeError，在
+        `x ? f() : y` 这种三元里异常会被吞掉，表现为"取到的值恒为默认"，
+        极难定位：实测"添加动漫"弹窗里读 Token 恒为空、误判成"没填 Token"）。
+
+        QML 侧要读配置一律走这个 Slot。
+        """
+        return self.value(key, fallback)
+
     # ---------- 快捷键占用检测 ----------
     @Slot(str, result="QVariant")
     def hotkeyAvailable(self, shortcut: str) -> Any:

@@ -51,26 +51,58 @@ Item {
                                     : kind === "chevron" ? "chevron-down"
                                     : kind === "link"   ? "link"
                                     : kind === "back"   ? "arrow-left"
+                                    // up：复用 arrow-left 的 SVG + 旋转 90°
+                                    // （见下面的 iconRotation）
+                                    : kind === "up"     ? "arrow-left"
+                                    // upBold：独立的**加粗**上箭头。
+                                    // 为什么不复用 up：arrow-left 的笔画宽约 1。
+                                    // 1（在 16 的 viewBox 里），放大到 20px 显示
+                                    // 时偏细（实测反馈"箭头想要粗一点"）。
+                                    // 直接改 arrow-left 会影响导航栏的返回按钮，
+                                    // 所以单开一个描边加粗的 SVG。
+                                    : kind === "upBold" ? "arrow-up-bold"
+                                    // plus：添加（描边加粗的加号）
+                                    : kind === "plus"   ? "plus"
                                     : ""
     readonly property string svgUrl: svgName !== "" && iconsBase !== ""
                                      ? iconsBase + svgName + ".svg" : ""
 
-    Image {
-        id: svgImage
-        anchors.fill: parent
-        visible: false
-        source: root.svgUrl
-        sourceSize.width: 64          // 放大解码，缩小后边缘更干净
-        sourceSize.height: 64
-        fillMode: Image.PreserveAspectFit
-        asynchronous: false
-    }
+    /// 需要旋转的角度（度）。
+    ///
+    /// **为什么用旋转而不是新建一个 up.svg**（取舍）：`arrow-left` 是一条
+    /// 手工调过的贝塞尔路径，直接改 `fill`/路径很容易画歪；而 arrow-left
+    /// 顺时针转 90° 正好是"向上"（`↑`），几何上严格等价。
+    /// 复用已验证的资源、不引入手写 SVG，出错面最小。
+    ///
+    /// **命名注意**：**不能叫 `rotation`** —— `Item` 自身已有内置属性
+    /// `rotation`（且为只读式绑定），再声明同名 property 会让整个文件
+    /// 加载失败（实测报 "rotation is a read-only property"，连带所有用到
+    /// NavIcon 的页面全部不可用）。所以用 `iconRotation`。
+    readonly property real iconRotation: kind === "up" ? 90 : 0
 
-    MultiEffect {
+    Item {
+        id: rot
         anchors.fill: parent
-        visible: root.svgUrl !== "" && svgImage.status === Image.Ready
-        source: svgImage
-        colorization: 1.0
-        colorizationColor: root.color
+        rotation: root.iconRotation
+        // 旋转默认绕中心（transformOrigin 默认即 Center），箭头指向正确
+
+        Image {
+            id: svgImage
+            anchors.fill: parent
+            visible: false
+            source: root.svgUrl
+            sourceSize.width: 64      // 放大解码，缩小后边缘更干净
+            sourceSize.height: 64
+            fillMode: Image.PreserveAspectFit
+            asynchronous: false
+        }
+
+        MultiEffect {
+            anchors.fill: parent
+            visible: root.svgUrl !== "" && svgImage.status === Image.Ready
+            source: svgImage
+            colorization: 1.0
+            colorizationColor: root.color
+        }
     }
 }

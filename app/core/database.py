@@ -832,6 +832,57 @@ class Database:
             )
             return int(cur.lastrowid)
 
+    def upsert_local_subject(
+        self,
+        folder_path: str,
+        display_name: str,
+        series_name: str = "",
+        total_eps: int = 0,
+    ) -> int:
+        """写入/复用「本地条目」——**没有 bangumi_id** 的漫画。
+
+        用途：「添加动漫」在**未填 Token** 时的路径（用户明确要求"没填
+        Token 就不匹配"）。此时不联网，把目录里的视频直接作为本地条目入库。
+
+        与 `upsert_pending_subject` 的区别只在 `match_state`：
+            pending —— "匹配过、结果需人工确认"（详情页会弹「⚠ 匹配待确认」）
+            manual  —— "由用户指定/认可的状态"（详情页显示「已手动指定」）
+        用户是**主动选择不匹配**的，并没有失败的匹配要他处理，套用 pending
+        会凭空多出一条待办提示，所以这里用 manual。
+
+        **为什么不能用 `upsert_subject(bangumi_id=0)`**（踩坑）：subjects 表的
+        `bangumi_id` 有 UNIQUE 约束，而 0 只能存在一行 —— 第二条未匹配番会
+        把第一条**覆盖**掉。未匹配必须写 NULL（SQLite 的 UNIQUE 允许多个
+        NULL 共存），并按 `folder_path` 手工判重（同 pending 的做法）。
+        """
+        existing = self.find_subject_by_folder(folder_path)
+        if existing is not None:
+            # 已有 manual 的不动（用户手动指定过就不该被本地添加覆盖）；
+            # auto/pending 升级为 manual —— 用户这次明确要求"只加本地"。
+            if existing.match_state != "manual" or not existing.bangumi_id:
+                with self._cursor() as cur:
+                    cur.execute(
+                        "UPDATE subjects SET name=?, name_cn=?, series_name=?,"
+                        " total_eps=?, match_state='manual', updated_at=?"
+                        " WHERE id=?",
+                        (display_name, display_name, series_name, total_eps,
+                         _now(), existing.id),
+                    )
+            return existing.id
+
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO subjects
+                    (bangumi_id, name, name_cn, cover_url, cover_path, total_eps,
+                     folder_path, series_name, match_state, updated_at)
+                VALUES (NULL,?,?,?,?,?,?,?,'manual',?)
+                """,
+                (display_name, display_name, "", "", total_eps,
+                 folder_path, series_name, _now()),
+            )
+            return int(cur.lastrowid)
+
     def set_manual_match(
         self,
         subject_id: int,

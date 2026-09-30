@@ -110,6 +110,8 @@ ApplicationWindow {
                         detailPage.load(subjectId)
                         browseStack.currentIndex = 1
                     }
+                    // 右下角「添加动漫」悬浮按钮 → 打开小窗
+                    onAddAnimeRequested: addAnimeDialog.open()
                 }
 
                 DetailPage { id: detailPage; objectName: "detailPage" }
@@ -287,6 +289,71 @@ ApplicationWindow {
         onVisibleChanged: {
             if (!visible)
                 timelinePage.reload()
+        }
+    }
+
+    // ============ 添加动漫对话框 ============
+    //
+    // 流程：小窗选目录 → 转发给 scanner.addFolder(path, match)
+    //      → 后端单目录扫描入库
+    //      → scanner.subjectAdded(id) → 关窗 + 进详情页（并刷新海报墙）
+    //      → scanner.failed(msg)      → 窗内红字
+    AddAnimeDialog {
+        id: addAnimeDialog
+
+        // 用户点了「添加」：把请求交给后端。
+        //
+        // 后端返回结构化结果（见 ScannerBridge.addFolder）：
+        //   ok=true                        → 已在扫描，等 subjectAdded
+        //   exists=true                    → 该番**已存在**：关窗 + 主题色提示
+        //                                    （可点击跳转到该条目）
+        //   message=<str>                  → 其它失败，窗内红字
+        onSubmitted: function (folder, match) {
+            if (typeof scanner === "undefined" || !scanner) {
+                addAnimeDialog.onResult(false, "扫描服务不可用")
+                return
+            }
+            var r = scanner.addFolder(folder, match)
+            if (r && r.ok === true)
+                return
+            if (r && r.exists === true) {
+                // 「已存在」不是错误：用**主题色**提示条（warn=false），
+                // 并带上 action="subject" + 条目 id，点一下直达该动漫。
+                addAnimeDialog.close()
+                banner.show("「" + (r.name || "该动漫") + "」已在库中 · 点击查看",
+                            false, "subject", r.subjectId || 0)
+                return
+            }
+            addAnimeDialog.onResult(false,
+                (r && r.message) ? r.message : "添加失败")
+        }
+    }
+
+    // 「添加动漫」完成 → 关窗并直接进该条目的详情页
+    //
+    // 说明为什么用 `browseStack.currentIndex = 1` + `currentPage = 0`：
+    // 与从海报墙点卡片进详情是**同一条路径**（详情页在内层子栈里，
+    // 外层必须切回 browseStack 所在那一页，见文件头「两层栈」的说明）。
+    Connections {
+        target: typeof scanner !== "undefined" && scanner ? scanner : null
+        function onSubjectAdded(subjectId) {
+            if (!addAnimeDialog.visible)
+                return                    // 不是本小窗发起的（如全量扫描）
+            addAnimeDialog.close()
+            if (subjectId > 0) {
+                library.reload()          // 先刷新列表，详情页取到的数据才一致
+                detailOriginPage = 0      // 从海报墙进来的语义
+                detailPage.load(subjectId)
+                browseStack.currentIndex = 1
+                window.currentPage = 0
+                statusBar.setMessage("已添加并打开详情", 5000)
+            } else {
+                statusBar.setMessage("未能添加该目录（详见日志）", 5000)
+            }
+        }
+        function onFailed(msg) {
+            if (addAnimeDialog.visible)
+                addAnimeDialog.onResult(false, msg || "添加失败")
         }
     }
 
@@ -767,17 +834,27 @@ ApplicationWindow {
         }
 
         /// 显示提示。`warn` 为 true 时用琥珀色（重复 / 需注意）。
-        /// `action` 传 "settings" 时浮条可点击 → 跳转设置页
-        /// （目前只有「集数按顺序对应」的警示在用）。
-        function show(text, warn, action) {
+        /// `action` 传 "settings" 时浮条可点击 → 跳转设置页；
+        /// 传 "subject" 时点击 → 跳转 `actionSubjectId` 对应条目的详情页
+        /// （「添加动漫」发现该番已存在时用）。
+        ///
+        /// **为什么按钮要带 id**（而不是让调用方自己接点击）：提示条本身是
+        /// 一次性浮层，点击后就要"知道去哪儿"。多一个 `actionSubjectId`
+        /// 比再开一套回调更省事，也与既有 `action` 机制一致。
+        function show(text, warn, action, subjectId) {
             banner.warn = warn === true
-            banner.action = (action === "settings") ? "settings" : ""
+            banner.action = (action === "settings" || action === "subject")
+                            ? action : ""
+            banner.actionSubjectId = (action === "subject") ? (subjectId || 0) : 0
             bannerText.text = text
             banner.opacity = 1
             bannerTimer.restart()
         }
 
-        // 点击浮条 → 执行 action（跳设置页）并收起。
+        // action="subject" 时的目标条目 id
+        property int actionSubjectId: 0
+
+        // 点击浮条 → 执行 action 并收起。
         // 只在带 action 时启用：普通提示的浮条区域不拦截下层点击。
         MouseArea {
             anchors.fill: parent
@@ -789,6 +866,14 @@ ApplicationWindow {
                     // 不止切页，还要滚动到那个开关并高亮（否则用户要在一
                     // 整页表单里自己找「集数按顺序对应」）
                     settingsPage.revealField("epAlignOrderBox")
+                } else if (banner.action === "subject"
+                           && banner.actionSubjectId > 0) {
+                    // 跳到该条目的详情页（与从海报墙点卡片同一条路径：
+                    // 内层子栈切到详情 + 外层切回 browseStack 所在页）
+                    detailOriginPage = 0
+                    detailPage.load(banner.actionSubjectId)
+                    browseStack.currentIndex = 1
+                    window.currentPage = 0
                 }
                 banner.opacity = 0
             }
