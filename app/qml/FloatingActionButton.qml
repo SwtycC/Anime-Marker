@@ -23,18 +23,34 @@ import QtQuick.Controls   // FontMetrics 在 QtQuick.Controls 下（Qt6 亦可�
 Item {
     id: root
 
-    /// 图标种类（透传给 NavIcon，如 "up" / "upBold" / "plus"）
+    /// 图标种类（透传给 NavIcon，如 "up" / "upBold" / "plus" / "trash"）
     property string icon: "upBold"
     /// 悬停时展开显示的文案
     property string label: "返回顶部"
+    /// 是否为"危险操作"：底色换成红色系（如详情页的「删除」）。
+    ///
+    /// 不只换文字色 —— **整颗按钮连图标一起变红**，这是删除类操作的通用
+    /// 视觉语言，能有效降低误点。其余动画/尺寸/描边逻辑完全不变。
+    property bool danger: false
+
+    /// 底色（静止 / 悬停）
+    readonly property color _baseColor: danger ? Theme.dangerColor : Theme.accent
+    readonly property color _hoverColor: danger ? Qt.lighter(Theme.dangerColor, 1.12)
+                                                : Theme.accentHover
 
     signal clicked()
 
     // 尺寸：静止 50、悬停 104（窄胶囊）
     readonly property int collapsedSize: 50
     readonly property int expandedSize: 104
-    /// 箭头/图标尺寸
-    readonly property int iconSize: 20
+    /// 箭头/图标尺寸。
+    ///
+    /// **必须是可写属性（不能 readonly）**：详情页的「删除」按钮要把垃圾桶
+    /// 放大一号（实测反馈"图标放大一点"），做法是在实例上覆盖 `iconSize`；
+    /// readonly 属性不允许外部赋值，会直接报
+    /// "Invalid property assignment: iconSize is a read-only property"
+    /// 并让整个 DetailPage 加载失败。其余按钮不覆盖，取这里的默认值即可。
+    property int iconSize: 20
 
     // ---- 展开 / 收回 的速度（**进出不对称**，用户需求）----
     //
@@ -140,7 +156,7 @@ Item {
         width: root.haloExpandedW
         height: root.haloCollapsedH
         radius: width / 2
-        color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b,
+        color: Qt.rgba(root._baseColor.r, root._baseColor.g, root._baseColor.b,
                        root.hovered ? 0.35 : 0.25)
 
         // 描边尺寸：用**显式动画**驱动，而不是 `Behavior on width`。
@@ -179,14 +195,16 @@ Item {
             target: halo
             property: "color"
             running: !root.hovered
-            to: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.25)
+            to: Qt.rgba(root._baseColor.r, root._baseColor.g,
+                        root._baseColor.b, 0.25)
             duration: root.haloOutDur
         }
         ColorAnimation {
             target: halo
             property: "color"
             running: root.hovered
-            to: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.35)
+            to: Qt.rgba(root._baseColor.r, root._baseColor.g,
+                        root._baseColor.b, 0.35)
             duration: root.inDur
         }
     }
@@ -200,7 +218,7 @@ Item {
         // 静止 = 正圆（半高）；悬停 = 24 圆角（胶囊端）。不能用 height/2，
         // 理由见文件头 ①。
         radius: root.hovered ? 24 : height / 2
-        color: root.hovered ? Theme.accentHover : Theme.accent
+        color: root.hovered ? root._hoverColor : root._baseColor
         clip: true
 
         // 本体：**收回更快**（outDur），比描边先到位 —— 与需求一致。
@@ -251,14 +269,14 @@ Item {
             target: body
             property: "color"
             running: root.hovered
-            to: Theme.accentHover
+            to: root._hoverColor
             duration: root.inDur
         }
         ColorAnimation {
             target: body
             property: "color"
             running: !root.hovered
-            to: Theme.accent
+            to: root._baseColor
             duration: root.outDur
         }
 

@@ -6,7 +6,10 @@
 2. **多候选关键词 + 打分择优**：不再盲信搜索结果第一条。
    打分逻辑见 app/core/matcher.py。
 3. **SP/OVA 归入所属季**：附属内容目录不下探，视频并入父条目，集数排在正片之后。
-4. **manual 记录保护**：用户手动指定的条目，重扫时不覆盖其 bangumi_id。
+4. **manual 记录保护**：用户**手动指定过 Bangumi 条目**的（match_state=
+   'manual' 且 bangumi_id 非空），重扫时不覆盖其 bangumi_id。未匹配的纯
+   本地条目（添加时没匹配、bangumi_id 为 NULL）不受这条保护 —— 重扫会
+   正常匹配并把数据补上（见 _process 里的判据说明）。
 """
 
 from __future__ import annotations
@@ -603,6 +606,21 @@ class ScanWorker(QThread):
     log_message = Signal(str)
     finished_ok = Signal()
     failed = Signal(str)
+    # 某个条目的**联网匹配失败**（超时/断网/被阻断），携带 (名称, 原因摘要)。
+    #
+    # 与 `failed` 的区别：`failed` 是整个扫描任务挂掉（不会走到这里）；
+    # 这里是"扫描正常跑完，但这一条没匹配上，且原因是网络" ——
+    # 条目标签是 `pending`（待人工确认），但用户更需要知道的是
+    # "这次是网没通"，而不是去手动挑条目。见 _process 里的用法。
+    match_failed = Signal(str, str)
+    # 某个条目**被写成待确认（pending）**：携带 (名称, 原因)。
+    #
+    # **为什么需要它**（踩坑，实测）：桥接层原先靠"日志文本里是否含
+    # 「待手动确认」"来计数 `_pending` —— 属于把展示用的字符串当成协议。
+    # 后来给网络失败单独发了一条文案不同的日志（"⚠ 联网匹配失败"），
+    # 计数便**静默漏掉**了这类条目：界面显示"待确认 0"，可库里明明
+    # 多了一条 pending。现在改为**显式信号**，与文案解耦。
+    item_pending = Signal(str, str)
 
     def __init__(
         self,
@@ -927,7 +945,11 @@ class ScanWorker(QThread):
         local_ep_count = len(cand.video_files)
 
         # 「添加动漫」在**没填 Token** 时的路径：完全不联网，直接把目录里的
-        # 视频作为本地条目入库（match_state="manual"，bangumi_id=0）。
+        # 视频作为本地条目入库（match_state="manual"，bangumi_id=NULL）。
+        #
+        # 注意这条路径建出来的条目**没有可保护的匹配结果**（见下面 manual
+        # 保护分支的判据）：用户后来填好 Token 再重扫，会走正常匹配流程把
+        # 数据补上，而不是被"已有手动匹配"挡回去。
         #
         # 为什么用 manual 而不是 pending：pending 的语义是"匹配过、但结果
         # 需要人工确认"（详情页会出现「⚠ 匹配待确认，请点右上角重新匹配」
@@ -954,20 +976,46 @@ class ScanWorker(QThread):
         result = self.matcher.search_best(cand.keywords, local_ep_count)
 
         if result.subject is None:
-            self.log_message.emit(f"  待手动确认：{result.reason}")
+            # **网络/接口失败与"确实没匹配项"要分开**（实测反馈）：
+            # 前者是"这次没联网成功"，条目其实没问题，用户需要知道
+            # "是网络的原因"并重试；后者才需要人工去挑条目。
+            # 单发一个 matchFailed 信号，让界面能弹一条带原因的提示
+            # （而不是让用户在一长串 urllib3 重试日志里自己找线索）。
+            if result.network_failed:
+                self.log_message.emit(
+                    f"  ⚠ 联网匹配失败：{result.network_error or '网络不通'}")
+                self.match_failed.emit(
+                    cand.display_name,
+                    result.network_error or "网络不通")
+            else:
+                self.log_message.emit(f"  待手动确认：{result.reason}")
             self._write_pending(cand, reason=result.reason)
+            # **计数走信号、不走日志文本**（见 item_pending 的说明）：
+            # 上面两条日志文案不同，靠文本匹配会漏掉网络失败那一类。
+            self.item_pending.emit(cand.display_name, result.reason)
             return
 
         subj = result.subject
         bangumi_id = subj["id"]
 
-        # manual 记录保护：用户手动指定过的条目不覆盖
+        # manual 记录保护：**用户手动指定过 Bangumi 条目**的不覆盖。
+        #
+        # 判据是「match_state='manual' 且 bangumi_id 非空」—— 见
+        # Database.find_manual_subject_by_folder 的说明。未匹配的纯本地
+        # 条目（「添加动漫」时没匹配）虽然也是 manual，却没有可保护的
+        # 用户选择，而它恰恰最需要靠重扫补上数据：用户反馈"手动添加过、
+        # 没拉取数据的动漫，重新扫描被跳过，只能删掉重加"。
+        # 这类条目这里继续往下走正常匹配流程，匹配成功后由 upsert_subject
+        # **就地升级**那一行（不会出现同目录两条）。
         manual = self.db.find_manual_subject_by_folder(str(cand.folder_path))
         if manual is not None:
             self.log_message.emit(
                 f"  跳过：该目录已有手动匹配（{manual.name_cn or manual.name}）"
             )
-            self._fill_episodes(manual.id, bangumi_id, cand)
+            # 回填集数要用**用户指定的那个** bangumi_id，不能用本次自动匹配
+            # 的结果：两者常常不同（自动匹配不准正是用户手动指定的原因），
+            # 拿自动匹配的条目去回填，会把集数标题/集 ID 写成另一部番的。
+            self._fill_episodes(manual.id, manual.bangumi_id, cand)
             return
 
         name = subj.get("name", "")
@@ -1024,6 +1072,13 @@ class ScanWorker(QThread):
                 series_name=cand.series_name,
             )
             log.info("待手动确认 %s：%s", cand.folder_path, reason)
+            # **待确认条目也要记进 created_subject_ids**（踩坑，实测）：
+            # 漏了这一步时，「添加动漫」遇到网络失败会走到
+            # `_on_ok` 里"没有产生任何条目"的分支 —— 于是弹一句
+            # "该目录下没有找到可入库的视频"，**并且不跳详情页**；
+            # 可实际上条目已经以 pending 状态写进库了（用户看到的是
+            # "提示说没加成功、但海报墙上多了一张待确认卡片"）。
+            self.created_subject_ids.append(subject_id)
             self._fill_episodes(subject_id, None, cand)
         except Exception as e:
             log.warning("写入待确认条目失败 %s: %s", cand.folder_path, e)

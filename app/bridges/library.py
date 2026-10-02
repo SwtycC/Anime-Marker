@@ -919,6 +919,49 @@ class LibraryBridge(QObject):
         self._notify_cover_changed(subject_id)
         return {"ok": True, "message": "已恢复原版海报"}
 
+    @Slot(int, result="QVariantMap")
+    def deleteSubject(self, subject_id: int) -> dict:
+        """从库中删除该条目（海报墙上随即消失）。
+
+        **只删库里的记录，不动磁盘上的视频文件**（重要）：
+        「添加动漫」是把已有目录**登记**进来，删除自然只该撤销登记。
+        真去删文件是破坏性操作，误点一下就没了 —— 那种事必须由用户
+        自己在资源管理器里做。返回消息里也明确写出这一点。
+
+        删除范围见 `Database.delete_subject`（episodes + subject_tags +
+        subjects，不依赖级联，因为 SQLite 未开外键）。另外顺手清掉该条目的
+        自定义海报文件，避免 `covers/` 里留下永远用不上的孤儿图。
+
+        返回：{ok: bool, message: str}（QML 侧转成提示条）
+        """
+        try:
+            s = self._db.get_subject(subject_id)
+        except Exception as e:
+            log.exception("读取条目 %s 失败: %s", subject_id, e)
+            return {"ok": False, "message": "读取条目失败（详见日志）"}
+        if s is None:
+            return {"ok": False, "message": "条目不存在（可能已被删除）"}
+
+        label = self._subject_label(s)
+        try:
+            self._db.delete_subject(subject_id)
+        except Exception as e:
+            log.exception("删除条目失败：《%s》（subject_id=%s）", label, subject_id)
+            return {"ok": False, "message": "删除失败：%s" % e}
+
+        # 自定义海报文件（`covers/<sid>_custom.*`）随条目一起清掉。
+        # 放在写库**之后**：失败了也只是留个孤儿文件，不会出现"库里没了、
+        # 文件还在被引用"的坏状态。
+        self._remove_custom_files(subject_id)
+
+        log.info("已删除条目：《%s》（subject_id=%s，media files kept on disk）",
+                 label, subject_id)
+
+        # 通知海报墙重新取数（同既有做法：标记 dirty + 发信号）
+        self.reload()
+        return {"ok": True,
+                "message": "已从库中删除「%s」（磁盘上的文件未删除）" % label}
+
     @staticmethod
     def _remove_custom_files(subject_id: int, keep: Optional[Path] = None) -> None:
         """删除该条目的自定义海报文件（`covers/<sid>_custom.*`）。

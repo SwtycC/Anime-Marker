@@ -63,6 +63,8 @@ Item {
                                     : kind === "upBold" ? "arrow-up-bold"
                                     // plus：添加（描边加粗的加号）
                                     : kind === "plus"   ? "plus"
+                                    // trash：删除（垃圾桶）
+                                    : kind === "trash"  ? "trash"
                                     : ""
     readonly property string svgUrl: svgName !== "" && iconsBase !== ""
                                      ? iconsBase + svgName + ".svg" : ""

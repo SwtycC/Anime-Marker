@@ -32,3 +32,4 @@ ShortcutRecorder 1.0 ShortcutRecorder.qml
 BackToTopButton 1.0 BackToTopButton.qml
 FloatingActionButton 1.0 FloatingActionButton.qml
 AddAnimeDialog 1.0 AddAnimeDialog.qml
+ConfirmDialog 1.0 ConfirmDialog.qml

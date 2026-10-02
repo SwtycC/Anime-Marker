@@ -1,0 +1,2 @@
+<!-- fill/stroke 必须为白色：MultiEffect 的 colorization 按「源亮度」相乘，黑色永远染不出颜色（见本目录 README） -->
+<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M2.6 4.4h10.8M6.4 4.4V2.9h3.2v1.5M4.3 4.4l0.7 8.3h6l0.7-8.3M6.6 6.9v3.6M9.4 6.9v3.6" fill="none" stroke="#FFFFFF" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>

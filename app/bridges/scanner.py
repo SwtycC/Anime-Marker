@@ -52,6 +52,11 @@ class ScannerBridge(QObject):
     # 进详情页"，需要知道**具体是哪一条**；而通用的 finished(matched,
     # pending) 只给数量，QML 无从得知该跳去哪一条。
     subjectAdded = Signal(int)
+    # 某条目**因网络/接口失败而未匹配上**：携带 (名称, 原因摘要)。
+    #
+    # 界面据此弹一条**黄色提示**说明原因（用户明确要求），而不是让用户
+    # 在一长串 urllib3 重试日志里自己找线索。见 ScanWorker.match_failed。
+    matchFailed = Signal(str, str)
 
     def __init__(
         self,
@@ -79,6 +84,8 @@ class ScannerBridge(QObject):
         self._adding = False
         # 本次「添加动漫」新入库的 subject_id（0 = 未入库）
         self._added_subject_id = 0
+        # 本次「添加动漫」是否勾选了匹配（决定播报要不要提"未匹配"）
+        self._last_match_requested = True
 
     def set_api(self, api: BangumiClient) -> None:
         self._api = api
@@ -106,6 +113,25 @@ class ScannerBridge(QObject):
         if self._total <= 0:
             return 0.0
         return min(100.0, self._current * 100.0 / self._total)
+
+    @Property(bool, notify=runningChanged)
+    def singleScan(self) -> bool:
+        """本次扫描是否为**单个目录**（「添加动漫」或详情页重扫）。
+
+        QML 据此换用更贴合的说法 —— 全量扫描报"匹配 N 个，待确认 M 个"
+        是自然的（扫了一整个库），但只加了一个目录时这么报就很怪，
+        用户要的是"这一部到底加上没有"。
+        """
+        return self._single_scan
+
+    @Property(bool, notify=runningChanged)
+    def lastMatchRequested(self) -> bool:
+        """本次「添加动漫」是否勾选了"匹配 Bangumi"。
+
+        用来决定要不要提"未匹配"：用户**主动选择不匹配**时，说"未匹配 N"
+        是废话（他没要求匹配），只报"已加入"即可。见 Main.qml 的播报逻辑。
+        """
+        return self._last_match_requested
 
     # ---------- 动作 ----------
     @Slot(result=str)
@@ -176,6 +202,8 @@ class ScannerBridge(QObject):
         worker.log_message.connect(self._on_log)
         worker.finished_ok.connect(self._on_ok)
         worker.failed.connect(self._on_failed)
+        worker.match_failed.connect(self._on_match_failed)
+        worker.item_pending.connect(self._on_pending)
 
         self._worker = worker
         # 全量扫描：允许完成回调发起「在看/动态」同步（见 _on_ok）
@@ -242,6 +270,8 @@ class ScannerBridge(QObject):
         worker.log_message.connect(self._on_log)
         worker.finished_ok.connect(self._on_ok)
         worker.failed.connect(self._on_failed)
+        worker.match_failed.connect(self._on_match_failed)
+        worker.item_pending.connect(self._on_pending)
 
         self._worker = worker
         # 标记为单条目扫描：完成回调据此决定**不发起**「在看/动态」同步
@@ -373,11 +403,18 @@ class ScannerBridge(QObject):
         worker.log_message.connect(self._on_log)
         worker.finished_ok.connect(self._on_ok)
         worker.failed.connect(self._on_failed)
+        worker.match_failed.connect(self._on_match_failed)
+        worker.item_pending.connect(self._on_pending)
 
         self._worker = worker
         self._single_scan = True          # 单条添加不触发「在看/动态」同步
         self._adding = True
         self._added_subject_id = 0
+        # 记下用户有没有勾选匹配 —— 播报"未匹配"的前提取决于它
+        # （用户主动选择不匹配时，报"未匹配 N"是废话）。见 lastMatchRequested。
+        self._last_match_requested = bool(match)
+        # 本次「添加动漫」是否勾选了匹配（决定播报要不要提"未匹配"）
+        self._last_match_requested = True
         self._set_running(True)
         worker.start()
         log.info("添加动漫已启动：%s（匹配=%s）", target, match)
@@ -411,17 +448,28 @@ class ScannerBridge(QObject):
         self.logMessage.emit(f"✓ 已匹配：{name}")
 
     def _on_log(self, msg: str) -> None:
-        # pending 条目的日志形如「  待手动确认：原因」，据此计数
-        if "待手动确认" in msg:
-            self._pending += 1
+        # **不要在这里靠文本匹配计数**（踩坑）：原先写的是
+        # `if "待手动确认" in msg: self._pending += 1` —— 把展示用的日志
+        # 文案当成了协议。后来网络失败那条日志改成了"⚠ 联网匹配失败"
+        # （文案不同），计数便静默漏掉那类条目：界面报"待确认 0"，
+        # 而库里确实多了一条 pending。现在改由 `_on_pending` 计数。
         self.logMessage.emit(msg)
+
+    def _on_pending(self, name: str, reason: str) -> None:
+        """条目被写成待确认（pending）→ 计数（与日志文案解耦）。"""
+        self._pending += 1
+        log.debug("待确认条目：%s（%s）", name, reason)
 
     def _on_ok(self) -> None:
         self._set_running(False)
         log.info("扫描完成：匹配 %s，待确认 %s", self._matched, self._pending)
-        self.logMessage.emit(
-            f"扫描完成：匹配 {self._matched} 个，待确认 {self._pending} 个"
-        )
+        # 扫完的**汇总文案不再走 logMessage**。
+        #
+        # **为什么**（踩坑，实测）：原先这里 emit 一句"扫描完成：匹配 N 个，
+        # 待确认 M 个"，而 QML 侧 `onLogMessage` 会把每条日志都弹成提示条、
+        # `onFinished` 里又弹了同样一句 —— 于是**同一个结果闪两遍**
+        # （前一条被后一条覆盖，看起来像抖了一下）。汇总属于"最终结果"，
+        # 只应由 finished 统一播报；logMessage 留给过程性日志。
         if self._on_finished_hook is not None:
             try:
                 self._on_finished_hook()
@@ -453,3 +501,8 @@ class ScannerBridge(QObject):
         self._set_running(False)
         log.error("扫描失败：%s", msg)
         self.failed.emit(msg)
+
+    def _on_match_failed(self, name: str, reason: str) -> None:
+        """某条目因网络原因未匹配上 → 原样转发给 QML 弹黄色提示。"""
+        log.warning("条目联网匹配失败：%s（%s）", name, reason)
+        self.matchFailed.emit(name, reason)

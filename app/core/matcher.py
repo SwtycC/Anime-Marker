@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from app.core.bangumi_api import extract_aliases
+from app.core.bangumi_api import describe_connection_error, extract_aliases
 
 log = logging.getLogger(__name__)
 
@@ -127,6 +127,18 @@ class MatchResult:
     score: int
     reason: str
     runner_up_score: int = 0
+    # 本次匹配是否**因网络/接口失败而根本没搜到东西**（与"搜到了但都不像"
+    # 是两回事）。
+    #
+    # **为什么需要它**（踩坑，实测反馈）：`search_best` 里对搜索异常是
+    # `except: continue` —— 超时/断网与"关键词搜不出结果"最终都归结为
+    # `"无候选结果"`，调用方无法区分。用户看到的就是"添加动漫后没匹配上"，
+    # 完全没有线索指向"其实是网络不通"（日志里那一大段 urllib3 重试
+    # 只有开发者会去看）。这里显式把"联网失败"这一事实带出去，让上层能
+    # 弹一条说明原因的提示。
+    network_failed: bool = False
+    # 失败原因摘要（network_failed 为真时用于提示文案）
+    network_error: str = ""
 
 
 def is_extra_dir(name: str) -> bool:
@@ -513,6 +525,11 @@ class SubjectMatcher:
         best_reason = ""
         second_score = -9999
         second_subject: Optional[dict] = None
+        # 记录"搜索调用失败"（超时/断网/被阻断…）。见 MatchResult 的说明：
+        # 不记的话，调用方无法把"网络不通"和"确实没有匹配项"区分开，
+        # 用户只能看到一句"没匹配上"，毫无头绪。
+        net_failed = False
+        net_error = ""
 
         for kw in keywords:
             if not kw:
@@ -522,6 +539,10 @@ class SubjectMatcher:
                 results = self.api.search_subjects(kw, limit=10)
             except Exception as e:
                 log.warning("搜索失败 keyword=%s err=%s", kw, e)
+                net_failed = True
+                # 优先保留第一条错误摘要（通常就是最根本的那个原因）
+                if not net_error:
+                    net_error = describe_connection_error(e) or str(e)
                 continue
 
             for subj in results:
@@ -545,7 +566,13 @@ class SubjectMatcher:
                     second_score, second_subject = s, subj
 
         if best_subject is None:
-            return MatchResult(None, 0, "无候选结果")
+            # 一个候选都没有：区分"搜过但没结果"与"压根没搜成功"
+            reason = "无候选结果"
+            if net_failed:
+                reason = f"搜索请求失败：{net_error}" if net_error else "搜索请求失败"
+            return MatchResult(None, 0, reason,
+                               network_failed=net_failed,
+                               network_error=net_error)
 
         # 差距过小 → 不自动接受
         # 注意：只在"第二名是不同条目"时才比较差距。

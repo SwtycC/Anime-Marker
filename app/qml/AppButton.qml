@@ -14,7 +14,10 @@ Rectangle {
     id: root
 
     property string text: ""
-    property string variant: "normal"     // primary | normal | ghost
+    // primary | normal | ghost | danger
+    //
+    // danger：实底 + 红色，用于不可逆的确认按钮（如「删除」）。
+    property string variant: "normal"
     property bool enabledState: enabled
     property bool hovered: mouseArea.containsMouse
     property bool pressed: mouseArea.pressed
@@ -28,6 +31,7 @@ Rectangle {
     opacity: enabled ? 1.0 : 0.45
 
     readonly property bool _isPrimary: variant === "primary"
+    readonly property bool _isDanger: variant === "danger"
     readonly property bool _isGhost: variant === "ghost"
 
     // 拆成多个 readonly 绑定，而不是一个 JS 代码块。
@@ -38,6 +42,14 @@ Rectangle {
     readonly property color _primaryColor: root.pressed ? Theme.accentPressed
                                          : root.hovered ? Theme.accentHover
                                          : Theme.accent
+    // 红色实底：按下更深、悬停更亮。
+    // 亮度用 Qt.darker/lighter 从 dangerColor 派生，不再往主题表里塞
+    // 三个"危险色"变量 —— 那种颜色只有确认按钮用得上。
+    readonly property color _dangerColor: root.pressed
+                                          ? Qt.darker(Theme.dangerColor, 1.15)
+                                          : root.hovered
+                                            ? Qt.lighter(Theme.dangerColor, 1.12)
+                                            : Theme.dangerColor
     // 静止态的"无色"一律用 Theme.fade(同色)，不要用 "transparent"：
     // 后者是黑色透明，ColorAnimation 逐分量插值时会先扫过一段深色（见 Theme.fade）
     readonly property color _normalColor: root.pressed ? Theme.pressedFill
@@ -45,12 +57,14 @@ Rectangle {
                                         : Theme.fade(Theme.hoverFill)
 
     color: root._isPrimary ? _primaryColor
+         : root._isDanger  ? _dangerColor
          : root._isGhost   ? (root.hovered ? Theme.hoverFill
                                            : Theme.fade(Theme.hoverFill))
          : _normalColor
 
     border.width: root._isGhost ? 0 : Theme.lineThin
-    border.color: root._isPrimary ? Theme.fade(Theme.border) : Theme.border
+    border.color: (root._isPrimary || root._isDanger)
+                  ? Theme.fade(Theme.border) : Theme.border
 
     Behavior on color { ColorAnimation { duration: Theme.durFast } }
     Behavior on border.color { ColorAnimation { duration: Theme.durFast } }
@@ -59,7 +73,9 @@ Rectangle {
         id: label
         anchors.centerIn: parent
         text: root.text
-        color: root._isPrimary ? Theme.accentText : Theme.textPrimary
+        // 实底按钮（主题色 / 红色）用反色文字，保证对比度
+        color: (root._isPrimary || root._isDanger)
+               ? Theme.accentText : Theme.textPrimary
         font.pixelSize: Theme.fontMd
         Behavior on color { ColorAnimation { duration: Theme.durFast } }
     }

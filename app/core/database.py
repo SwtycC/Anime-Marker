@@ -427,6 +427,18 @@ class Database:
 
     # ---------- subjects ----------
     def upsert_subject(self, **fields: Any) -> int:
+        """写入/更新一条**已匹配**条目，返回本地主键。
+
+        **同目录已有一条"未匹配占位行"时就地升级，而不是另插一行**（踩坑，
+        实测）：bangumi_id 为 NULL 的条目有两个来源 —— 扫描没匹配上的
+        `pending` 占位，以及「添加动漫」未填 Token 时建的纯本地条目
+        （`upsert_local_subject`）。它们**后来匹配成功**时（重扫 / 详情页
+        重新扫描），若只按 `bangumi_id` 做 ON CONFLICT，会因"库里那行没有
+        bangumi_id"而**新插一行** —— 海报墙上同一个目录出现两张卡
+        （一张有封面、一张没有），集数也分裂在两个 subject 下。
+        所以这里先找同目录的未匹配行，命中就按主键 UPDATE：它原有的
+        episodes（subject_id 指向它）因此原样保留，随后被正常回填。
+        """
         bangumi_id = fields.get("bangumi_id")
         if not bangumi_id:
             raise ValueError("bangumi_id 必填")
@@ -439,6 +451,23 @@ class Database:
             f"ON CONFLICT(bangumi_id) DO UPDATE SET {updates}"
         )
         with self._cursor() as cur:
+            cur.execute("SELECT id FROM subjects WHERE bangumi_id=?", (bangumi_id,))
+            if cur.fetchone() is None:
+                folder = fields.get("folder_path") or ""
+                if folder:
+                    cur.execute(
+                        "SELECT id FROM subjects WHERE folder_path=?"
+                        " AND bangumi_id IS NULL ORDER BY id LIMIT 1",
+                        (folder,),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        sets = ",".join(f"{c}=?" for c in cols)
+                        cur.execute(
+                            f"UPDATE subjects SET {sets} WHERE id=?",
+                            [fields[c] for c in cols] + [int(row["id"])],
+                        )
+                        return int(row["id"])
             cur.execute(sql, [fields[c] for c in cols])
             cur.execute("SELECT id FROM subjects WHERE bangumi_id=?", (bangumi_id,))
             return int(cur.fetchone()["id"])
@@ -786,11 +815,22 @@ class Database:
             return Subject(**dict(row)) if row else None
 
     def find_manual_subject_by_folder(self, folder_path: str) -> Optional[Subject]:
-        """查该目录下手动匹配的条目（重扫时保护，不覆盖）。"""
+        """查该目录下**用户手动指定过 Bangumi 条目**的记录（重扫时保护，不覆盖）。
+
+        **必须排除 bangumi_id 为空的行**（踩坑，实测）：`match_state='manual'`
+        有两种来源 ——
+            ① 用户在「重新匹配」里手选了一部（`set_manual_match`，有 bangumi_id）
+            ② 「添加动漫」在没填 Token / 主动不选匹配时建的**纯本地条目**
+               （`upsert_local_subject`，bangumi_id 为 NULL）
+        ②并没有"用户指定的匹配结果"可保护：若把它一并当成手动匹配跳过，
+        用户之后填好 Token 点「重新扫描」只会得到"跳过：该目录已有手动匹配"，
+        非得删掉重加才能拿到数据（实测反馈）。判据用 bangumi_id 才准确 ——
+        有它是"用户的匹配决定"，没有它只是个还没匹配上的本地条目。
+        """
         with self._cursor() as cur:
             cur.execute(
                 "SELECT * FROM subjects WHERE folder_path=? AND match_state='manual'"
-                " ORDER BY id LIMIT 1",
+                " AND bangumi_id IS NOT NULL ORDER BY id LIMIT 1",
                 (folder_path,),
             )
             row = cur.fetchone()
@@ -917,9 +957,23 @@ class Database:
             )
 
     def delete_subject(self, subject_id: int) -> None:
-        """删除条目及其集数（episodes 有 ON DELETE CASCADE，但需开外键）。"""
+        """删除条目及其**全部关联数据**。
+
+        **不要只删 subjects 主表**（踩坑）：`episodes` 建表时写了
+        `ON DELETE CASCADE`，但 SQLite **默认不开外键约束**（需要
+        `PRAGMA foreign_keys=ON`，本项目未开），级联不会生效 —— 只删主表
+        会留下孤儿集数行；`subject_tags` 更是完全没有级联。
+
+        所以这里**显式逐表清理**：
+            episodes      —— 集数（详情页左列的数据源）
+            subject_tags  —— 接口/用户标签（海报墙 tag 筛选的数据源）
+
+        说明：`watched_episodes` 按 **bangumi_id** 存的是 Bangumi 侧记录，
+        不属于本条的从属数据（同一部番重扫回来后仍要用），故**不删**。
+        """
         with self._cursor() as cur:
             cur.execute("DELETE FROM episodes WHERE subject_id=?", (subject_id,))
+            cur.execute("DELETE FROM subject_tags WHERE subject_id=?", (subject_id,))
             cur.execute("DELETE FROM subjects WHERE id=?", (subject_id,))
 
     # ---------- 聚合展示 ----------

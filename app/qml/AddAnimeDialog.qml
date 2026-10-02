@@ -27,6 +27,8 @@ Window {
 
     /// 当前选择的目录
     property string folder: ""
+    /// 「浏览…」对话框的起始目录（默认媒体库根，见 open()）
+    property string pickStart: ""
     /// 是否做 Bangumi 匹配（无 Token 时强制 false）
     property bool doMatch: true
     /// 是否已填 Token（决定 doMatch 能否勾选）
@@ -55,6 +57,20 @@ Window {
         dlg.busy = false
         dlg.status = ""
         dlg.statusIsError = false
+        // 「浏览…」第一次打开时的**起始目录**：取设置里的媒体库根目录。
+        //
+        // **为什么要单独存一份**（踩坑）：
+        // 早期直接把 `dlg.folder`（当前已选路径）当起始目录传下去 ——
+        // 首次打开时它是空串，系统文件对话框就落在"上次访问的目录"
+        // （实测反馈"第一次点浏览没有默认打开媒体库路径"）。
+        // 用户选了值之后再点"浏览"，用刚选的路径当起点才是对的
+        // （连续调整同一部番的路径时不用重新导航）。
+        //
+        // 媒体库路径可能配了多个（分号分隔），取**第一个**作起点。
+        dlg.pickStart = (typeof settingsBridge !== "undefined" && settingsBridge)
+                        ? String(settingsBridge.getValue("general.library_path", ""))
+                              .split(";")[0].trim()
+                        : ""
         // 有 Token 才默认勾选匹配（用户要求：没填 Token 就不匹配）。
         //
         // 必须调 `getValue`（**@Slot**）而不是 `value` —— 后者是普通 Python
@@ -80,8 +96,16 @@ Window {
         // 成功时由外部立刻 close() 并跳详情页，这里不额外处理
     }
 
+    // ---- 上方：标题 + 说明 + 路径 + 开关 + 状态 ----
+    //
+    // **不用 anchors.fill**（踩坑，与 ConfirmDialog 同一个问题）：
+    // fill 会把 Column 拉满整个窗口高度，`spacing` 又只在子项之间生效，
+    // 于是"状态行"到"按钮行"之间会被撑出一大段空白。
+    // 现在正文区锚顶、按钮区锚底（见下方 Row），两者位置互不影响。
     Column {
-        anchors.fill: parent
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
         anchors.margins: Theme.spacingXl
         spacing: Theme.spacingMd
 
@@ -125,7 +149,10 @@ Window {
                 onClicked: {
                     if (typeof settingsBridge === "undefined" || !settingsBridge)
                         return
-                    var p = settingsBridge.pickDirectory(dlg.folder)
+                    // 起始目录：**已选路径优先**（连续调整时不用重新导航），
+                    // 首次打开则用媒体库根（见 open() 里的 pickStart 说明）
+                    var start = dlg.folder !== "" ? dlg.folder : dlg.pickStart
+                    var p = settingsBridge.pickDirectory(start)
                     if (p) {
                         dlg.folder = p
                         dlg.status = ""
@@ -154,44 +181,62 @@ Window {
         }
 
         // ---- 提示行（错误红字 / 进行中） ----
-        Text {
-            id: statusText
-            objectName: "addAnimeStatus"
+        //
+        // **用固定高度的容器兜住，而不是让 Text 自己 visible 切换**：
+        // `visible: false` 会让该行高度**归零**，下面的内容整体上移一行 ——
+        // 于是"添加前"与"添加中"两种状态下，开关的垂直位置差了一行
+        // （实测两张截图对比很明显）。
+        //
+        // 这里外层 Item 恒定占一个行高（约 20px，够放一行 fontSm），
+        // Text 在里面叠放；没有内容时只是不可见，**位置照旧**。
+        Item {
             width: parent.width
-            visible: dlg.status !== ""
-            text: dlg.status
-            color: dlg.statusIsError ? Theme.dangerColor : Theme.textSecondary
-            font.pixelSize: Theme.fontSm
-            wrapMode: Text.WordWrap
+            height: 20
+
+            Text {
+                id: statusText
+                objectName: "addAnimeStatus"
+                width: parent.width
+                text: dlg.status
+                visible: dlg.status !== ""
+                color: dlg.statusIsError ? Theme.dangerColor
+                                         : Theme.textSecondary
+                font.pixelSize: Theme.fontSm
+                wrapMode: Text.WordWrap
+            }
+        }
+    }
+
+    // ---- 操作按钮：**钉在小窗下沿** ----
+    //
+    // 与 ConfirmDialog 同一套版式（正文在上、按钮贴底）。这样：
+    //   ① 状态行出现/消失时按钮**不会上下跳**（实测反馈"位置不一致"）；
+    //   ② 正文长度变化（如错误信息折行）也不影响按钮位置。
+    Row {
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.margins: Theme.spacingXl
+        spacing: Theme.spacingMd
+
+        AppButton {
+            objectName: "addAnimeCancelBtn"
+            text: "取消"
+            enabled: !dlg.busy
+            onClicked: dlg.close()
         }
 
-        Item { width: 1; height: Theme.spacingSm }
-
-        // ---- 操作 ----
-        Row {
-            anchors.right: parent.right
-            spacing: Theme.spacingMd
-
-            AppButton {
-                objectName: "addAnimeCancelBtn"
-                text: "取消"
-                enabled: !dlg.busy
-                onClicked: dlg.close()
-            }
-
-            AppButton {
-                objectName: "addAnimeConfirmBtn"
-                text: dlg.busy ? "添加中…" : "添加"
-                variant: "primary"
-                enabled: !dlg.busy && dlg.folder.trim() !== ""
-                onClicked: {
-                    if (dlg.folder.trim() === "")
-                        return
-                    dlg.busy = true
-                    dlg.status = dlg.doMatch ? "正在匹配并加入…" : "正在加入…"
-                    dlg.statusIsError = false
-                    dlg.submitted(dlg.folder.trim(), dlg.doMatch)
-                }
+        AppButton {
+            objectName: "addAnimeConfirmBtn"
+            text: dlg.busy ? "添加中…" : "添加"
+            variant: "primary"
+            enabled: !dlg.busy && dlg.folder.trim() !== ""
+            onClicked: {
+                if (dlg.folder.trim() === "")
+                    return
+                dlg.busy = true
+                dlg.status = dlg.doMatch ? "正在匹配并加入…" : "正在加入…"
+                dlg.statusIsError = false
+                dlg.submitted(dlg.folder.trim(), dlg.doMatch)
             }
         }
     }

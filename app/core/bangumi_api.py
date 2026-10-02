@@ -416,7 +416,13 @@ class BangumiClient:
         api_base: str = "https://api.bgm.tv",
         proxy: str = "",
         user_agent: str = USER_AGENT,   # 合规 UA 见 app/__init__.py 的说明
-        timeout: float = 10.0,
+        # 单次请求的超时（连接 + 读取）。
+        #
+        # **从 10 秒降到 6 秒**（实测反馈"超时时间有点长"）：
+        # 真实可用的链路（哪怕走代理绕一圈）通常 1~3 秒内就能建连，6 秒
+        # 足够；连不上时大概率是"被阻断 / 代理没生效"，多等 4 秒也不会变通。
+        # 配合下面的重试次数下调，最坏等待从约 60 秒缩到约 15 秒。
+        timeout: float = 6.0,
         fast_probe: bool = False,
     ) -> None:
         self.api_base = api_base.rstrip("/")
@@ -437,8 +443,14 @@ class BangumiClient:
                 allowed_methods=frozenset(["GET"]),
             )
         else:
+            # **连接重试从 3 次降到 1 次**（实测反馈"超时太长"）：
+            # 原策略 `connect=3` = 连接不通时重试 3 次（共 4 次尝试），
+            # 单次 6s 超时下最坏也要约 24 秒才报错 —— 而"连不上"这种失败
+            # 重试几乎不会改变结论（实测日志里三次全是同一个 ConnectTimeout）。
+            # read=3 保留：读超时可能是服务端偶发慢，重试有意义。
+            # 这样最坏等待 ≈ 6s×2（连接）+ 少量读重试。
             retry = Retry(
-                total=3, connect=3, read=3,
+                total=3, connect=1, read=3,
                 backoff_factor=0.5,
                 status_forcelist=(429, 500, 502, 503, 504),
                 # PATCH 也要列进来：标记单集看过用的是 PATCH（见 mark_episode_watched）。
@@ -561,9 +573,11 @@ class BangumiClient:
         if addr:
             # 去掉 scheme 少占几个字符（状态栏是单行，右端会被省略号截断）
             shown = addr.split("://")[-1]
-            hint += f" —— 已走代理 {shown}，请确认它没把 bgm.tv 分流成直连"
-        else:
-            hint += " —— 当前未走代理，请在「设置 → Bangumi → 代理」配置"
+            hint += f" —— 已走代理 {shown}"
+        # **不再补"未检测到代理，请去设置里填"**（实测反馈：用户只是询问
+        # 这一栏的作用，不需要它出现在报错里）。而且那句话本身有误导性 ——
+        # 开着 clash 系统代理时压根不用填（requests 会自动读系统代理）。
+        # 这里只说清"是什么错"，具体怎么配代理交给文档与设置页说明。
         return hint
 
     # ---------- 业务 ----------

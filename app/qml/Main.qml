@@ -114,7 +114,15 @@ ApplicationWindow {
                     onAddAnimeRequested: addAnimeDialog.open()
                 }
 
-                DetailPage { id: detailPage; objectName: "detailPage" }
+                DetailPage {
+                    id: detailPage
+                    objectName: "detailPage"
+                    // 「删除」→ 先弹确认框（不可逆操作，必须二次确认）
+                    onDeleteRequested: function (subjectId) {
+                        deleteDialog.ask(subjectId,
+                                         detailPage.subject.title || "")
+                    }
+                }
             }
 
             InProgressPage {
@@ -355,6 +363,55 @@ ApplicationWindow {
             if (addAnimeDialog.visible)
                 addAnimeDialog.onResult(false, msg || "添加失败")
         }
+        // 某条目**因网络原因**没匹配上 → 黄色提示说明原因。
+        //
+        // warn=true 用琥珀色：这不是"错误"（条目已入库、只是标签页为
+        // 待确认），而是"需要知道但不致命"的提醒 —— 与「该标签已存在」
+        // 同一档语义。
+        //
+        // `name` 参数仍保留在信号里（日志与将来可能的展开视图要用）。
+        function onMatchFailed(name, reason) {
+            // 去掉 reason 末尾可能带的" —— 已走代理 xx"之类补充（基类提示
+            // 现在只保留到"是什么错"为止，这里不再额外拼接长尾）。
+            banner.show("联网匹配失败：" + reason
+                        + " —— 条目已加入待确认", true)
+        }
+    }
+
+    // ============ 删除确认对话框 ============
+    //
+    // 「删除」是不可逆操作，必须先确认。确认后：
+    //   ① 调 library.deleteSubject(id)（只删库记录，磁盘文件不动）
+    //   ② 退出详情页回到海报墙（该卡片已消失，留在详情页会很怪）
+    //   ③ 用提示条说明"磁盘文件未删除"，消除用户顾虑
+    ConfirmDialog {
+        id: deleteDialog
+        objectName: "deleteDialog"
+        danger: true
+        acceptText: "删除"
+
+        onConfirmed: function (subjectId) {
+            if (typeof library === "undefined" || !library) {
+                statusBar.setMessage("媒体库不可用，删除失败", 5000)
+                return
+            }
+            var r = library.deleteSubject(subjectId)
+            if (!r || r.ok !== true) {
+                statusBar.setMessage((r && r.message) ? r.message : "删除失败",
+                                     6000)
+                return
+            }
+            // 退出详情页：先切回海报墙那一格，再回到当初进来的外层页
+            detailPage.load(0)
+            browseStack.currentIndex = 0
+            window.currentPage = detailOriginPage
+            // 删除成功用**主题色**提示（不是红色 —— 红色留给"失败"）
+            banner.show(r.message || "已删除", false)
+        }
+
+        onCancelled: {
+            // 取消不做任何事（详情页保持原样）
+        }
     }
 
     // ============ 手动匹配对话框 ============
@@ -497,6 +554,21 @@ ApplicationWindow {
     Component.onCompleted: nav.z = 100
 
     // ============ 扫描 → 状态栏 ============
+    // ============ 扫描 → 状态栏（**只管进度与过程日志**）============
+    //
+    // **分工约定**：
+    //   状态栏  —— 进度 + 过程性日志（"共发现 N 个条目"、"✓ 已匹配…"）
+    //   顶部提示条 —— 所有**结论性**消息（扫描完成 / 联网失败 / 已删除…），
+    //                 并带颜色分级（主题色=正常、琥珀=需注意）
+    //
+    // **为什么这么分**（踩坑）：原先这里和下面那个 banner 的 Connections
+    // 是**各接一遍同一个 scanner**，于是同一次事件被两个通道各报一次 ——
+    // 用户看到"两条都在说超时"（其实一条来自状态栏、一条来自顶部提示条），
+    // 而且措辞还不一样（状态栏写"匹配 N 个"、提示条写"已匹配/未匹配"）。
+    // 结论只报一次，才不会自相矛盾。
+    //
+    // 状态栏适合承载"持续变化的过程量"（进度条 + 滚动日志），
+    // 但它是 28px 的细条、容易被忽略，不适合放需要用户看到的结论。
     Connections {
         target: typeof scanner !== "undefined" && scanner ? scanner : null
 
@@ -504,14 +576,16 @@ ApplicationWindow {
             statusBar.setProgress(current, total)
         }
 
+        // 过程日志照旧进状态栏（**结论性日志已在下方的 banner 通道拦截**，
+        // 见那里 onLogMessage 的说明，同一条不会两边都弹）
         function onLogMessage(msg) {
             statusBar.setMessage(msg)
         }
 
         function onFinished(matched, pending) {
+            // **不再在这里报"扫描完成：匹配 N 个…"** —— 结论统一由顶部
+            // 提示条播报（见下方 banner 的 onFinished）。这里只收掉进度条。
             statusBar.stopProgress()
-            statusBar.setMessage(
-                "扫描完成：匹配 " + matched + " 个，待确认 " + pending + " 个", 8000)
             // 详情页正开着时重取：单条目重扫（详情页「+」按钮）会改写集数
             // 序号/标题/匹配状态，不刷新的话用户看到的还是旧列表
             // （与 player.onWatched 的处理同理）。
@@ -522,8 +596,8 @@ ApplicationWindow {
         }
 
         function onFailed(msg) {
+            // 同上：失败结论归顶部提示条，这里只收进度条
             statusBar.stopProgress()
-            statusBar.setMessage("扫描失败：" + msg, 8000)
         }
     }
 
@@ -756,129 +830,215 @@ ApplicationWindow {
         }
     }
 
-    Rectangle {
+    // ============ 顶部提示条（**可叠加多层**）============
+    //
+    // 为什么要做成"列表"而不是单个浮层（实测反馈）：
+    // 「添加动漫」网络失败时会**连发两条**消息 ——
+    //   ① 琥珀："联网匹配失败：连接超时…… —— 条目已加入待确认"（说明原因）
+    //   ② 主题色："扫描完成：未匹配"（说明结果）
+    // 单浮层实现下后一条会把前一条**覆盖**掉，用户根本看不到那句原因
+    // （实测："在软件里没看到为什么超时的黄色提示框"）。
+    // 现在按顺序**从上往下堆叠**：原因在上、结果在下，两条同时可见。
+    //
+    // **注意与状态栏的分工**（方案 ）：顶部提示条只放**结论**；
+    // 过程日志（"共发现 N 个条目"、"✓ 已匹配…"）归状态栏，不要在这里
+    // 再弹一遍 —— 否则同一次事件会出现两条措辞不同的提示。
+    Item {
         id: banner
-        objectName: "statusBanner"
 
-        // 提示条有两种语气：
-        //   normal —— 主题色底（"已保存"这类中性/成功信息）
-        //   warn   —— 琥珀色底（"该标签已存在"这类需要注意但不致命的提示）
-        // 用 `warn` 而不是 `dangerColor`：重复添加不是错误，红字会显得过重。
-        property bool warn: false
-        // 可选动作（show() 的第三参）："settings" = 点击浮条跳转设置页。
-        // 空串 = 普通提示，不可点击（MouseArea disabled，不挡下层点击）。
-        property string action: ""
+        // 每条消息：{ text, warn, action, subjectId }
+        property var messages: []
 
-        // 位置：**窗口顶部居中**，浮在内容之上，不占布局空间。
-        //
-        // 位置取舍（三次调整，记下结论）：
-        //   ① 最初在底部导航正上方 —— 与高对比的胶囊导航挤成一团，
-        //      既抢注意力、又像是导航的一部分（实测反馈"和导航栏重叠"）。
-        //   ② 搬到右上角 —— 会压住详情页右上角的「更换海报 / 重新匹配」
-        //      按钮（实测截图确认）。各页面右上角基本都有操作按钮，
-        //      这里并不空。
-        //   ③ 现在放在**顶部居中** —— 该区域在各页面都是空白：标题左对齐、
-        //      操作按钮靠右，中间这条带子没人占用。
-        //
-        // 为什么不贴顶：贴着窗口边缘会有"被裁切"的观感，留 `_topMargin`
-        // 让它落在标题行上方的空白带里。
-        readonly property int _pad: 12
+        // 单条的高度与间距
+        readonly property int _itemH: 38
+        readonly property int _gap: 8
         readonly property int _topMargin: 14
+        // 最多同时显示几条（超出时挤掉最旧的，避免刷屏盖满上半屏）
+        readonly property int _maxItems: 3
+        // 各条的停留时长：**统一 5 秒**（实测反馈"两个提示框时间都改为 5s"）。
+        //
+        // 早先琥珀警告给了 8 秒（理由是"要用户去看"），但实际用起来：
+        // 网络失败时黄条与"扫描完成"同时出现，黄条赖着不走会挡住后面的
+        // 提示，还让整屏一直有东西在闪。既然结论已经足够简短，
+        // 两种语气统一即可（3 秒 → 5 秒，留足阅读时间）。
+        readonly property int _infoLife: 5000
+        readonly property int _warnLife: 5000
+
+        // 整体宽度：取**最长那条的估算宽**（Text 未创建时用字数粗估，
+        // 避免依赖 Repeater 的 delegate 是否已实例化）。
+        //
+        // 每字宽度按 fontMd 的中文全角估：Theme.fontMd ≈ 14px，
+        // 中文字形接近字号宽度，故 `字数 × 字号 + 内边距` 足够贴近实际；
+        // 略微偏大一点点也无妨（提示条宽一点比文字被截断好）。
+        readonly property int _width: {
+            var maxLen = 1
+            for (var i = 0; i < messages.length; i++)
+                maxLen = Math.max(maxLen, messages[i].text.length)
+            return Math.min(window.width - 48,
+                            maxLen * Theme.fontMd + Theme.spacingXl * 2)
+        }
+
+        width: _width
+        height: Math.max(0, messages.length * _itemH
+                         + Math.max(0, messages.length - 1) * _gap)
         x: Math.round((window.width - width) / 2)
         y: _topMargin
-
-        width: bannerText.implicitWidth + Theme.spacingXl * 2
-        height: 38
-        radius: Theme.radiusSm
-        // 琥珀色不放进 Theme：只在提示条这一处用，加进主题表反而增加
-        // 维护面（且 warningColor 是为深色背景调过的，做底色偏暗）
-        color: banner.warn
-               ? (Theme.dark ? "#3A2E12" : "#FFF4D6")
-               : Theme.accentSoft
-        border.width: Theme.lineThin
-        border.color: banner.warn
-                      ? (Theme.dark ? "#8A6D1F" : "#E0B84C")
-                      : Theme.accent
-        opacity: 0
-        visible: opacity > 0.01
         z: 200
 
-        // 出现时从上方轻微滑入（配合顶部位置的"弹出"观感）
-        transform: Translate {
-            y: banner.opacity > 0.5 ? 0 : -8
-            Behavior on y {
-                NumberAnimation { duration: Theme.durNormal; easing.type: Easing.OutCubic }
+        /// 显示一条提示（**追加**到底部，不覆盖已有的）。
+        ///
+        /// `warn` 为 true 时用琥珀色（需注意但不致命）；
+        /// `action` 传 "settings" → 点击跳设置页；
+        /// 传 "subject" → 点击跳 `subjectId` 对应条目详情页。
+        function show(text, warn, action, subjectId) {
+            var list = banner.messages.slice()   // var 属性要整体赋值才会通知
+            list.push({
+                "text": text,
+                "warn": warn === true,
+                "action": (action === "settings" || action === "subject")
+                          ? action : "",
+                "subjectId": (action === "subject") ? (subjectId || 0) : 0,
+                // 剩余存活时间（毫秒）。**警告类留更久**：它是要用户去
+                // 处理的（如"检查代理设置"），一闪而过等于没说。
+                "life": (warn === true) ? banner._warnLife : banner._infoLife
+            })
+            // 超过上限时丢掉**最旧**的（用户已经在看最新的了）
+            while (list.length > banner._maxItems)
+                list.shift()
+            banner.messages = list
+        }
+
+        /// 立即清空全部提示
+        function clear() {
+            banner.messages = []
+        }
+
+        /// 移除指定下标的一条（越界忽略）
+        function removeAt(index) {
+            var list = banner.messages.slice()
+            if (index < 0 || index >= list.length)
+                return
+            list.splice(index, 1)
+            banner.messages = list
+        }
+
+        /// 执行某条的 action（"settings" 跳设置页 / "subject" 跳详情页）
+        function runAction(msg) {
+            if (!msg || msg.action === "")
+                return
+            if (msg.action === "settings") {
+                window.gotoPage(4)      // 4 = 设置页（见页面索引表）
+                // 不止切页，还要滚动到那个开关并高亮
+                settingsPage.revealField("epAlignOrderBox")
+            } else if (msg.action === "subject" && msg.subjectId > 0) {
+                // 跳到该条目的详情页（与从海报墙点卡片同一条路径：
+                // 内层子栈切到详情 + 外层切回 browseStack 所在页）
+                detailOriginPage = 0
+                detailPage.load(msg.subjectId)
+                browseStack.currentIndex = 1
+                window.currentPage = 0
             }
         }
 
-        Behavior on opacity { NumberAnimation { duration: Theme.durNormal } }
+        Column {
+            anchors.fill: parent
+            spacing: banner._gap
 
-        Text {
-            id: bannerText
-            anchors.centerIn: parent
-            color: banner.warn
-                   ? (Theme.dark ? "#F0D48A" : "#7A5B08")
-                   : Theme.accent
-            font.pixelSize: Theme.fontMd
+            Repeater {
+                id: messageRepeater
+                model: banner.messages
 
-            Behavior on color { ColorAnimation { duration: Theme.durNormal } }
+                delegate: Rectangle {
+                    id: row
+                    required property var modelData
+                    required property int index
+
+                    width: rowText.implicitWidth + Theme.spacingXl * 2
+                    height: banner._itemH
+                    radius: Theme.radiusSm
+                    // 琥珀色不放进 Theme：只在这类提示用，加进主题表反而
+                    // 增加维护面（且 warningColor 是给深色背景调的，做底色偏暗）
+                    color: row.modelData.warn
+                           ? (Theme.dark ? "#3A2E12" : "#FFF4D6")
+                           : Theme.accentSoft
+                    border.width: Theme.lineThin
+                    border.color: row.modelData.warn
+                                  ? (Theme.dark ? "#8A6D1F" : "#E0B84C")
+                                  : Theme.accent
+
+                    // 整体水平居中（Column 是左对齐的，这里各自居中）
+                    x: Math.round((banner.width - width) / 2)
+
+                    // 出现时轻微滑入 + 淡入（新加的那条会动画，旧的保持）
+                    opacity: 1
+                    transform: Translate {
+                        y: 0
+                        Behavior on y {
+                            NumberAnimation { duration: Theme.durNormal
+                                              easing.type: Easing.OutCubic }
+                        }
+                    }
+
+                    Text {
+                        id: rowText
+                        anchors.centerIn: parent
+                        text: row.modelData.text
+                        color: row.modelData.warn
+                               ? (Theme.dark ? "#F0D48A" : "#7A5B08")
+                               : Theme.accent
+                        font.pixelSize: Theme.fontMd
+                    }
+
+                    // 点击 → 执行该条的 action 并**移除这一条**
+                    MouseArea {
+                        anchors.fill: parent
+                        // 只在带 action 时接管点击（否则不挡下层）
+                        enabled: row.modelData.action !== ""
+                        cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                        onClicked: {
+                            banner.runAction(row.modelData)
+                            banner.removeAt(row.index)
+                        }
+                    }
+                }
+            }
         }
 
+        // **每条各自倒计时**（不再"统一到点删最旧的"）。
+        //
+        // 为什么要这样（踩坑思路）：早期实现是"定时器每 3 秒删最旧那条"，
+        // 于是「网络失败原因」（琥珀，先出现）会在结果提示出现后没多久
+        // **先被删掉** —— 用户正想读原因，它却先没了，反而把不重要的
+        // "扫描完成"留着。现在每条带自己的 `life`，到点各自退场
+        // （普通信息与琥珀警告现在统一 5 秒，见上方 _infoLife/_warnLife）。
         Timer {
             id: bannerTimer
-            // 停留 3 秒后淡出（淡出动画本身再加 durNormal=200ms）。
-            // 用 restart() 而非 start()：连续触发时重新计时，避免第二条
-            // 提示被前一条的计时器提前关掉。
-            interval: 3000
-            onTriggered: banner.opacity = 0
-        }
-
-        /// 显示提示。`warn` 为 true 时用琥珀色（重复 / 需注意）。
-        /// `action` 传 "settings" 时浮条可点击 → 跳转设置页；
-        /// 传 "subject" 时点击 → 跳转 `actionSubjectId` 对应条目的详情页
-        /// （「添加动漫」发现该番已存在时用）。
-        ///
-        /// **为什么按钮要带 id**（而不是让调用方自己接点击）：提示条本身是
-        /// 一次性浮层，点击后就要"知道去哪儿"。多一个 `actionSubjectId`
-        /// 比再开一套回调更省事，也与既有 `action` 机制一致。
-        function show(text, warn, action, subjectId) {
-            banner.warn = warn === true
-            banner.action = (action === "settings" || action === "subject")
-                            ? action : ""
-            banner.actionSubjectId = (action === "subject") ? (subjectId || 0) : 0
-            bannerText.text = text
-            banner.opacity = 1
-            bannerTimer.restart()
-        }
-
-        // action="subject" 时的目标条目 id
-        property int actionSubjectId: 0
-
-        // 点击浮条 → 执行 action 并收起。
-        // 只在带 action 时启用：普通提示的浮条区域不拦截下层点击。
-        MouseArea {
-            anchors.fill: parent
-            enabled: banner.action !== ""
-            cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-            onClicked: {
-                if (banner.action === "settings") {
-                    window.gotoPage(4)      // 4 = 设置页（见页面索引表）
-                    // 不止切页，还要滚动到那个开关并高亮（否则用户要在一
-                    // 整页表单里自己找「集数按顺序对应」）
-                    settingsPage.revealField("epAlignOrderBox")
-                } else if (banner.action === "subject"
-                           && banner.actionSubjectId > 0) {
-                    // 跳到该条目的详情页（与从海报墙点卡片同一条路径：
-                    // 内层子栈切到详情 + 外层切回 browseStack 所在页）
-                    detailOriginPage = 0
-                    detailPage.load(banner.actionSubjectId)
-                    browseStack.currentIndex = 1
-                    window.currentPage = 0
+            interval: 500                     // 每 0.5 秒结算一次
+            repeat: true
+            running: banner.messages.length > 0
+            onTriggered: {
+                var list = banner.messages.slice()
+                var kept = []
+                for (var i = 0; i < list.length; i++) {
+                    var m = list[i]
+                    // 拷贝一份再改（var 数组里的对象就地改不发通知）
+                    kept.push({
+                        "text": m.text, "warn": m.warn,
+                        "action": m.action, "subjectId": m.subjectId,
+                        "life": m.life - bannerTimer.interval
+                    })
                 }
-                banner.opacity = 0
+                // 全部过期就清空（避免留下 life 为负的死项）
+                var alive = []
+                for (var j = 0; j < kept.length; j++)
+                    if (kept[j].life > 0)
+                        alive.push(kept[j])
+                banner.messages = alive
             }
         }
     }
+
+
 
     // ---- 扫描进度反馈：写进窗口标题（QML 无状态栏，暂用标题承载）----
     Connections {
@@ -889,12 +1049,41 @@ ApplicationWindow {
                 banner.show("开始扫描…")
         }
 
+        // **过程日志不再进顶部提示条**（方案 A 分工）。
+        //
+        // 理由：过程日志是"滚动的流水"（"共发现 N 个条目"、"✓ 已匹配 X"、
+        // "⚠ 联网匹配失败…"），它们属于**状态栏**（细条、常驻、可以一直刷新，
+        // 见上面那个 Connections）。若同时往顶部提示条灌，会出现：
+        //   ① 每次扫描刷出十几条提示条，把画面盖住；
+        //   ② 网络失败时同时出现 [琥珀]"联网匹配失败：<原因>" 与
+        //      [主题色]"⚠ 联网匹配失败：<原因>" 两条，说的是同一件事、
+        //      底色还不同，用户以为出了两种问题（实测反馈"两条都在说超时"）。
+        //
+        // 顶部提示条只承载**结论**：扫描完成 / 联网失败 / 扫描失败
+        // （分别见 onFinished / onMatchFailed / onFailed）。
         function onLogMessage(msg) {
-            banner.show(msg)
+            // 有意留空：分工调整后，过程日志归状态栏。
+            // 保留这个空实现是为了让"这里接过 onLogMessage、但故意不播报"
+            // 这件事在代码里可见，避免以后有人以为漏了而补回去。
         }
 
+        // 扫描结果的统一播报（**只在这里播一次**）。
+        //
+        // 措辞分两种（用户要求）：
+        //   单个目录（「添加动漫」/ 详情页重扫）：
+        //       只报**一个**结论 —— "扫描完成：已匹配" 或 "扫描完成：未匹配"。
+        //       **不带原因**：失败原因由那条黄色提示负责说明，这里复述
+        //       一遍只会让两条提示内容重叠。
+        //   全量扫描：沿用"匹配 N 个，待确认 M 个"（扫一整个库，
+        //       用"个"计数才自然，也能一眼看出规模）。
         function onFinished(matched, pending) {
-            banner.show("扫描完成：匹配 " + matched + " 个，待确认 " + pending + " 个")
+            if (scanner.singleScan) {
+                banner.show(matched > 0 ? "扫描完成：已匹配"
+                                        : "扫描完成：未匹配")
+            } else {
+                banner.show("扫描完成：匹配 " + matched
+                            + " 个，待确认 " + pending + " 个")
+            }
             library.reload()
         }
 

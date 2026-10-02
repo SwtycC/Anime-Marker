@@ -13,8 +13,21 @@ Item {
     /// 提示消息（由 Main.qml 转成窗口底部浮条）。
     /// `warn` = true 时浮条用琥珀色（如"该标签已存在"）。
     /// `action` = 可选动作："settings" → 浮条可点击、跳转设置页
-    /// （其余发射点不传即为 undefined，浮条按普通提示处理）。
+    /// （普通提示传空串）。
+    ///
+    /// **发射时必须把三个参数都传齐**（踩坑，实测日志：
+    /// `DetailPage.qml:290: Error: Insufficient arguments`）：Qt 6 的 QML
+    /// 里调用 signal 少传参数会直接报错、**该次提示静默丢失** —— 早期按
+    /// Qt 5 的习惯只写前一个/前两个参数，于是"点重新扫描"这类提示弹不出来，
+    /// 只在日志里留一条 Error。信号声明不支持默认值，只能每个发射点写全。
     signal statusMessage(string text, bool warn, string action)
+    /// 请求删除该条目（由 Main.qml 弹确认并调用后端）。
+    ///
+    /// **为什么不在页面里直接删**：删除是不可逆操作，必须**先确认**。
+    /// 确认框要挂在窗口级（本页会被 StackLayout 切走），且删除后还要
+    /// 退出详情页、刷新海报墙 —— 这一串编排属于 Main.qml 的职责，
+    /// 页面只表达"用户想删这一条"。
+    signal deleteRequested(int subjectId)
 
     property int subjectId: 0
     property var subject: ({})
@@ -164,7 +177,7 @@ Item {
         var lower = name.toLowerCase()
         for (var i = 0; i < root.editUser.length; i++) {
             if (root.editUser[i].toLowerCase() === lower) {
-                root.statusMessage("标签「" + name + "」已存在", true)
+                root.statusMessage("标签「" + name + "」已存在", true, "")
                 return
             }
         }
@@ -174,7 +187,7 @@ Item {
                 root.statusMessage(
                     root.editApi[j].deleted
                         ? "「" + name + "」已存在（已删除，点它可恢复）"
-                        : "标签「" + name + "」已存在", true)
+                        : "标签「" + name + "」已存在", true, "")
                 return
             }
         }
@@ -186,7 +199,7 @@ Item {
             return
         root.editUser = next
         root.newTagText = ""
-        root.statusMessage("已添加标签「" + name + "」")
+        root.statusMessage("已添加标签「" + name + "」", false, "")
     }
 
     /// 把当前草稿提交给桥接层；返回是否成功。
@@ -198,7 +211,7 @@ Item {
             return false
         var r = library.saveSubjectTags(root.subjectId, apiStates, userNames)
         if (!r.ok)
-            root.statusMessage(r.message || "保存失败")
+            root.statusMessage(r.message || "保存失败", false, "")
         return r.ok === true
     }
 
@@ -280,7 +293,7 @@ Item {
                         if (typeof scanner === "undefined" || !scanner)
                             return
                         scanner.startSubject(root.subjectId)
-                        root.statusMessage("正在重新扫描该条目…")
+                        root.statusMessage("正在重新扫描该条目…", false, "")
                     }
                 }
 
@@ -414,7 +427,8 @@ Item {
                                     return
                                 if (!library.openSubjectPage(root.subjectId))
                                     root.statusMessage(
-                                        "该条目未关联 Bangumi，无法打开页面")
+                                        "该条目未关联 Bangumi，无法打开页面",
+                                        false, "")
                             }
 
                             ToolTip.visible: containsMouse
@@ -913,6 +927,47 @@ Item {
                 }
             }
         }
+    }
+
+    // ---- 「删除」悬浮按钮（右下角）----
+    //
+    // 位置与样式**与海报墙的「添加动漫」按钮完全一致**（同一套
+    // FloatingActionButton：50 圆 + 悬停展开成胶囊 + 淡描边 + 进出不对称
+    // 的时长）。差别只有两点：
+    //   ① `danger: true` → 整颗按钮走红色系（删除类操作的通用视觉语言）
+    //   ② 图标换成垃圾桶、文案「删除」
+    //
+    // **必须是 ColumnLayout 的兄弟项**（不能放进里面的布局流）：
+    // 放进去会被 Layout 分配空间、把内容区挤变形；这里与海报墙一样是
+    // "浮在内容之上"的层。
+    //
+    // 位置取值也与海报墙保持同一套常量，这样两页的按钮落在同一处：
+    //   水平：贴右边缘（留 pagePadding，不避让滚动条 —— 本页集数列表的
+    //         滚动条在最右侧且较窄，按 pagePadding 对齐反而更整齐）
+    //   垂直：导航胶囊顶边再往上一点
+    FloatingActionButton {
+        id: deleteButton
+        objectName: "deleteButton"         // 诊断/探针用
+        z: 2
+        icon: "trash"
+        label: "删除"
+        danger: true
+        // 垃圾桶图标比默认（20）大一号（实测反馈"图标放大一点"）。
+        // **只改这一个实例**：海报墙的「添加动漫」按钮仍用组件默认值，
+        // 因此这里覆盖属性而不是去动 FloatingActionButton 里的 iconSize ——
+        // 后者是共用属性，改了会把另一个按钮也一起放大。
+        // 图标尺寸是 `iconRestY` / `iconFlownY` 的输入项，居中与飞出距离
+        // 都按新值重算，无需另外调坐标。
+        iconSize: 26
+        // 条目未加载完成时（subjectId=0）不显示，避免"删了个空的"
+        visible: root.subjectId > 0
+        anchors.right: parent.right
+        anchors.rightMargin: Theme.pagePadding
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: Theme.navBottomMargin + Theme.navPillHeight
+                              + Theme.spacingLg
+
+        onClicked: root.deleteRequested(root.subjectId)
     }
 
     // ---- 信号（由 Main.qml 接）----
