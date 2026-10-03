@@ -36,6 +36,19 @@ COLLECT_TYPE_DOING = 3     # 在看
 COLLECT_TYPE_ON_HOLD = 4   # 搁置
 COLLECT_TYPE_DROPPED = 5   # 抛弃
 
+# 收藏类型的中文名。
+#
+# **唯一权威定义**：界面上那排「想看 / 看过 / 在看 / 搁置 / 抛弃」的状态选择
+# 与后端日志都从这里取，避免两处各写一份字面量后漂移。
+# 顺序即界面顺序（Bangumi 官网的排列：想看 → 看过 → 在看 → 搁置 → 抛弃）。
+COLLECT_TYPE_NAMES: dict[int, str] = {
+    COLLECT_TYPE_WISH: "想看",
+    COLLECT_TYPE_DONE: "看过",
+    COLLECT_TYPE_DOING: "在看",
+    COLLECT_TYPE_ON_HOLD: "搁置",
+    COLLECT_TYPE_DROPPED: "抛弃",
+}
+
 
 class BangumiError(RuntimeError):
     """Bangumi API 业务异常。"""
@@ -43,6 +56,20 @@ class BangumiError(RuntimeError):
 
 class BangumiAuthError(BangumiError):
     """Token 无效或权限不足（401/403）。"""
+
+
+class BangumiNotFound(BangumiError):
+    """HTTP 404 —— 资源不存在。
+
+    **为什么值得单独一个异常类**：404 在 Bangumi 有两种截然不同的含义 ——
+    「这个东西本来就没有」（该条目未收藏、路径里的用户/条目不匹配）与
+    「请求本身发错了」（端点或占位符用错）。前者是**正常结论**，不该当成
+    故障告警，更不该让调用方把"没查成"与"确实没有"混为一谈（混了会把
+    网络故障写成本地快照，此后一直是错的，见 bridges/library 的收藏状态
+    回查）。有了这个类，调用方可以 `except BangumiNotFound` 精确分开。
+
+    它继承 `BangumiError`：所有既有的 `except BangumiError` 行为不变。
+    """
 
 
 def describe_connection_error(exc: Exception) -> str:
@@ -424,9 +451,25 @@ class BangumiClient:
         # 配合下面的重试次数下调，最坏等待从约 60 秒缩到约 15 秒。
         timeout: float = 6.0,
         fast_probe: bool = False,
+        # 配置里的「用户 ID」—— 即 `/v0/me` 的 `username` 字段（**不是昵称**）。
+        #
+        # 只有少数端点需要它（如 `GET /v0/users/{username}/collections/{id}`，
+        # 那里 `-` 占位符不生效，见 get_collection），所以允许留空：
+        # 留空时由 `resolve_username()` 用 Token 调 `/v0/me` 现解析（带缓存）。
+        username: str = "",
     ) -> None:
         self.api_base = api_base.rstrip("/")
         self.timeout = timeout
+        # 是否配了 Token —— 决定"能不能写远端"。
+        #
+        # **不能靠 `self._api is None` 判断**：`app/qml_app.py` 无论有没有
+        # Token 都会构造一个客户端（只是不带 Authorization 头），于是
+        # "没配 Token"的用户点收藏状态会走到 POST → 401 → 回滚，
+        # 看起来就是"点了没反应"。有这个标志，后端才能改走"只写本地"的
+        # 分支（见 bridges/library.setCollectType 的模式 ②）。
+        self.has_token = bool(token)
+        self._configured_username = (username or "").strip()
+        self._resolved_username = ""
         self.session = requests.Session()
         # **fast_probe：给"交互式探测"用的快速模式**（设置页「检测」按钮）。
         #
@@ -509,6 +552,15 @@ class BangumiClient:
                 raise BangumiError(
                     f"Bangumi 服务端故障（HTTP {status}）—— 与本地网络无关，稍后重试"
                 ) from e
+            if status == 404:
+                # 404 降到 debug：它对**某些调用是正常结论**（未收藏的条目
+                # 回查就是这个响应，见 get_collection），按 warning 记会让
+                # 日志被这类"正常"刷屏。真正需要人看的 404 由调用方自己
+                # 决定记不记（收到 BangumiNotFound 想告警就告警）。
+                log.debug("Bangumi GET %s 404%s: %s", url, label, e)
+                # 消息里保留 requests 的原文（含 "404 Client Error"）：
+                # bridges/inprogress 靠 `"404" in msg` 判断"用户名填成了昵称"。
+                raise BangumiNotFound(str(e)) from e
             log.warning("Bangumi GET %s 失败%s: %s", url, label, e)
             raise BangumiError(str(e)) from e
         except requests.RequestException as e:
@@ -716,12 +768,96 @@ class BangumiClient:
         return True
 
     def get_collection(self, subject_id: int) -> Optional[dict]:
+        """回查该条目在 Bangumi 的收藏记录；**未收藏返回 None**。
+
+        端点：`GET /v0/users/{username}/collections/{subject_id}`
+
+        **路径里必须用真实 username，不能用 `-`**（2026-10-03 实测踩坑，
+        这是详情页"回查收藏状态"永远回 404、本地明明收藏了却显示未收藏的
+        根因）：`-`（"当前 Token 对应用户"）这个占位符 Bangumi 只在**部分
+        路由**上实现，同一个 `/collections/{subject_id}` 路径下两个方法的
+        表现恰好相反 ——
+
+            GET  /v0/users/-/collections/506677          → 404（永远）
+            GET  /v0/users/933287/collections/506677     → 200 type=2
+            GET  /v0/users/-/collections/506677/episodes → 200 ✅（读集数用，没错）
+            POST /v0/users/-/collections/506677          → 400（路由存在，只是 body 不合法）
+            POST /v0/users/933287/collections/506677     → 404 ❌（**写不能用 username**）
+
+        即：**这个路径 GET 认 username、POST 只认 `-`**，不能凭"同族接口
+        一样"推断（原先两处都写 `-`，写那边蒙对了，读那边一直错）。
+
+        "未收藏"就是 404（官方语义），所以这里吞掉 BangumiNotFound 返回
+        None；**其它错误照抛** —— 调用方要能区分"确实没收藏"与"没查成"，
+        否则网络故障会被写成本地快照，此后一直是错的。
+        """
+        username = self.resolve_username()
         try:
-            return self._get(f"/v0/users/-/collections/{subject_id}")
-        except BangumiError:
+            data = self._get(
+                f"/v0/users/{username}/collections/{int(subject_id)}")
+        except BangumiNotFound:
             return None
+        return data if isinstance(data, dict) else None
+
+    def set_collection_type(self, subject_id: int, collect_type: int) -> None:
+        """设置该条目在 Bangumi 的收藏状态（想看/看过/在看/搁置/抛弃）。
+
+        端点与方法以官方 spec 为准：
+            POST /v0/users/-/collections/{subject_id}
+                 body {"type": <int 1~5>}
+
+        **为什么用 POST 而不是 PATCH**：与集级收藏（`mark_episode_watched`
+        用 PATCH）不同，条目级这个端点在 spec 里就是 POST —— 早期实现里
+        集级那次错写成 POST 报了 404（见那里踩坑记录），所以要按端点各查
+        一次，不能凭"同族接口方法一样"推断。POST 是幂等的：条目还没收藏
+        时它会新建收藏行，已收藏时更新 type。
+
+        与 `get_collection` 的关系：那个用来在本地没有缓存时回查真实状态
+        （见 bridges/library 的收藏状态 worker），这里是写入。
+
+        `subject_id` 是 **Bangumi 条目 ID**（不是本地 subjects.id），
+        传错会 404 或改到别的条目上 —— 调用方必须先确认条目已 match。
+
+        **这里的 `-` 是对的，别顺手"统一"成 username**：同一个
+        `/v0/users/{x}/collections/{subject_id}` 路径，GET 只认真实
+        username、**POST 只认 `-`**（换成 username 会 404）。实测数据见
+        `get_collection` 的注释。
+        """
+        if collect_type not in COLLECT_TYPE_NAMES:
+            raise ValueError(f"非法的收藏状态：{collect_type}")
+        body = {"type": int(collect_type)}
+        self._post(f"/v0/users/-/collections/{int(subject_id)}", json=body)
+        log.info("已设置收藏状态：bgm=%s → %s（%s）",
+                 subject_id, collect_type,
+                 COLLECT_TYPE_NAMES.get(collect_type, "?"))
 
     # ---------- F18：用户在看列表 ----------
+    def resolve_username(self) -> str:
+        """当前 Token 对应用户的 `username`（路径参数用），带缓存。
+
+        **要的是 `username` 而不是昵称**：接口路径里的那个值是账号的
+        `username` 字段（实测可能就是纯数字 ID，如 `933287`），而界面上
+        显示的是 `nickname` —— 拿昵称去请求会 404「用户不存在」（与
+        `inprogress._FetchWorker` 里同一条踩坑记录）。
+
+        解析顺序与那边一致（先权威、后配置）：`/v0/me` 优先，失败才退回
+        配置值；两者都拿不到就抛错。**每次进程只解析一次**（缓存结果），
+        否则每次回查收藏都要多打一个 `/v0/me`。
+        """
+        if self._resolved_username:
+            return self._resolved_username
+        me = self.get_me() or {}
+        username = str(me.get("username") or "").strip()
+        if not username:
+            username = self._configured_username
+            if username:
+                log.info("未能用 Token 解析 username，改用配置值：%r", username)
+        if not username:
+            raise BangumiError(
+                "无法确定 Bangumi 用户名（Token 无效且设置里没填用户 ID）")
+        self._resolved_username = username
+        return username
+
     def get_me(self) -> Optional[dict]:
         """GET /v0/me，用 Token 解析当前用户（未配置 username 时使用）。
 

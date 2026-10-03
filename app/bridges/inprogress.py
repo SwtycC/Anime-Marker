@@ -225,16 +225,7 @@ class _FetchWorker(QThread):
         try:
             # ---- 解析 username（不是昵称！）----
             #
-            # 踩坑记录：Bangumi 的 `/v0/users/{username}` 路径参数要的是
-            # **`username` 字段**，而不是界面上显示的**昵称**（`nickname`）。
-            # 用昵称去请求会返回 **404「用户不存在」**，且错误信息极具误导性
-            # （看起来像"接口挂了"或"用户没数据"）。
-            #
-            # 实测（GET /v0/me）：
-            #     username: '123456'     ← API 要的是这个（可能也是数字）
-            #     nickname: 'your-name'  ← 界面上显示的名字，填它必 404
-            #
-            # 因此策略是：**只要 Token 可用就优先自动解析**，配置里那一栏
+            # 策略是：**只要 Token 可用就优先自动解析**，配置里那一栏
             # 仅作兜底（Token 无效时的离线场景）。这样用户填了昵称也不会出错。
             username = ""
             me = self.api.get_me()
@@ -845,7 +836,12 @@ class InProgressBridge(QObject):
             return
 
         try:
-            self._db.replace_inprogress_cache(items)
+            # 拉满上限就可能是被截断的（`iter_user_collections(max_items=...)`）：
+            # 那种情况下"名单外的条目"只是没拉到，不能当成"已取消收藏"，
+            # 所以要把这个信号传下去（见 replace_inprogress_cache 第 ② 步）。
+            # 恰好等于上限时按截断处理 —— 只是少清一次旧状态，方向安全。
+            self._db.replace_inprogress_cache(items,
+                                              truncated=len(items) >= MAX_ITEMS)
         except Exception as e:
             log.exception("写入在看缓存失败: %s", e)
             self.failed.emit(f"写入缓存失败：{e}")

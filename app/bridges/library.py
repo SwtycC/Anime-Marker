@@ -26,7 +26,9 @@ from PySide6.QtCore import QObject, Property, QThread, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QImage
 from PySide6.QtWidgets import QFileDialog
 
-from app.core.bangumi_api import COLLECT_TYPE_DOING, is_studio_name
+from app.core.bangumi_api import (
+    COLLECT_TYPE_DOING, COLLECT_TYPE_NAMES, BangumiNotFound, is_studio_name,
+)
 from app.core.database import Database, Episode, Subject
 # 同系列排序用：把「第X季 / S1 / II」统一解析成季数（见 series_siblings）
 from app.core.matcher import extract_season
@@ -169,11 +171,115 @@ class _TagFetchWorker(QThread):
         self.done.emit(self._subject_id, True, msg, bool(studio))
 
 
+class _CollectTypeWorker(QThread):
+    """读 / 写单个条目的 Bangumi 收藏状态（详情页那排状态选择器）。
+
+    **为什么要线程**：两件事都要发网络请求 ——
+      ① 进入详情页时本地没有状态（新建/未匹配过收藏的条目），
+         要 `GET /v0/users/-/collections/{id}` 回查真实状态；
+      ② 用户点某个状态时要 `POST` 写远端。
+    同步做会把 UI 卡住 0.3~1s（与 `_TagFetchWorker` 同理）。
+
+    **写远端的顺序**：先请求远端，**成功才回写本地**。反过来会导致
+    "界面显示改了、Bangumi 上其实没改" —— 用户下次打开网页版发现对不上，
+    而且本地这份快照此后一直是错的。
+
+    `done` 的 message 用于状态栏；`ok=False` 时 QML 侧把选中项**弹回原值**
+    （不能保留乐观更新的结果，理由同上）。
+    """
+
+    #: (subject_id, ok, message, new_type)
+    done = Signal(int, bool, str, int)
+
+    def __init__(
+        self,
+        db: Database,
+        api: BangumiClient,
+        subject_id: int,
+        bangumi_id: int,
+        write_type: int = 0,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._db = db
+        self._api = api
+        self._subject_id = subject_id
+        self._bangumi_id = bangumi_id
+        # 0 = 只读（回查并写本地）；1~5 = 写入该状态
+        self._write_type = int(write_type or 0)
+
+    def run(self) -> None:
+        if self._write_type:
+            try:
+                self._api.set_collection_type(self._bangumi_id, self._write_type)
+            except Exception as e:
+                log.warning("设置收藏状态失败 subject_id=%s（bgm=%s）→ %s: %s",
+                            self._subject_id, self._bangumi_id,
+                            self._write_type, e)
+                self.done.emit(self._subject_id, False,
+                               "设置失败：%s" % e, 0)
+                return
+            name = COLLECT_TYPE_NAMES.get(self._write_type, "")
+            # 远端成功后才落本地快照
+            try:
+                self._db.set_subject_collect_type(self._subject_id,
+                                                  self._write_type)
+            except Exception as e:
+                # 远端已改成功，本地写失败：**仍算成功**（权威在远端），
+                # 只是下次进详情页会再回查一次补上
+                log.warning("写入收藏状态快照失败 subject_id=%s: %s",
+                            self._subject_id, e)
+            self.done.emit(self._subject_id, True, "已标记为「%s」" % name,
+                           self._write_type)
+            return
+
+        # ---- 只读：回查真实状态 ----
+        #
+        # **三种结果要分开处理**（原先混在一起，是"回查永远 404"之外的第二
+        # 层问题）：
+        #   ① 未收藏 —— 官方返回 404，明确结论 → 写 0 快照，静默；
+        #   ② 查到了   —— 写真实状态；
+        #   ③ 没查成   —— 网络 / 鉴权 / 用户名解析失败 → **什么都不写**。
+        # ③ 若也按"未收藏"写 0，就等于把一次断网永久记成"这条没收藏"，
+        # 而且本地一旦有值后端就不再回查（见 requestCollectType），
+        # 这份错快照会一直留着。写 0 的诱惑是"下次进详情页别再请求"，
+        # 但防重复请求已有 `_collect_queried` 兜底，不需要拿准确性来换。
+        try:
+            data = self._api.get_collection(self._bangumi_id)
+        except BangumiNotFound:
+            data = None
+        except Exception as e:
+            log.warning("回查收藏状态失败 subject_id=%s: %s",
+                        self._subject_id, e)
+            self.done.emit(self._subject_id, False, "", 0)
+            return
+        if not isinstance(data, dict):
+            # ① 未收藏（get_collection 用 None 表示"确实没有"）
+            try:
+                self._db.set_subject_collect_type(self._subject_id, 0)
+            except Exception:
+                pass
+            self.done.emit(self._subject_id, False, "", 0)
+            return
+        # ② 查到了
+        ctype = int(data.get("type") or 0)
+        if ctype not in COLLECT_TYPE_NAMES:
+            ctype = 0
+        try:
+            self._db.set_subject_collect_type(self._subject_id, ctype)
+        except Exception as e:
+            log.warning("写入收藏状态快照失败 subject_id=%s: %s",
+                        self._subject_id, e)
+        self.done.emit(self._subject_id, ctype > 0, "", ctype)
+
+
 class LibraryBridge(QObject):
     """媒体库数据源。"""
 
     # 数据变化通知（QML 侧用它触发列表重建）
     subjectsChanged = Signal()
+    #: 某条目的收藏状态变化（参数：subject_id）—— 详情页那排状态选择器刷新
+    collectTypeChanged = Signal(int)
     episodesChanged = Signal()
     inProgressChanged = Signal()
     watchedEpsChanged = Signal()
@@ -215,10 +321,29 @@ class LibraryBridge(QObject):
         # 标签自动补拉：同一时刻最多一个 worker；期间新请求只记最后一个
         self._tag_worker: Optional[_TagFetchWorker] = None
         self._tag_fetch_pending: Optional[int] = None
+        # 收藏状态（读/写）worker。**每个条目各自独立**，不做排队：
+        # 用户在一部番上点状态时不会有并发的第二部（详情页一次只显示一条），
+        # 而进入详情页时的"回查"与"点击写入"可能重叠 —— 后者必须能立刻执行，
+        # 排队会让点击延迟到回查结束（体感很差）。两者写的是同一列，
+        # 但写入方以**远端结果**为准，最后落地的一定是用户点的那次。
+        self._collect_workers: list[_CollectTypeWorker] = []
+        # 本次运行**已经回查过**收藏状态的条目（本地主键）。防重入的闸门，
+        # 见 requestCollectType —— 没有它，回查结果为 0 的条目会自激成
+        # 无限请求循环。写在内存而不是库里：它是"这一次运行做没做过"的
+        # 事实，与"库里存的值"无关。
+        self._collect_queried: set[int] = set()
 
     def set_api(self, api: BangumiClient) -> None:
-        """注入 Bangumi 客户端（QmlApp 在启动 / 配置重建时调用）。"""
+        """注入 Bangumi 客户端（QmlApp 在配置重建时调用）。"""
         self._api = api
+
+    # 注：**曾经**在启动时做过一次"清掉缓存里没有的条目"的对齐，已删除。
+    # 它用"最近一次同步的收藏缓存"当权威，而那个缓存可能比本地值更旧：
+    # 实测（用户反馈）"在网站上标了看过 → 详情页回查写进本地 2 →
+    # 重启后被启动对齐清成 0 → 又回到「未标记」 → 再进详情页才恢复"。
+    # 缓存只能当"秒显"的加速，不能当**删数据**的依据 —— 现在真值一律
+    # 由详情页回查网络得到（见 requestCollectType），同步时那次清理
+    # 仍然保留（那次缓存是刚拉的全量，判据成立）。
 
     # ---------- 配置 ----------
     def set_display_mode(self, mode: str) -> None:
@@ -252,7 +377,12 @@ class LibraryBridge(QObject):
     # ---------- Bangumi 收藏列表（阶段 7）----------
     @Property("QVariantList", notify=inProgressChanged)
     def inProgress(self) -> list[dict]:
-        """Bangumi「在看」收藏（来自 `inprogress_cache`，由 InProgressBridge 写入）。
+        """Bangumi「在看」收藏 ＋ 本地手动标成「在看」的条目。
+
+        服务端那部分来自 `inprogress_cache`（由 InProgressBridge 写入），
+        本地那部分来自 `subjects.collect_type`（见 `_load_inprogress` 末尾
+        的合并段）—— 合并是为了让**没配 Token / 没匹配 Bangumi** 的用户
+        也能在用选择器标了「在看」之后，真的在这一页看到那部番。
 
         > 命名说明：表名/属性名一直是 F18 的 `inprogress*`，**语义从一开始就是
         > 「在看」**，中途一度改成「看过」，现在改回本意（`collect_type = 3`）——
@@ -273,6 +403,10 @@ class LibraryBridge(QObject):
         修改时间），而不是表里的 `updated_at`（那是缓存写入时刻，整批相同，
         对界面没有意义）。老库该列为空时回落到缓存写入时间。
         """
+        return self._inprogress_items()
+
+    def _inprogress_items(self) -> list[dict]:
+        """在看列表（带缓存，`inProgress` 与 `inProgressMeta` 共用同一份）。"""
         if self._inprogress_dirty:
             self._inprogress_cache = self._load_inprogress()
             self._inprogress_dirty = False
@@ -287,6 +421,21 @@ class LibraryBridge(QObject):
         except Exception as e:
             log.exception("读取在看缓存失败: %s", e)
             return []
+
+        # 本地快照的"真实状态"（bangumi_id → collect_type）：**本地比缓存新**
+        # （用户一点就改写，同步时也会跟着对齐），所以缓存里标着「在看」、
+        # 本地却已经改成「想看/看过」的那些要**立刻**从本页去掉，
+        # 而不是等下一次同步。值 0 是"查过、确实没收藏"= 不知道 → 不据此过滤。
+        try:
+            local_types = self._db.subject_collect_types()
+        except Exception as e:
+            log.exception("读取本地收藏状态失败: %s", e)
+            local_types = {}
+        items = [
+            it for it in items
+            if local_types.get(int(it.bangumi_id or 0), COLLECT_TYPE_DOING)
+            in (0, COLLECT_TYPE_DOING)
+        ]
 
         # 「上传」统计：**一次查全量**再按条目取（逐条查会变成 2N 次查询）
         try:
@@ -355,6 +504,52 @@ class LibraryBridge(QObject):
                 "nextEpisodeHint": next_ep_hint,
                 "pendingUpload": pending_up,
                 "blockedUpload": blocked_up,
+            })
+
+        # ---- 本地标记的「在看」（没连 Bangumi 的那些）----
+        #
+        # 没配 Token、或条目压根没匹配到 Bangumi 的用户也能在详情页手动标
+        # 「在看」；这些条目不在收藏缓存里（那张表是服务端收藏的镜像），
+        # 只有 subjects.collect_type 记着。不补进来，"我在看、但没连
+        # Bangumi"的番就永远不出现在这一页（用户实测要求）。
+        #
+        # 排序：**追加在末尾、按条目名排**。不掺进上面那批的排序里 ——
+        # 它们的 `updatedAt` 是"Bangumi 收藏修改时间"，而本地条目只有
+        # `subjects.updated_at`（元数据变更时间），拿两种时间混排是假顺序。
+        listed = {int(it.get("bangumiId") or 0) for it in out}
+        try:
+            locals_ = self._db.subjects_by_collect_type(COLLECT_TYPE_DOING)
+        except Exception as e:
+            log.exception("读取本地「在看」条目失败: %s", e)
+            locals_ = []
+        locals_.sort(key=lambda s: (s.name_cn or s.name or ""))
+        for s in locals_:
+            if int(s.bangumi_id or 0) and int(s.bangumi_id) in listed:
+                continue                 # 缓存里已经有这一部（那条更权威）
+            local_id = int(s.id)
+            # 进度看**本地已看集数**：本地条目没有 Bangumi 的 ep_status
+            # 可看，而这一列正是详情页/订阅页同一口径（见 count_locally_watched_eps）
+            try:
+                ep_status = self._db.count_locally_watched_eps(local_id)
+            except Exception:
+                ep_status = 0
+            next_ep_id, next_ep_hint = self._next_episode(local_id, ep_status)
+            out.append({
+                "bangumiId": int(s.bangumi_id or 0),
+                "name": s.name or "",
+                "nameCn": s.name_cn or "",
+                "title": s.name_cn or s.name or "",
+                "coverUrl": self._cover_file_url(s.cover_path or "", local_id),
+                "epStatus": int(ep_status),
+                "totalEps": int(s.total_eps or 0),
+                "collectType": COLLECT_TYPE_DOING,
+                "updatedAt": s.updated_at or "",
+                "localSubjectId": local_id,
+                "inLibrary": True,
+                "nextEpisodeId": next_ep_id,
+                "nextEpisodeHint": next_ep_hint,
+                "pendingUpload": len(pend_map.get(local_id, [])),
+                "blockedUpload": int(block_map.get(local_id, 0)),
             })
         return out
 
@@ -516,16 +711,26 @@ class LibraryBridge(QObject):
             return {"count": 0, "ageSeconds": -1}
         return {"count": count, "ageSeconds": -1}
 
-    @Slot(result="QVariantMap")
+    @Property("QVariantMap", notify=inProgressChanged)
     def inProgressMeta(self) -> dict:
         """收藏页的元信息（缓存年龄 + 条数），页面标题区展示用。
 
         条数只算「在看」—— 与 `inProgress` 的过滤保持一致，
         否则页头数字会比列表实际条数大（差额是"看过"的那批，上百部）。
+        **直接数页面那一份**（`_inprogress_items`）而不是再查一次缓存表：
+        那份里还含"本地标记的「在看」"（没连 Bangumi 的条目），
+        另查一遍会少算它们，页头数字与列表对不上。
+
+        **必须是带 `notify` 的 Property，不能是 `@Slot`**（改过一处）：
+        QML 里原先写 `library.inProgressMeta()` —— 那是"在绑定里调一次函数"，
+        没有任何可追踪的依赖，于是**只在页面创建时算一次**，此后列表怎么变
+        页头数字都不动（实测：列表 14 行、页头写着 13 部，用户一眼就能看出
+        对不上）。改成 Property 后 QML 用 `library.inProgressMeta`，
+        列表一变就重算。
         """
         try:
             age = self._db.inprogress_cache_age()
-            count = len(self._db.load_inprogress_cache(collect_type=COLLECT_TYPE_DOING))
+            count = len(self._inprogress_items())
         except Exception as e:
             log.exception("读取在看缓存元信息失败: %s", e)
             return {"count": 0, "ageSeconds": -1, "stale": True}
@@ -538,6 +743,48 @@ class LibraryBridge(QObject):
         }
 
     # ---------- 条目列表 ----------
+    @Property("QVariantList", notify=collectTypeChanged)
+    def collectOptions(self) -> list[dict]:
+        """收藏状态的可选项：`[{value: 1, text: "想看"}, ...]`（**唯一来源**）。
+
+        详情页那排状态按钮、海报墙筛选面板的「收藏状态」栏都从这里取。
+        顺序取 `COLLECT_TYPE_NAMES` 的定义顺序（想看 → 看过 → 在看 → 搁置
+        → 抛弃），与 Bangumi 官网一致。
+
+        **为什么由后端给而不是各 QML 各写一份**：原先只有详情页用，写死
+        在 QML 里还能接受（那里也留了注释说明）。现在筛选栏也要用，
+        两处各写一份就等于同一个枚举有 3 份字面量（QML×2 + 后端），
+        哪天改一个漏一个，表现是"筛出来的和详情页选的对不上"这种
+        很难发现的错。这里从 `COLLECT_TYPE_NAMES` 派生，只有一处定义。
+        """
+        # notify 用 collectTypeChanged：它是"某个条目的状态变了"的通知，
+        # 与这份**静态**选项列表无关 —— 但 Property 需要挂一个信号才能
+        # 在 QML 里正常绑定（挂 subjectsChanged 之类同理）。
+        # 选项本身不会变，这个 notify 事实上永远不会触发，无害。
+        return [{"value": int(v), "text": t}
+                for v, t in sorted(COLLECT_TYPE_NAMES.items())]
+
+    @Property("QVariantMap", notify=collectTypeChanged)
+    def collectTypes(self) -> dict:
+        """`本地主键 → 收藏状态`（海报墙筛选用，随 `collectTypeChanged` 实时更新）。
+
+        **为什么要单独给一份、而不是让墙去读 `subjects` 里那个字段**：
+        `subjects` 是长生命周期的缓存（重取会重建整墙卡片，见
+        `_on_collect_type_done` 的说明），收藏状态变了它不一定重取 ——
+        于是出现"详情页已经显示「看过」、筛选里还算「未标记」，
+        要重扫才好"（用户实测）。这份映射只有两列、重建极廉价，
+        且挂在 `collectTypeChanged` 上，状态一变就跟着变。
+
+        key 用字符串：QML 里 JS 对象的键一律是字符串（`map[item.id]` 会被
+        自动转成字符串索引，取得到）。
+        """
+        try:
+            data = self._db.collect_types_by_subject_id()
+        except Exception as e:
+            log.exception("读取收藏状态映射失败: %s", e)
+            return {}
+        return {str(k): int(v) for k, v in data.items()}
+
     @Property("QVariantList", notify=subjectsChanged)
     def subjects(self) -> list[dict]:
         """全部条目（海报墙用）。
@@ -1129,6 +1376,237 @@ class LibraryBridge(QObject):
             log.info("等待标签拉取线程结束…")
             w.wait(ms)
 
+    # ---------- 收藏状态（想看 / 看过 / 在看 / 搁置 / 抛弃）----------
+    @Slot(int)
+    def requestCollectType(self, subject_id: int) -> None:
+        """进入详情页时把该条目的收藏状态补齐。
+
+        **两段式，缺一不可**：
+          ① 收藏同步缓存里若已有答案 → 先落库 + 通知，**同一帧**把界面点亮
+             （不发请求，见下）；
+          ② 有 Token → 再回查一次网络（每条目每会话最多一次），**以网络为准**。
+
+        ① 是为了"快"：网络往返数百毫秒，而海报是立刻出现的；只用 ② 的话
+        选中态会明显慢半拍（用户实测反馈"最好跟展示图出现的时间一样快"）。
+
+        ② 是为了"对"：缓存只是上次同步时的状态，**不是权威**——
+           - 缓存里没有它：可能确实没收藏，也可能只是还没同步过
+             （用户刚在网站上标的就属于这种）；
+           - 缓存里有它：用户此后在网页/手机上改过就已过期。
+        两种都只有网络知道答案（用户原话："有 token 按 bangumi 上处理"）。
+        **本地快照一律不参与判断**：CLANNAD 那次就是"本地有值就信任"
+        让一个早已取消收藏的「在看」一直错下去。
+
+        （曾经在这里只做"缓存有就用、没有才回查"，还不够：缓存里有的那些
+        永远得不到核实；也曾经按缓存**清过**本地值，结果把用户刚在网站上
+        标的、详情页刚写进来的新值清掉了 —— 缓存能拿来"先用"，不能拿来
+        "删"。）
+
+        未匹配 Bangumi 的条目直接返回（没有条目 ID 可查，状态只由用户
+        手动标记，见 setCollectType 的模式 ②）。
+
+        **`_collect_queried` 这道闸门是必需的，不是优化**（2026-10-03 实测
+        踩坑：一个条目刷出上百次 404）。原先只有"本地值非 0 才跳过"一条
+        判据，于是**回查结果为 0 的条目（就是没收藏的）永远满足"该回查"**，
+        而回查完成会发 `collectTypeChanged` → 详情页 reload → reload 又调
+        本函数 → 再回查 …… 每个 404 都能自激出一个新请求，日志被同一行
+        404 刷屏、服务端也被反复打。判据改成"**每个条目每次运行最多查
+        一次**"后，无论 QML 那边怎么重入都只会有一次请求。
+
+        代价：本次运行期间在网页版新收藏的条目不会立刻反映到详情页
+        （要重启才补）—— 但这本来就是"本地有快照就信任"的既定取舍，
+        与本次运行无关的旧快照同样不会回查。
+        """
+        try:
+            s = self._db.get_subject(subject_id)
+        except Exception as e:
+            log.exception("读取条目 %s 失败: %s", subject_id, e)
+            return
+        if s is None or not s.bangumi_id:
+            return
+        if int(subject_id) in self._collect_queried:
+            return                       # 本次运行已查过（含"未收藏"）
+        # 先登记再动手：两个连续的 load() 会在回写前都走到这里，
+        # 只靠"DB 里已写 0/已有值"挡不住（那时还没写）。
+        self._collect_queried.add(int(subject_id))
+
+        # ① 收藏同步缓存里就有答案 → **同步**落库 + 通知，一个请求都不发。
+        #
+        # 这条路的全部意义是"快"：emit 是主线程内的直接调用，QML 收到后
+        # 立刻 reload，选中态**与海报同一帧**出现（用户实测反馈"最好跟
+        # 展示图出现的时间一样快"）。走网络的话要等几百毫秒，
+        # 用户看到的是"海报早就在了、状态还在转"。
+        #
+        # **这一步不看本地快照**：快照可能是错的（实测：CLANNAD 早已取消
+        # 收藏，本地还留着「在看」）。缓存里有答案时以它为准，
+        # 值没变就什么都不做（不写库、不发信号，QML 本来就显示对了）。
+        cached = 0
+        try:
+            cached = self._db.cached_collect_type(int(s.bangumi_id))
+        except Exception as e:
+            log.warning("读取收藏缓存失败 subject_id=%s: %s", subject_id, e)
+        if cached:
+            if cached != int(s.collect_type or 0):
+                try:
+                    self._db.set_subject_collect_type(int(subject_id), cached)
+                except Exception as e:
+                    log.warning("写入收藏状态快照失败 subject_id=%s: %s",
+                                subject_id, e)
+                self._dirty = True
+                self.collectTypeChanged.emit(int(subject_id))
+            return
+
+        # ② 有 Token → **再回查一次网络**（每条目每会话最多一次），以它为准。
+        #
+        # 缓存只是"秒显"用的加速，**不能当权威**：
+        #   - 缓存里没有这个条目 → 可能确实没收藏，也可能只是还没同步过
+        #     （用户刚在网站上标的就属于这种）；
+        #   - 缓存里有 → 那是**上次同步时**的状态，用户此后改过就过期了。
+        # 两种都只有网络知道答案。用户原话："有 token 按 bangumi 上处理"。
+        # 回查结果与显示不同时，worker 会写库并通知（选择器/筛选跟着变）。
+        #
+        # 对没配 Token 的用户**直接返回**：那种情况下 GET 必然 401，回查只
+        # 会在日志里刷"回查收藏状态失败"，而本地那个值（用户手动标的
+        # 「在看」）本来就是唯一的事实来源 —— 见 setCollectType 模式 ②。
+        if not self._can_write_remote():
+            return
+        self._start_collect_worker(int(subject_id), int(s.bangumi_id), 0)
+
+    @Slot(int, int)
+    def setCollectType(self, subject_id: int, collect_type: int) -> None:
+        """把该条目设为某个收藏状态（详情页点击那排按钮时调用）。
+
+        校验在两端都做：这里先挡一次非法值（QML 传错时不发请求），
+        `BangumiClient.set_collection_type` 里再挡一次。
+
+        **两种模式**：
+          ① 有条目 ID 且配了 Token → 先写远端，成功才落本地（见
+             `_CollectTypeWorker`：反过来会造成"界面改了、Bangumi 没改"）；
+          ② **要么没配 Token、要么条目没匹配到 Bangumi** → 只写本地，
+             并在状态栏说明"仅本地、不会同步到 Bangumi"。
+
+        ② 是必须有的（用户实测要求："如果没 token 的用户，也能使用状态栏，
+        可以手动选择在看，然后在「在看」页看到该动漫"）。这些用户压根没有
+        远端可写，若照旧拒绝，选择器就是个永远点不动的摆设；
+        写本地之后「在看」页会把他们标过的番列出来（见 `_load_inprogress`
+        里合并 `subjects.collect_type` 的那一段）。**注意别把这条并进 ①
+        的失败回滚里**：远端写失败仍然要回滚（那才是"假象"），
+        而这里本来就没有远端。
+
+        **任何一条提前返回都必须发 `collectTypeChanged`**（QML 侧靠它解锁
+        "写入中"并清掉乐观更新的待确认值）。漏发的话按钮会永久灰着 ——
+        看起来就是"点了没反应、之后也点不动了"。
+        """
+        if collect_type not in COLLECT_TYPE_NAMES:
+            log.warning("非法的收藏状态：%s（subject_id=%s）",
+                        collect_type, subject_id)
+            self.collectTypeChanged.emit(int(subject_id))
+            return
+        try:
+            s = self._db.get_subject(subject_id)
+        except Exception as e:
+            log.exception("读取条目 %s 失败: %s", subject_id, e)
+            self.collectTypeChanged.emit(int(subject_id))
+            return
+        if s is None:
+            self.collectTypeChanged.emit(int(subject_id))
+            return
+        if int(s.collect_type or 0) == int(collect_type):
+            # 点的是当前状态：无变化，不打扰（QML 侧也会先挡一道）。
+            # 但仍然要发通知把界面解锁（见 docstring）。
+            self.collectTypeChanged.emit(int(subject_id))
+            return
+        if not s.bangumi_id or not self._can_write_remote():
+            self._set_collect_type_local(
+                int(subject_id), int(collect_type),
+                "该条目未关联 Bangumi" if not s.bangumi_id
+                else "未配置 Bangumi Token")
+            return
+        self._start_collect_worker(int(subject_id), int(s.bangumi_id),
+                                   int(collect_type))
+
+    def _can_write_remote(self) -> bool:
+        """能不能把收藏状态写到 Bangumi（客户端在、且配了 Token）。
+
+        **判的是 Token 而不是"客户端是否存在"** —— QmlApp 永远会构造一个
+        客户端，没配 Token 时它只是不带 Authorization 头，
+        那种情况下 POST 必然 401（见 BangumiClient.has_token）。
+        """
+        return self._api is not None and bool(
+            getattr(self._api, "has_token", True))
+
+    def _set_collect_type_local(self, subject_id: int, collect_type: int,
+                                why: str) -> None:
+        """只写本地快照（见 setCollectType 的模式 ②）。
+
+        提示语**只说结果**："已标记为「在看」· 仅本地"。
+        技术原因（没配 Token / 条目没匹配）只进日志 —— 用户实测反馈
+        不希望提示里出现"未配置 Bangumi Token……"这类解释：
+        他要的只是"点上了没有"，机制细节写在状态栏里既长又像报错。
+        """
+        try:
+            self._db.set_subject_collect_type(subject_id, collect_type)
+        except Exception as e:
+            log.exception("写入收藏状态失败 subject_id=%s: %s", subject_id, e)
+            self.statusMessage.emit("保存失败（详见日志）")
+            self.collectTypeChanged.emit(int(subject_id))
+            return
+        log.info("收藏状态仅写本地：subject_id=%s → %s（%s）",
+                 subject_id, collect_type, why)
+        self._dirty = True
+        # 「在看」页要立刻反映（标成在看就出现、从在看改走就消失）
+        self._inprogress_dirty = True
+        self.inProgressChanged.emit()
+        self.collectTypeChanged.emit(int(subject_id))
+        self.statusMessage.emit(
+            "已标记为「%s」· 仅本地" % COLLECT_TYPE_NAMES.get(collect_type, ""))
+
+    def _start_collect_worker(self, subject_id: int, bangumi_id: int,
+                              write_type: int) -> None:
+        w = _CollectTypeWorker(self._db, self._api, subject_id, bangumi_id,
+                               write_type)
+        self._collect_workers.append(w)
+        w.done.connect(self._on_collect_type_done)
+        w.finished.connect(lambda: self._drop_collect_worker(w))
+        w.start()
+
+    def _drop_collect_worker(self, w: "_CollectTypeWorker") -> None:
+        try:
+            self._collect_workers.remove(w)
+        except ValueError:
+            pass
+        w.deleteLater()
+
+    def _on_collect_type_done(self, subject_id: int, ok: bool, message: str,
+                              new_type: int) -> None:
+        # **无论 new_type 是否为 0 都要通知 QML**（踩坑，实测反馈"重新扫描后
+        # 没有选中当前动漫的状态"）。
+        #
+        # 原先写的是 `if new_type: emit(...)` —— 于是回查结果为 0
+        # （条目在 Bangumi 上确实没收藏）时**什么都不发**，选择器停在
+        # "一个都没选中"且界面无从知道"已经查完了"。虽然此时视觉结果一样，
+        # 但 QML 侧的 `collectBusy` 也解不了锁，用户点过一次写失败后
+        # 选择器会一直灰着。
+        #
+        # 现在一律 emit：QML 那边重取一次即可，值没变等于空操作，代价可忽略。
+        # **不能改成 subjectsChanged**：那会重建全部海报卡片（每张重新解码
+        # 封面），而收藏状态只影响详情页那排按钮。
+        self._dirty = True            # subjects 缓存要失效（值可能变了）
+        # 「在看」列表也要失效：状态在「在看」↔其它之间变化时，
+        # 这一部要不要出现在那一页正是由它决定的。
+        self._inprogress_dirty = True
+        self.inProgressChanged.emit()
+        self.collectTypeChanged.emit(subject_id)
+        if message:
+            self.statusMessage.emit(message)
+
+    def waitCollectWorkers(self, ms: int = 3000) -> None:
+        """退出时等待进行中的收藏状态线程（QmlApp.shutdown 调用）。"""
+        for w in list(self._collect_workers):
+            if w.isRunning():
+                log.info("等待收藏状态线程结束…")
+                w.wait(ms)
+
     def _original_cover_path(self, s: Subject) -> Path:
         """原版海报的本地缓存路径（按实际情况探测，不靠猜）。
 
@@ -1215,6 +1693,10 @@ class LibraryBridge(QObject):
             # 详情页打开时据此弹黄色提示：这种对应是数量一致下的猜测，
             # 没有按号匹配可靠。
             "epAlignOrder": (s.ep_align or "") == "order",
+            # Bangumi 收藏状态（0 = 未知/未收藏，1 想看 / 2 看过 / 3 在看 /
+            # 4 搁置 / 5 抛弃）。详情页海报下方那排状态按钮的当前选中项。
+            # 0 时界面**一个都不选中**，并由 requestCollectType 异步回查。
+            "collectType": int(s.collect_type or 0),
             "matchState": s.match_state or "auto",
             "totalEps": int(s.total_eps or 0),
             "folderPath": s.folder_path or "",

@@ -20,7 +20,37 @@ from app.utils.paths import database_path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
+
+#: 「把收藏缓存里已知的状态写回 `subjects.collect_type`」的那条 SQL。
+#:
+#: 两个调用点用**同一条语句**（收藏同步落缓存时、v10 迁移回填旧库），
+#: 抽成常量避免哪天只改一处。
+#: 只覆盖"缓存里有对应行"的条目：没行 = 不知道（未收藏 / 从没同步过），
+#: 不能据此判定"未收藏"（见 cached_collect_type 的说明）。
+_COLLECT_TYPE_BACKFILL_SQL = """
+UPDATE subjects
+   SET collect_type = (
+       SELECT c.collect_type FROM inprogress_cache c
+        WHERE c.bangumi_id = subjects.bangumi_id)
+ WHERE bangumi_id IN (SELECT bangumi_id FROM inprogress_cache)
+"""
+
+#: 「本地有状态、收藏缓存里却没有它」的**已匹配**条目 → 清成"未知"。
+#:
+#: **只用在同步路径**（`replace_inprogress_cache` 第 ② 步）：那里的缓存
+#: 是刚拉下来的全量，所以"名单里没有"就是"服务端没有"这个判据成立。
+#: **不要拿它做启动对齐**（试过、已撤）：启动时的缓存可能是几天前的，
+#: 拿它去清会把用户刚在网站上新标的状态（详情页回查写进本地、缓存还没
+#: 同步到）一起清掉 —— 实测：魔女之旅重启后又被算回「未标记」。
+#: 只动已匹配条目：未匹配条目的状态只可能来自用户手动标记。
+_COLLECT_TYPE_CLEAR_STALE_SQL = """
+UPDATE subjects
+   SET collect_type = 0
+ WHERE bangumi_id IS NOT NULL
+   AND COALESCE(collect_type, 0) != 0
+   AND bangumi_id NOT IN (SELECT bangumi_id FROM inprogress_cache)
+"""
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -41,6 +71,7 @@ CREATE TABLE IF NOT EXISTS subjects (
     aliases      TEXT,                       -- infobox 别名，用换行分隔（见下方注释）
     studio       TEXT,                       -- 动画制作公司（规范名，见 bangumi_api.STUDIO_ALIASES）
     ep_align     TEXT,                       -- 集数对应方式：''=按号（默认）/'order'=按顺序（可能不准）
+    collect_type INTEGER,                    -- Bangumi 收藏状态：0/NULL=未知，1想看 2看过 3在看 4搁置 5抛弃
     match_state  TEXT DEFAULT 'auto',        -- auto / manual / pending
     updated_at   TEXT
 );
@@ -209,6 +240,10 @@ class Subject:
     # 集数对应方式（v7+）：'' / NULL = 按号（默认）；'order' = 按顺序配对。
     # 带默认值：旧调用方按位置构造不受影响，Subject(**dict(row)) 也能对上。
     ep_align: str = ""
+    # Bangumi 收藏状态（v9+）：0/NULL = 未知，1 想看 / 2 看过 / 3 在看 /
+    # 4 搁置 / 5 抛弃。详情页那排状态选择器的当前选中项就取它。
+    # 带默认值（同上）：旧调用方按位置构造不受影响。
+    collect_type: int = 0
 
 
 @dataclass
@@ -393,6 +428,41 @@ class Database:
         if "ep_align" not in cols:
             log.info("迁移：subjects 增加 ep_align 列")
             self._conn.execute("ALTER TABLE subjects ADD COLUMN ep_align TEXT")
+        # v9：subjects 新增 collect_type（Bangumi 收藏状态快照）。
+        #
+        # 用途：详情页海报下方的「想看 / 看过 / 在看 / 搁置 / 抛弃」选择器
+        # 需要一个"当前是哪个状态"的本地来源。
+        #
+        # 为什么要单独一列、而不是需要时去 `inprogress_cache` 现查：
+        # 那张表**只覆盖已收藏的条目**，未收藏的条目压根没有行（而"未收藏"
+        # 正是最常见的起点 —— 用户第一次点某个状态时才创建收藏），
+        # 而且它会被整表刷新。有这一列才能把"用户在本页点过什么"存住。
+        # 反过来，缓存表**有**行时确实可以拿来提前知道状态（少一次网络
+        # 往返），见 `cached_collect_type` —— 那里不能反推的只是"没有行"
+        # 这一种情况。
+        #
+        # 旧库该列为 NULL —— 与 0 同义（"未知"）。界面此时**一个都不选中**，
+        # 并在进入详情页时补齐：先看缓存表，再退到网络回查真实状态
+        # （见 bridges/library 的 _CollectTypeWorker）。
+        if "collect_type" not in cols:
+            log.info("迁移：subjects 增加 collect_type 列")
+            self._conn.execute(
+                "ALTER TABLE subjects ADD COLUMN collect_type INTEGER")
+        # v10：**没有列变更，纯粹是数据回填** —— 把收藏同步缓存里已经知道的
+        # 状态写进 subjects.collect_type。
+        #
+        # 为什么需要：那一列早先只在用户点过选择器、或进过某条目详情页时
+        # 才有值，而海报墙的「收藏状态」筛选（尤其"未标记"）是按这一列筛的
+        # —— 于是**明明在 Bangumi 上收藏过的番，在"未标记"里一大堆**
+        # （用户实测反馈）。缓存表里本来就有全量收藏状态，回填一次即可。
+        #
+        # 之后由 replace_inprogress_cache 在每次同步时自动保持对齐，
+        # 所以这一条只在旧库上跑一次。
+        if old_version < 10:
+            cur = self._conn.execute(_COLLECT_TYPE_BACKFILL_SQL)
+            if cur.rowcount:
+                log.info("迁移：按收藏缓存回填了 %s 个条目的收藏状态",
+                         cur.rowcount)
         # v8：episodes 新增 ep_label（非正片的显示标签）。
         #
         # 用途：SP / OVA / NCOP / 特典 这类"附加内容"的序号是**字符串**语义
@@ -500,6 +570,113 @@ class Database:
             cur.execute(
                 "UPDATE subjects SET ep_align=? WHERE id=?",
                 ("order" if by_order else "", subject_id),
+            )
+
+    def subject_collect_types(self) -> dict[int, int]:
+        """`bangumi_id → 本地收藏状态`（只含有 bangumi_id 且值非 NULL 的条目）。
+
+        **本地快照比收藏缓存更新**（缓存在每次同步时被整表替换，而这一列
+        在用户点击的当下就被改写，同步时也会跟着对齐 —— 见
+        `replace_inprogress_cache`）。「在看」列表用它做一遍过滤：用户在本
+        程序里把某部从「在看」改成「想看」后，那一部应当**立刻**从列表里
+        消失，而不是等下一次同步。
+
+        值可能是 0（"查过、确实没收藏"）：调用方要把它当成"不知道"，
+        别当成"不在看" —— 详情页那套"0 = 未知"的口径在这里同样适用。
+        """
+        with self._cursor() as cur:
+            rows = cur.execute(
+                """
+                SELECT bangumi_id, collect_type FROM subjects
+                 WHERE bangumi_id IS NOT NULL AND collect_type IS NOT NULL
+                """
+            ).fetchall()
+        return {int(r["bangumi_id"]): int(r["collect_type"] or 0)
+                for r in rows if r["bangumi_id"]}
+
+    def subjects_by_collect_type(self, collect_type: int) -> list[Subject]:
+        """本地收藏状态等于该值的条目（`collect_type` 的含义由调用方定）。
+
+        **为什么要按状态查本地条目**（典型用途：补出「在看」页里那些
+        *没连 Bangumi* 的番）：没配 Token、或条目没匹配到 Bangumi 的用户
+        也能在详情页手动标「在看」，这些条目**不在 `inprogress_cache` 里**
+        （那张表是服务端收藏的镜像），只有 `subjects.collect_type` 记着。
+        不查这一份，"我在看、但没连 Bangumi"的番就永远不出现在「在看」页。
+
+        去重由调用方做（按 bangumi_id 与缓存来的行比对）：这里只按状态过滤，
+        不掺"缓存里有没有"的判断 —— 缓存里那一行可能是**旧状态**
+        （如「看过」），此时本地这一条恰恰是该显示的。
+        """
+        with self._cursor() as cur:
+            rows = cur.execute(
+                "SELECT * FROM subjects WHERE collect_type=? ORDER BY id",
+                (int(collect_type),),
+            ).fetchall()
+        return [Subject(**dict(r)) for r in rows]
+
+    def collect_types_by_subject_id(self) -> dict[int, int]:
+        """`本地主键 → 收藏状态`（全部条目，0 含"未知"）。
+
+        海报墙的筛选要用它：那张墙的条目列表是**长生命周期的缓存**（重取会
+        重建全部卡片），收藏状态变了它不一定跟着更新 —— 用这份只有两列的
+        小映射做筛选，既实时又不用重建卡片（用户实测：详情页已显示「看过」、
+        筛选里却还算「未标记」，要重扫才好）。
+        """
+        with self._cursor() as cur:
+            rows = cur.execute(
+                "SELECT id, collect_type FROM subjects"
+            ).fetchall()
+        return {int(r["id"]): int(r["collect_type"] or 0) for r in rows}
+
+    def cached_collect_type(self, bangumi_id: int) -> int:
+        """从**收藏同步缓存**里取该条目的状态；0 表示"表里没有这一条"。
+
+        与 `subjects.collect_type` 的分工：那一列是自己写的快照（可能为空），
+        这张表是最近一次全量同步拿到的**服务端收藏**（含 1~5 全部状态，
+        见 `InProgressBridge`）。详情页状态选择器优先用它 —— 查得到就能
+        **同步**给出选中态，不必等一个网络往返（用户实测反馈"最好跟展示图
+        出现的时间一样快"：海报是立刻出现的，选中态不该慢半拍）。
+
+        **0 的含义是"不知道"，不是"未收藏"**：表里只存用户**已收藏**的条目，
+        没有行可能是"未收藏"，也可能是"还没同步过"。所以调用方拿到 0 必须
+        回退到网络回查（见 bridges/library 的 requestCollectType）。
+        这也是本表唯一能反推出的结论 —— 不能拿"没有行"当"未收藏"用
+        （见 set_subject_collect_type 的注释）。
+
+        `bangumi_id` 是主键，单行查询走索引。
+        """
+        with self._cursor() as cur:
+            row = cur.execute(
+                "SELECT collect_type FROM inprogress_cache WHERE bangumi_id=?",
+                (int(bangumi_id),),
+            ).fetchone()
+        if row is None:
+            return 0
+        ctype = int(row["collect_type"] or 0)
+        # 只认 1~5（不想为这一个判断把 bangumi_api 的枚举表引进存储层）。
+        # 老库迁移留下的 NULL 在这里落成 0 = "不知道" → 调用方回查网络，
+        # 结论同样正确；注意别顺手按 load_inprogress_cache 的
+        # `COALESCE(collect_type, 2)` 当成「看过」—— 那是列表排序的口径，
+        # 拿来当收藏状态会默默写错一条快照。
+        return ctype if 1 <= ctype <= 5 else 0
+
+    def set_subject_collect_type(self, subject_id: int, collect_type: int) -> None:
+        """写入该条目的 Bangumi 收藏状态（详情页状态选择器）。
+
+        **本地只做"快照"，权威在 Bangumi**：这个值有三个来源 ——
+          ① 用户在详情页点某个状态 → 先写远端，成功后才回写这里；
+          ② 进入详情页时本地没有值（0）→ 回查远端补齐（见
+             bridges/library 的 _CollectTypeWorker）；
+          ③ 只是"想快点显示"时，从 `inprogress_cache`（上次全量同步的
+             服务端收藏）同步搬过来，见 `cached_collect_type`。
+        不更新 `updated_at`：那一列语义是"条目元数据最后变更时间"
+        （名称/封面/集数），收藏状态是另一维度，混在一起会让
+        "最近更新"这类排序失去意义。
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE subjects SET collect_type=? WHERE id=?",
+                (int(collect_type or 0), subject_id),
             )
 
     # ---------- 条目别名 ----------
@@ -1003,7 +1180,8 @@ class Database:
             return {float(r["ep_index"]) for r in cur.fetchall() if r["ep_index"] is not None}
 
     # ---------- F18：在看缓存 ----------
-    def replace_inprogress_cache(self, items: list[dict]) -> None:
+    def replace_inprogress_cache(self, items: list[dict],
+                                 truncated: bool = False) -> None:
         """整体替换在看缓存（先清后插，保证与线上一致）。
 
         **两个时间字段别搞混**（v4 起分列存储）：
@@ -1011,6 +1189,18 @@ class Database:
             collection_updated_at —— Bangumi 的收藏修改时间（逐条不同），
                                      供「最近 N 部」排序
         早期版本只存前者，导致「最近 N 部」实际退化成「按名字排序的前 N 部」。
+
+        **顺带把 `subjects.collect_type` 与这批新数据对齐**（同一事务，
+        见末尾那条 UPDATE）：详情页的状态选择器读的是那一列，
+        而它可能来自"上次同步"甚至更早（`cached_collect_type` 那条快路径
+        也会写它）。不在这里对齐的话，用户改过收藏后本地会一直显示旧状态，
+        且因为"有值就不再回查"而**永远不会自愈**。
+        搬这一列是安全的：收藏同步拉的就是服务端全量状态，
+        至少和任何本地快照一样新。
+
+        `truncated=True` 表示这次拉取触顶截断（见 `iter_user_collections`
+        的 max_items）：此时**不会**把"名单外的条目"当成"已取消收藏"，
+        见下面第 ② 步的说明。
         """
         now = _now()
         with self._cursor() as cur:
@@ -1039,6 +1229,28 @@ class Database:
                     if it.get("bangumi_id")
                 ],
             )
+            # ① 把**这次拉到的**状态写回 subjects.collect_type（同一条 SQL
+            # 也用于 v10 迁移）。只覆盖"缓存里有行"的条目：名单外的条目
+            # 保持原快照，不会被清成"未知"。
+            cur.execute(_COLLECT_TYPE_BACKFILL_SQL)
+            # ② 这次拉取是全量的（除触顶截断），所以**名单里没有的已匹配条目
+            # = 服务端已不在收藏里** → 本地快照清成 0（"未知"）。
+            #
+            # **不做这一步会留下幽灵**：用户取消收藏后，本地快照仍是「在看」，
+            # 「在看」页会把它当"本地标记的条目"继续列出来（见 LibraryBridge
+            # 的合并段），而缓存里早已没有它 —— 一部已经取消收藏的番永远挂着。
+            # 用整库的判据（而不是"与上一轮缓存比差集"）：后者漏掉
+            # "更早以前就消失、当时没清干净"的遗留（实测：CLANNAD 一直显示
+            # 在看在）。
+            #
+            # **截断时跳过**（`truncated`）：拉取触顶（MAX_ITEMS）时，
+            # 名单外的条目不代表"已取消收藏"，只是没拉到 —— 此时宁可留着
+            # 旧值，也不能把真实状态批量清掉。
+            if not truncated:
+                cur.execute(_COLLECT_TYPE_CLEAR_STALE_SQL)
+                if cur.rowcount:
+                    log.info("同步：%s 个条目已不在收藏里，本地状态清为未知",
+                             cur.rowcount)
 
     def load_inprogress_cache(
         self, collect_type: Optional[int] = None

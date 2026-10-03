@@ -7,7 +7,9 @@ import QtQuick.Window      // Screen.devicePixelRatio（封面解码尺寸用）
 // 页面语义是"我正在追的番"（导航栏那一项也写着「在看」）。
 // 「看过」的番不在这里 —— 它们数量多（实测 149 部），时间线在「动态」页更合适。
 //
-// 数据来源：`library.inProgress`（读本地缓存表 inprogress_cache）。
+// 数据来源：`library.inProgress` —— 服务端收藏缓存（inprogress_cache）
+// **＋** 本地手动标成「在看」的条目（没配 Token / 没匹配 Bangumi 的用户
+// 也能用，见 LibraryBridge._load_inprogress 的合并段）。
 // 拉取动作由 `inprogress.refresh()` 触发（QThread + 信号），
 // 完成后 LibraryBridge 会 emit inProgressChanged，本页自动重算。
 //
@@ -21,8 +23,10 @@ Item {
     // 防御性写法：上下文属性在独立加载本文件时不存在（同 PosterWallPage）
     property var items: typeof library !== "undefined" && library
                         ? library.inProgress : []
+    // 元信息（条数 / 缓存年龄）走 Property 而不是函数调用：函数式的写法
+    // 在绑定里没有可追踪依赖，只会求值一次，列表变了页头数字也不动
     property var meta: typeof library !== "undefined" && library
-                       ? library.inProgressMeta() : ({ "count": 0, "stale": true })
+                       ? library.inProgressMeta : ({ "count": 0, "stale": true })
     property bool busy: typeof inprogress !== "undefined" && inprogress
                         ? inprogress.running : false
 

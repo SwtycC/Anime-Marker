@@ -137,6 +137,7 @@ Item {
             // （需求里的"搜索按钮右移"，实现见 TagFilterPill.qml）。
             TagFilterPill {
                 id: filterPill
+                objectName: "filterPill"      // 诊断/探针用
 
                 rows: root.filterRows
                 selection: root.tagSelection
@@ -482,6 +483,24 @@ Item {
             return false
         if (root.stateFilter === "unmatched" && item.matchState !== "pending")
             return false
+        // 收藏状态（「收藏状态」栏）：比的是收藏状态本身，不是 tag。
+        // 取值 "1"~"5" = 具体状态，"0" = 未标记（见 makeCollectRow）。
+        // **这一栏不进 filterCatalogue**（它是固定项、不来自 tag 统计），
+        // 所以不能靠下面遍历目录的那段，得单独判一次。
+        //
+        // **状态从 `root.collectTypes` 取，不读 `item.collectType`**：
+        // 那张墙的条目列表是长生命周期的缓存，收藏状态变了它不一定重取
+        // （重取要重建全部卡片），读它会出现"详情页已经是「看过」、
+        // 筛选里还算未标记"（用户实测，要重扫才更新）。映射取不到时
+        // 才回落到条目自己的字段。
+        var wantCollect = root.tagSelection[root.collectRowTitle] || ""
+        if (wantCollect) {
+            var cur = root.collectTypes[String(item.id)]
+            if (cur === undefined)
+                cur = item.collectType || 0
+            if (String(cur) !== wantCollect)
+                return false
+        }
         // 按键走目录（而不是走 selection 的键）：每栏的取值来源不同 ——
         // 制作公司栏比的是 subjects 的 studio 字段，其余栏比的是 tag。
         //
@@ -705,12 +724,66 @@ Item {
                       { "label": "未匹配", "value": "unmatched" }]
         }]
         var cat = root.filterCatalogue
-        for (var i = 0; i < cat.rows.length; i++)
+        var collectRow = root.makeCollectRow()
+        var placed = false
+        for (var i = 0; i < cat.rows.length; i++) {
             rows.push(root.makeTagRow(cat.rows[i]))
+            // 收藏状态栏：**紧跟「类型」之后**（用户指定的位置）
+            if (cat.rows[i].title === root._collectRowAfter) {
+                rows.push(collectRow)
+                placed = true
+            }
+        }
+        // 兜底：库里连「类型」栏都没有（该分类一个值都没出现过时整行不显示）
+        // → 放在最后一个分类栏之后、其他 / 制作公司之前
+        if (!placed)
+            rows.push(collectRow)
         if (cat.other.tags.length > 0)
             rows.push(root.makeTagRow(cat.other))
         return rows
     }
+
+    /// 收藏状态栏的标题。
+    ///
+    /// **为什么不叫「状态」**：面板第一行已经叫「状态」，含义是**匹配状态**
+    /// （已匹配 / 未匹配）—— 这一栏筛的是 Bangumi 的收藏状态（想看/看过/…），
+    /// 两者不是一回事，重名会让人分不清点的是哪一个。
+    /// 这个标题同时是 `tagSelection` 的键（选中值存那儿）与 `facetMatches`
+    /// 的依据，所以只在这里定义一次。
+    readonly property string collectRowTitle: "收藏状态"
+    /// 收藏状态栏插在哪个分类栏之后（见 buildFilterRows）
+    readonly property string _collectRowAfter: "类型"
+
+    /// 收藏状态栏：全部 + 五个状态 + 未标记。
+    ///
+    /// **值一律用字符串**（含未标记的 `"0"`）：`applyFilter` 用 `if (value)`
+    /// 判断"选中了没"，数字 0 会被当成"没选"，那一项就永远点不中；
+    /// 字符串 `"0"` 在 JS 里是真值，正好绕开。
+    ///
+    /// 「未标记」= `collectType == 0`（本地没有收藏状态：没查过、或确实没收藏）。
+    /// 这两种情况界面上区分不了，对"筛出还没标过的番"这个用途也没必要区分。
+    function makeCollectRow() {
+        var chips = [{ "label": "全部", "value": "" }]
+        var opts = root.collectOptions
+        for (var i = 0; i < opts.length; i++) {
+            chips.push({ "label": String(opts[i].text),
+                         "value": String(opts[i].value) })
+        }
+        chips.push({ "label": "未标记", "value": "0" })
+        return { "title": root.collectRowTitle, "kind": "collect", "chips": chips }
+    }
+
+    /// 收藏状态的可选项（想看/看过/…），由后端给（见 LibraryBridge.collectOptions）
+    readonly property var collectOptions: typeof library !== "undefined"
+                                          && library && library.collectOptions
+                                          ? library.collectOptions : []
+
+    /// `条目主键 → 收藏状态`，供「收藏状态」栏筛选（见 facetMatches）。
+    /// 单独一份、挂在 collectTypeChanged 上：收藏状态一变就更新，
+    /// 不用等整墙重取（那会重建全部卡片）。
+    readonly property var collectTypes: typeof library !== "undefined"
+                                        && library && library.collectTypes
+                                        ? library.collectTypes : ({})
 
     /// 一个筛选栏 → 面板行（首项固定是"全部"= 清空本栏）。
     /// `cat.source` 决定面板/匹配按哪个字段取数（"tag" / "studio"）。

@@ -215,6 +215,11 @@ class QmlApp:
             proxy=self.config.get("bangumi", "proxy", ""),
             user_agent=self.config.get(
                 "bangumi", "user_agent", USER_AGENT),
+            # 配置里的「用户 ID」= username（不是昵称）。只有几个端点要它，
+            # 且 `-` 占位符在那里不生效（详情页回查收藏状态就是其一，
+            # 见 BangumiClient.get_collection）。留空时客户端会自己用
+            # Token 调 /v0/me 解析，所以填错/没填都还能工作。
+            username=self.config.get("bangumi", "username", ""),
         )
 
     # ---------- 启动 ----------
@@ -445,6 +450,12 @@ class QmlApp:
             self.library_bridge.waitTagWorker()
         except Exception as e:  # pragma: no cover - 防御性
             log.warning("等待标签拉取结束失败：%s", e)
+        # 收藏状态（想看/看过/…）的读/写线程同理：不等的话，退出瞬间
+        # 正好在写远端的那个请求会被连带掐掉，用户看到"点了没反应"
+        try:
+            self.library_bridge.waitCollectWorkers()
+        except Exception as e:  # pragma: no cover - 防御性
+            log.warning("等待收藏状态写入结束失败：%s", e)
         # 后台的「看完同步到 Bangumi」也要等：它的收尾（写回 watched_episodes）
         # 在主线程，不等就永远不会执行（见 ProgressMonitor.wait_pending_sync）
         try:

@@ -105,6 +105,7 @@ ApplicationWindow {
 
                 PosterWallPage {
                     id: wallPage
+                    objectName: "posterWallPage"   // 诊断/探针用
                     onSubjectClicked: function (subjectId) {
                         detailOriginPage = window.currentPage    // 记住来源页
                         detailPage.load(subjectId)
@@ -127,6 +128,9 @@ ApplicationWindow {
 
             InProgressPage {
                 id: inProgressPage
+                // 与相邻的 detailPage / timelinePage 一致：给个 objectName，
+                // 自动化脚本（截图/点按核对）才找得到这一页
+                objectName: "inProgressPage"
                 // 在看页「详情」按钮 / 整行点击 → 复用海报墙的详情页
                 onSubjectClicked: function (subjectId) {
                     detailOriginPage = window.currentPage    // 必须在切页**之前**记
@@ -283,6 +287,37 @@ ApplicationWindow {
         function onTagsChanged(subjectId) {
             if (detailPage.subjectId === subjectId)
                 detailPage.reloadTagRows()
+        }
+        // 收藏状态可能变了（用户点了那排状态按钮，或进入详情页时补齐）→
+        // 解锁 `collectBusy`、清掉乐观更新的待确认值，**值确实变了才 reload**。
+        //
+        // **为什么不能无条件 reload**（原先就是）：`load()` 会
+        // `epFlick.contentY = 0` 把集数列表滚回顶部。而这个信号并不保证
+        // 值有变化 —— 后端在"点的是当前状态 / 写失败 / 回查确认一致"时
+        // 也会发（它必须发，否则按钮永远解不开锁，见 setCollectType）。
+        // 无条件 reload 就会在这些"其实什么都没变"的时刻把用户的滚动位置
+        // 冲掉。
+        //
+        // 比较的是**旧字典里的值 vs 库里现在的值**：`detailPage.subject`
+        // 是 load() 时取的一份快照，所以它就是"界面正在显示的那个值"。
+        // 先清 collectPending 再比，才能让"点完写入成功"这一步得出
+        // "值已一致、无需 reload"（待确认值和真实值相同）—— 这一帧的
+        // 选中态本来就是对的，不必再重建。
+        //
+        // 真要 reload 时也只能整条重取（不能像 tag 那样只重取一小块）：
+        // collectType 是 subject 字典里的字段，而 subject 只在 load() 里赋值，
+        // 没有单独的 Property 通知。
+        // load() 里还会再调一次 requestCollectType —— 后端有"每次运行
+        // 每条目只查一次"的闸门兜底（见那里注释），所以这个 reload 不会
+        // 变成"reload → 回查 → collectTypeChanged → reload"的循环。
+        function onCollectTypeChanged(subjectId) {
+            if (detailPage.subjectId !== subjectId)
+                return
+            detailPage.collectBusy = false
+            detailPage.collectPending = 0
+            if ((library.subject(subjectId).collectType || 0)
+                    !== (detailPage.subject.collectType || 0))
+                detailPage.load(subjectId)
         }
         function onStatusMessage(text) {
             banner.show(text)

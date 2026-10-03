@@ -49,6 +49,31 @@ Item {
     property var editApi: []        // [{name, deleted}]
     property var editUser: []       // [string]
     property string newTagText: ""
+    /// 收藏状态正在写入（防连点；写入期间选择器置灰）
+    property bool collectBusy: false
+    /// 点击后**立刻**显示的状态（0 = 没有待确认的点击）。
+    ///
+    /// **为什么要它（乐观更新）**：写入要发一个 POST 到 Bangumi（实测
+    /// 往返数百毫秒到 1 秒），而选中态原先只认 `subject.collectType` ——
+    /// 那是**写入成功后**才回写的快照。于是"点一下→亮起"中间空着将近
+    /// 一秒，用户实测反馈"点击按钮后对应按钮亮起的时间也快一点"。
+    /// 现在点下去的那一帧就先用这个值把按钮点亮，等 `collectTypeChanged`
+    /// 回来（Main.qml → load()）再以库里/远端的结果为准：
+    ///   - 写成功 → 值一致，视觉无变化；
+    ///   - 写失败 → load() 会清掉它，自动**弹回**原状态（不保留假象，
+    ///     与后端"远端成功才落本地"的取舍一致）。
+    property int collectPending: 0
+    /// 选择器当前该显示的值：待确认的点击优先，其次才是本地快照。
+    readonly property int collectShown: root.collectPending
+                                        || (root.subject.collectType || 0)
+    /// 收藏状态的五个选项（想看/看过/在看/搁置/抛弃）。
+    ///
+    /// **从后端取，不再写死在这里**：海报墙的筛选面板也用同一份
+    /// （`library.collectOptions` ← bangumi_api.COLLECT_TYPE_NAMES），
+    /// 两处各写一份的话，改了枚举只改一处就会出现"筛出来的和这里选的对不上"。
+    readonly property var collectOptions: typeof library !== "undefined"
+                                          && library && library.collectOptions
+                                          ? library.collectOptions : []
 
     function load(sid) {
         root.subjectId = sid
@@ -56,6 +81,31 @@ Item {
         root.episodes = library.episodes(sid)
         root.siblings = library.series_siblings(sid)
         root.resetTagState()
+        // 收藏状态：**换条目 / 刷新时清掉"写入中"与待确认的点击**，
+        // 否则上一条目失败留下的 true 会把新条目的选择器一直锁成灰色
+        // （换条目时没有完成信号来解锁），或者把上一条目点的状态留着。
+        //
+        // **顺序要紧：这两行必须在 `root.subject = ...` 之后**。
+        // 选择器显示的是 `collectPending || subject.collectType`，若先清
+        // pending，中间会有一帧退回**旧**条目的值（多半是 0 = 一个都不选），
+        // 再跳成新值 —— 表现为"进详情页时选择器闪一下"，正是要消灭的那种慢。
+        root.collectPending = 0
+        root.collectBusy = false
+        // 收藏状态：**每次都让后端补齐**（它自己决定代价）——
+        // 收藏缓存里有答案就立刻给出（不发请求），没有就回查一次网络，
+        // 每个条目每次运行最多查一次（见 requestCollectType）。
+        //
+        // **这里不要加"collectType == 0 才调"这类判据**（踩过）：那正是
+        // "错的快照永远没人纠正"的成因 —— CLANNAD 早在网页端取消了收藏，
+        // 本地快照还留着「在看」，于是详情页一直显示错的，而这条判据
+        // 让后端根本没机会去纠正它（用户实测反馈"有 token 按 bangumi 上处理"）。
+        //
+        // **这里被 load() 反复调到是正常的，不会重复发请求**：后端有
+        // "本次运行已回查过的条目"闸门（`_collect_queried`）。**别把闸门
+        // 去掉**——回查完成会触发 collectTypeChanged → Main.qml reload →
+        // 又调到这里，自激成无限循环（2026-10-03 实测刷出上百次 404）。
+        if (typeof library !== "undefined" && library)
+            library.requestCollectType(sid)
         // 存量条目自动补拉标签（异步，不阻塞界面；已有 tag 时是空操作）。
         // 失败经状态栏提示；下次进入本页会自动重试，无需手动入口。
         if (root.tagRows.length === 0 && (root.subject.bangumiId || 0) > 0
@@ -155,11 +205,6 @@ Item {
     }
 
     /// 把输入框里的文字添加为用户 tag（去重、去空白），并**立即落库**。
-    ///
-    /// **踩坑（加了 tag 按 × 却没了）**：早期版本把 ✔ 设计成"只改草稿"、
-    /// 需要再点一次空输入的 ✔ 才写库，× 则是"丢弃草稿退出"。但用户的心智
-    /// 是"我点了 ✔ 就已经加上了"，随后按 × 收工 → 草稿被丢弃 → tag 消失
-    /// （实测反馈）。
     ///
     /// 现在改为**每次操作立即提交**：
     ///   ✔ 添加   → 立刻写库，失败则不当场改 UI
@@ -315,42 +360,89 @@ Item {
             Layout.fillHeight: true
             spacing: Theme.spacingXl
 
-            // 封面
-            Rectangle {
-                Layout.preferredWidth: 240
-                Layout.preferredHeight: Math.round(240 * Theme.posterRatio)
+            // 左列：封面 + 其下方的收藏状态选择器。
+            //
+            // **为什么把状态选择器放在这一列、而不是信息区里**（版式依据）：
+            // 按需求它要"在海报展示图下方"。放进这个 Column 并锚在封面之下，
+            // 位置就随封面尺寸自动跟着走；若塞进右侧信息区（那是个
+            // ColumnLayout），它会跑到标题/别名/标签那一串里，
+            // 既不"在封面下方"，也会被标签的展开/收起推着上下移动。
+            Column {
                 Layout.alignment: Qt.AlignTop
-                color: Theme.surfaceAlt
-                border.width: Theme.lineThin
-                border.color: Theme.border
-                radius: Theme.radiusMd
-                clip: true
+                spacing: Theme.spacingMd
 
-                Image {
-                    id: detailCover
-                    anchors.fill: parent
-                    source: root.subject.coverUrl || ""
-                    fillMode: Image.PreserveAspectFit
-                    asynchronous: true
-                    visible: status === Image.Ready && source != ""
+                // 封面
+                Rectangle {
+                    id: coverBox
+                    width: 240
+                    height: Math.round(width * Theme.posterRatio)
+                    color: Theme.surfaceAlt
+                    border.width: Theme.lineThin
+                    border.color: Theme.border
+                    radius: Theme.radiusMd
+                    clip: true
 
-                    // **必须给 `sourceSize`**（与海报墙同源的画质教训）：
-                    // 不给的话，1227×1736 的原图会整张传上 GPU，再靠**一次
-                    // 双线性采样**缩到 240×336（约 5 倍缩小），细节成片丢失、
-                    // 边缘出块状锯齿 —— 就是"详情页海报比原图糊"的原因。
-                    //
-                    // 倍数取"物理像素的 2 倍"：实测的拐点，少了偏糊、多了
-                    // 又重新锯齿。完整数据与推导见 PosterCard.qml 里的长注释。
-                    sourceSize.width: Math.round(width * Screen.devicePixelRatio * 2)
-                    sourceSize.height: Math.round(height * Screen.devicePixelRatio * 2)
+                    Image {
+                        id: detailCover
+                        anchors.fill: parent
+                        source: root.subject.coverUrl || ""
+                        fillMode: Image.PreserveAspectFit
+                        asynchronous: true
+                        visible: status === Image.Ready && source !== ""
+
+                        // **必须给 `sourceSize`**（与海报墙同源的画质教训）：
+                        // 不给的话，1227×1736 的原图会整张传上 GPU，再靠**一次
+                        // 双线性采样**缩到 240×336（约 5 倍缩小），细节成片丢失、
+                        // 边缘出块状锯齿 —— 就是"详情页海报比原图糊"的原因。
+                        //
+                        // 倍数取"物理像素的 2 倍"：实测的拐点，少了偏糊、多了
+                        // 又重新锯齿。完整数据与推导见 PosterCard.qml 里的长注释。
+                        sourceSize.width: Math.round(width * Screen.devicePixelRatio * 2)
+                        sourceSize.height: Math.round(height * Screen.devicePixelRatio * 2)
+                    }
+
+                    Text {
+                        anchors.centerIn: parent
+                        visible: !detailCover.visible
+                        text: "无封面"
+                        color: Theme.textTertiary
+                        font.pixelSize: Theme.fontSm
+                    }
                 }
 
-                Text {
-                    anchors.centerIn: parent
-                    visible: !detailCover.visible
-                    text: "无封面"
-                    color: Theme.textTertiary
-                    font.pixelSize: Theme.fontSm
+                // 收藏状态选择器（想看 / 看过 / 在看 / 搁置 / 抛弃）。
+                //
+                // 两种不可用情形都收敛到 `interactive`：
+                //   subjectId=0      → 页面还没加载完
+                //   写入进行中        → 防连点导致状态来回跳
+                // 此时仍**显示**（不隐藏）：隐藏会让下方内容整体上移、
+                // 加载完成时跳一下；置灰则一眼看出"这里有东西但不能点"。
+                //
+                // **不再要求"已匹配 Bangumi"**：没配 Token / 没匹配的条目
+                // 也能点（后端只写本地，状态栏会说明"仅本地"），
+                // 否则对那类用户这排按钮就是个永远点不动的摆设。
+                CollectTypeSelector {
+                    id: collectBox
+                    objectName: "collectTypeSelector"
+                    width: parent.width
+                    options: root.collectOptions
+                    currentValue: root.collectShown
+                    interactive: root.subjectId > 0 && !root.collectBusy
+                    onActivated: function (value) {
+                        if (typeof library === "undefined" || !library)
+                            return
+                        // 点的就是当前状态：无变化。**必须在这里挡掉**，
+                        // 不能交给后端去重 —— 后端那条"值相同就直接 return"
+                        // 不发 collectTypeChanged，collectBusy 就永远解不开，
+                        // 选择器一直灰着（用户看起来就是"卡住了"）。
+                        if (value === root.collectShown)
+                            return
+                        // 乐观更新：这一帧就把按钮点亮（见 collectPending），
+                        // 失败时由 collectTypeChanged → load() 弹回原状态。
+                        root.collectPending = value
+                        root.collectBusy = true
+                        library.setCollectType(root.subjectId, value)
+                    }
                 }
             }
 
