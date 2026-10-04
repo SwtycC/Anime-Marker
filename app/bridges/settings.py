@@ -42,7 +42,7 @@ ALLOWED_KEYS = {
     # qBittorrent
     "qbittorrent.host", "qbittorrent.port", "qbittorrent.username",
     "qbittorrent.password", "qbittorrent.category", "qbittorrent.save_path",
-    "qbittorrent.webui_url",
+    "qbittorrent.webui_url", "qbittorrent.exe_path", "qbittorrent.auto_start",
     # RSS
     "rss.poll_interval", "rss.rule", "rss.auto_download", "rss.poll_on_start",
     # 界面
@@ -79,6 +79,8 @@ FALLBACKS: dict[str, str] = {
     "qbittorrent.category": "Bangumi",
     "qbittorrent.save_path": "",
     "qbittorrent.webui_url": "",
+    "qbittorrent.exe_path": "",
+    "qbittorrent.auto_start": "false",
     "rss.poll_interval": "30",
     "rss.rule": "new_only",
     "rss.auto_download": "false",

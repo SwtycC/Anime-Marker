@@ -22,10 +22,20 @@ Rectangle {
     property bool hovered: mouseArea.containsMouse
     property bool pressed: mouseArea.pressed
 
+    /// 紧凑模式：更小的内边距与高度，用于**塞进标题行/工具条**里的小按钮
+    /// （如「下载器 · 保存位置」标题右侧的「重新扫描」）。
+    ///
+    /// 为什么做成开关而不是让调用方覆写 `implicitHeight`（踩坑）：
+    /// 直接写 `implicitHeight: 24` 只改了外框，里面 `label` 的字号与
+    /// 居中都不变 —— 字会几乎贴满边框，看着比原来还"挤"。
+    /// 这里连内边距和字号一起缩，才是真正的"小一号"。
+    property bool compact: false
+
     signal clicked()
 
-    implicitWidth: label.implicitWidth + Theme.spacingLg * 2
-    implicitHeight: 34
+    implicitWidth: label.implicitWidth
+                   + (root.compact ? Theme.spacingMd : Theme.spacingLg) * 2
+    implicitHeight: root.compact ? 24 : 34
     radius: Theme.radiusSm
     // 禁用态：整体降透明度，避免"看起来能点却点不动"
     opacity: enabled ? 1.0 : 0.45
@@ -76,7 +86,7 @@ Rectangle {
         // 实底按钮（主题色 / 红色）用反色文字，保证对比度
         color: (root._isPrimary || root._isDanger)
                ? Theme.accentText : Theme.textPrimary
-        font.pixelSize: Theme.fontMd
+        font.pixelSize: root.compact ? Theme.fontXs : Theme.fontMd
         Behavior on color { ColorAnimation { duration: Theme.durFast } }
     }
 

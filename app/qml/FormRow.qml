@@ -27,6 +27,23 @@ Item {
 
     property string label: ""
     property string hint: ""
+
+    /// 弹窗里**实际渲染**的文本：把 hint 统一成 RichText 可用的形式。
+    ///
+    /// 存在的理由：`hint` 是公开属性，两个调用方写出来的东西不一样 ——
+    ///   - 老文案是**纯文本**，靠 `\n\n` 分段（大量 SettingsPage 的说明）；
+    ///   - 新文案是 **HTML**（SubscriptionForm 的判新规则说明要用 `<b>`）。
+    /// 而渲染端只有一个 `Text`，且必须写死 `RichText`（AutoText 会把
+    /// 以中文开头的 HTML 判成纯文本，见下方 Text 的说明）。
+    /// RichText 下 `\n` 会被折叠 —— 所以纯文本那批必须先把换行转成
+    /// `<br>`，否则段落会全部挤在一起。
+    ///
+    /// 判据用"是否含 `<`"而不是正则匹配标签：项目里的 hint 都是自写的，
+    /// 含 `<` 的只可能是故意写的 HTML（没有一处正文需要显示字面的 `<`）。
+    /// 若将来真出现，改成显式 property bool hintIsHtml 更稳妥。
+    readonly property string hintMarkup: hint.indexOf("<") >= 0
+                                          ? hint
+                                          : hint.replace(/\n/g, "<br>")
     // 150（原 132）：要容下最长的标签「附加内容独立编号」——
     // 7 个中文字约 98px + 右侧 `?` 按钮 20px + 间距，132 会把文字截成
     // 「附加内容独立...」（实测截图反馈）。所有行共用此宽度，
@@ -148,9 +165,25 @@ Item {
             width: parent.width
             spacing: Theme.spacingMd
 
+            // **必须显式指定 RichText**（踩坑，实测反馈"文本加粗效果
+            // 没实现"）：`Text` 默认 `textFormat: Text.AutoText`，只有
+            // 内容**看起来像 HTML**（以 `<` 开头）时才会自动判定为富文本；
+            // 而这里的 hint 常以中文/字母开头（如「只下新集」），
+            // AutoText 会判成纯文本，`<b>` 就被原样显示成尖括号。
+            // 写死 RichText 后 `<b>`、`<br>`、`<p>` 才生效。
+            //
+            // **text 走 hintMarkup**（而不是 root.hint）：RichText 下
+            // `\n` 只是普通空白、会被折叠成空格，而本项目多数 hint 是
+            // **纯文本 + `\n\n` 分段**（见 SettingsPage 的快捷键说明）——
+            // 直接切 RichText 会让那些说明的段落全部挤成一坨（实测）。
+            // hintMarkup 做两件事：
+            //   ① 把 `\n` 换成 `<br>`（保住原有分段）；
+            //   ② 若调用方已经写了 HTML 标签（含 `<`），则原样透传。
+            // 这样"老纯文本 hint"和"新 HTML hint"都能正确显示。
             Text {
                 width: parent.width
-                text: root.hint
+                text: root.hintMarkup
+                textFormat: Text.RichText
                 color: Theme.textSecondary
                 font.pixelSize: Theme.fontSm
                 lineHeight: 1.5

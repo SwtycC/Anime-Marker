@@ -32,6 +32,8 @@ from app.bridges.scanner import SEASON_DISPLAY
 from app.core.bangumi_api import BangumiClient
 from app.core.config import Config
 from app.core.database import Database
+from app.core.qbittorrent_api import QbClient
+from app.core.rss_service import RssService
 from app.utils.logger import setup_logging
 from app.utils.paths import app_data_dir, qml_dir, resource_path
 
@@ -126,12 +128,87 @@ class QmlApp:
         # 集级观看记录（第二阶段）拉完后，刷新动态页数据源
         self.inprogress_bridge.set_episode_done_hook(
             self.library_bridge.reloadWatchedEpisodes)
-        self.rss_bridge = RssBridge(self.db)
+        # 订阅桥接也需要 config（抓 RSS 的代理/UA）与 api（「从订阅源新建条目」
+        # 时匹配 Bangumi）—— 早期只传 db，因为当时只做订阅源管理。
+        self.rss_bridge = RssBridge(self.db, self.config, self.api)
+
+        # ---- RSS 轮询下载（F19 的第二半）----
+        #
+        # **踩坑（实测反馈"我怎么确认在下载了"）**：`core/rss_service.py` 里
+        # 整套下载链路（轮询 → 三层判新 → 推送 qBittorrent → 写下载记录）
+        # 早就写好了，但**从来没有被实例化过** —— 全项目搜 `RssService`
+        # 只在它自己的文件里出现。于是订阅建了、绑了，却一次都没轮询过，
+        # 下载记录永远是空的（界面上那句"轮询下载功能尚未接入"是实话）。
+        #
+        # 现在在启动时建好并 start()：它内部按 `rss.poll_interval` 定时触发，
+        # 且 `poll_on_start` 为真时立刻跑一次。
+        self.qb_client = self._build_qb_client()
+        self.rss_service = RssService(self.db, self.config, self.api,
+                                      self.qb_client)
+        # 桥接层也要一份（查下载进度用，见 RssBridge.refreshTorrents）
+        self.rss_bridge.set_qb(self.qb_client)
+        # 轮询结果交给桥接层，由它转成 QML 能读的属性（见 RssBridge）
+        self.rss_service.progress.connect(self.rss_bridge.setProgress)
+        self.rss_service.poll_finished.connect(self.rss_bridge.onPollFinished)
+        # 桥接层的「立即检查」→ 服务层轮询
+        self.rss_bridge.pollRequested.connect(self._on_poll_requested)
+        # 桥接层的「下发」→ 服务层推送
+        self.rss_bridge.pushRequested.connect(self._on_push_requested)
 
         # 配置保存后重建依赖配置的服务
         self.settings_bridge.saved.connect(self._rebuild_services)
         # 「保存并扫描」按钮
         self.settings_bridge.scanRequested.connect(self._on_scan_requested)
+
+    # ---------- RSS 下载 ----------
+    def _build_qb_client(self) -> Optional[QbClient]:
+        """按配置建 qBittorrent 客户端；**没填地址就返回 None**。
+
+        返回 None 是**受支持的正常状态**（不是错误）：`PollWorker` 遇到
+        `qb is None` 时会把新集入库为「待确认」而不是报错（见
+        rss_service 里那段），用户仍然看得到"有新集"，只是没自动下发。
+
+        判断依据用「地址是否为空」而不是"能不能连上"：连不上只是**当下**
+        不通（qBittorrent 没开），此时仍应把客户端交出去 —— 否则用户
+        先启动本程序、后开 qBittorrent 的话，整个下载功能就永久不可用了。
+        真正的连接失败会在下发时以 QbError 形式落到那条记录的失败状态上。
+        """
+        host = (self.config.get("qbittorrent", "host", "") or "").strip()
+        if not host:
+            log.info("未配置 qBittorrent 地址，跳自动下发（新集入库为待确认）")
+            return None
+        return QbClient(
+            host=host,
+            port=self.config.getint("qbittorrent", "port", 8080),
+            username=self.config.get("qbittorrent", "username", "admin"),
+            password=self.config.get("qbittorrent", "password", ""),
+            category=self.config.get("qbittorrent", "category", "Bangumi"),
+            save_path=self.config.get("qbittorrent", "save_path", ""),
+            webui_url=self.config.get("qbittorrent", "webui_url", ""),
+            # 按需启动 qBittorrent（实测诉求："在其退出但需要时打开"）。
+            # 路径留空时不生效（保持旧行为）。
+            exe_path=self.config.get("qbittorrent", "exe_path", ""),
+            auto_start=self.config.getbool("qbittorrent", "auto_start", False),
+        )
+
+    @Slot(int)
+    def _on_poll_requested(self, source_id: int = 0) -> None:
+        """触发一次轮询（异步）。
+
+        `source_id`：0 = 全部启用订阅（「立即检查」按钮）；>0 = 只检查
+        该订阅（「下载器」保存后自动触发，见 RssBridge.setDownloader）。
+        只查一个订阅是有意义的优化：用户刚改的就是它，没必要把所有
+        订阅重新抓一遍（每条都是一次 HTTP 请求）。
+        """
+        self.rss_service.poll(only_source_id=(source_id or None))
+
+    @Slot(int)
+    def _on_push_requested(self, record_id: int) -> None:
+        """界面点某条记录的「下发」→ 推送到 qBittorrent（同步，本机很快）。"""
+        if record_id <= 0:
+            return
+        ok, msg = self.rss_service.push_pending(record_id)
+        self.rss_bridge.onPushResult(record_id, ok, msg)
 
     # ---------- 配置变更 ----------
     def _rebuild_services(self) -> None:
@@ -142,6 +219,20 @@ class QmlApp:
         self.match_bridge.set_api(self.api)
         self.inprogress_bridge.set_api(self.api)
         self.library_bridge.set_api(self.api)
+        # 订阅桥接：换 API 后「从订阅源新建条目」才能用新的 Token 匹配
+        self.rss_bridge.set_api(self.api)
+        # RSS 轮询：**重建 qB 客户端与轮询间隔**。
+        #
+        # 用户在设置页改了 qBittorrent 地址/密码、或改了轮询间隔，
+        # 必须重新下发才能生效 —— `RssService` 的定时器间隔与 `QbClient`
+        # 都是构造时读入的（同 ProgressMonitor 的坑，见 PlayerBridge.
+        # apply_config 的说明）。不重启程序就该生效。
+        self.qb_client = self._build_qb_client()
+        self.rss_service.set_qb(self.qb_client)
+        self.rss_service.apply_config()
+        # 桥接层那份引用（查进度用）也要同步，否则会"下发用新地址、
+        # 查进度还在问旧地址"（见 RssBridge.set_qb 的说明）
+        self.rss_bridge.set_qb(self.qb_client)
         # 海报墙展示模式：固定方案（见 SEASON_DISPLAY 的说明）。
         # 原先这里读 `scanner.season_display`，但界面已移除该选项，
         # 配置里可能是用户很久以前设过的旧值 —— 继续读会让"界面上
@@ -327,6 +418,13 @@ class QmlApp:
         # ---- 应用持久化的主题（必须在界面加载后调用，此时 Theme 单例已就绪）----
         self._apply_saved_theme()
 
+        # ---- 启动 RSS 轮询 ----
+        # 放在界面加载**之后**：轮询是后台线程，但它的信号会更新桥接层的
+        # 属性（订阅页读的那些），界面还没起来时发信号没有意义；
+        # 而且启动瞬间要优先保证窗口尽快显示（轮询可能立刻发网络请求）。
+        # `poll_on_start` 为真时 RssService.start() 内部会立即跑一次。
+        self.rss_service.start()
+
         return app.exec()
 
     # ---------- 窗口尺寸 ----------
@@ -456,6 +554,18 @@ class QmlApp:
             self.library_bridge.waitCollectWorkers()
         except Exception as e:  # pragma: no cover - 防御性
             log.warning("等待收藏状态写入结束失败：%s", e)
+        # 订阅相关线程（抓 RSS 推断名称 / 从订阅源新建条目）
+        try:
+            self.rss_bridge.waitWorkers()
+        except Exception as e:  # pragma: no cover - 防御性
+            log.warning("等待订阅线程结束失败：%s", e)
+        # RSS 轮询线程：**必须停掉再关数据库**。轮询线程会写
+        # `download_history` / `rss_sources`（见 PollWorker.run），
+        # 不等它结束就 close()，轻则写失败刷一堆异常、重则残留半条记录。
+        try:
+            self.rss_service.stop()
+        except Exception as e:  # pragma: no cover - 防御性
+            log.warning("停止 RSS 轮询失败：%s", e)
         # 后台的「看完同步到 Bangumi」也要等：它的收尾（写回 watched_episodes）
         # 在主线程，不等就永远不会执行（见 ProgressMonitor.wait_pending_sync）
         try:

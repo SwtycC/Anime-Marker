@@ -272,6 +272,9 @@ Item {
         v["qbittorrent.port"] = qbPortField.value
         v["qbittorrent.username"] = qbUserField.text.trim()
         v["qbittorrent.password"] = qbPassField.text
+        // 按需启动（v14）：路径 + 开关
+        v["qbittorrent.exe_path"] = qbExeField.text.trim()
+        v["qbittorrent.auto_start"] = qbAutoStartBox.checked
         // RSS
         v["rss.poll_interval"] = rssPollField.value
         v["rss.rule"] = rssRuleSeg.currentValue
@@ -1154,6 +1157,72 @@ Item {
                         text: root.getValue("qbittorrent.password", "")
                         width: parent.width
                         echoPassword: true
+                    }
+                }
+
+                // ---- 按需启动（v14）----
+                //
+                // 实测诉求："可以添加 qBittorrent 的路径吗，在其退出但需要时打开"。
+                // 背景：qBittorrent 的 GUI 与 Web UI 是**同一个进程** —— 从托盘
+                // 「退出」后 Web UI 一起消失，本程序连不上，新集只能落成
+                // 「待确认」（不丢，但要手动点）。填了路径并开启后，下发前会
+                // 自动把它拉起来（见 QbClient.ensure_running）。
+                FormRow {
+                    width: parent.width
+                    label: "程序路径"
+                    // 全 HTML（不要混 `\n`，原因见 FormRow.hintMarkup：
+                    // 含 `<` 即整段透传，`\n` 便不再转 `<br>`）
+                    hint: "qBittorrent 主程序的完整路径。"
+                          + "<br><br><b>为什么要填：</b><br>"
+                          + "qBittorrent 的桌面窗口和 Web UI 是<b>同一个进程</b>，"
+                          + "从托盘「退出」后 Web UI 也会一起关闭，本程序就"
+                          + "连不上了。填好路径并开启下面那项后，"
+                          + "<b>需要在下载时会自动帮你启动它</b>。"
+                          + "<br><br>留空 = 不自动启动（只在下发失败时给出提示）。"
+                    Row {
+                        width: parent.width
+                        spacing: Theme.spacingMd
+
+                        AppTextField {
+                            id: qbExeField
+                            objectName: "qbExeField"
+                            text: root.getValue("qbittorrent.exe_path", "")
+                            width: parent.width - browseQbExeBtn.width
+                                    - Theme.spacingMd
+                            // 不写 placeholder 示例路径（实测要求"去除"）——
+                            // 点「浏览…」选即可，示例反而像已填的值
+                            placeholder: "点击「浏览…」选择"
+                        }
+                        AppButton {
+                            id: browseQbExeBtn
+                            text: "浏览…"
+                            onClicked: {
+                                var p = settingsBridge.pickFile("选择 qBittorrent",
+                                                                qbExeField.text)
+                                if (p)
+                                    qbExeField.text = p
+                            }
+                        }
+                    }
+                }
+
+                FormRow {
+                    width: parent.width
+                    label: "按需启动"
+                    // 全 HTML：含 `<` 会被 `hintMarkup` 判为"调用方已写 HTML"
+                    // 而**原样透传**，里面的 `\n` 就不会再被转成 `<br>`
+                    // （见 FormRow.hintMarkup）。所以想用 `<b>` 就必须把
+                    // 换行也写成 `<br>`，两者不能混。
+                    hint: "开启后，下发新集时若连不上 qBittorrent，"
+                          + "会自动用上面的路径把它启动起来，等它就绪再下发。"
+                          + "<br><br>已经开着的话<b>不会重复启动</b>；"
+                          + "一次轮询里只尝试一次。"
+                          + "<br>关闭 = 不自动启动（保持原样，只在失败时提示原因）。"
+                    CheckBoxLine {
+                        id: qbAutoStartBox
+                        objectName: "qbAutoStartBox"
+                        checked: root.getBool("qbittorrent.auto_start", false)
+                        text: "连不上时自动启动 qBittorrent"
                     }
                 }
             }

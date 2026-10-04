@@ -20,7 +20,7 @@ from app.utils.paths import database_path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 13
 
 #: 「把收藏缓存里已知的状态写回 `subjects.collect_type`」的那条 SQL。
 #:
@@ -166,19 +166,65 @@ CREATE TABLE IF NOT EXISTS ep_sync_state (
 );
 
 -- F19：RSS 订阅源
+--
+-- 绑定的两列（v10 起）：
+--   local_subject_id —— **本地 subjects.id**，订阅绑定条目的**权威标识**
+--   bangumi_id       —— 冗余存一份 Bangumi 条目 ID
+--
+-- **为什么以 local_subject_id 为准**（踩坑，实测反馈）：早期只有
+-- `bangumi_id`，于是**未匹配 Bangumi 的条目根本无法绑定** ——
+-- `linkSubject` 里有一道 `if not subj.bangumi_id: 拒绝`。而"没填 Token"
+-- 或"匹配没成功"的本地条目恰恰是最常见的，"全部下载 + 从订阅源新建条目"
+-- 这条链路上建出来的都是这种条目，结果就是"新建成功了却绑不上"。
+-- 本地主键是更根本的标识（`bangumi_id` 只是它的一个可选属性），改用它
+-- 之后两类条目都能绑定；`bangumi_id` 保留为**冗余**，因为判新逻辑
+-- （rss_matcher）拿它跟 Bangumi 的集数对齐更直接，不必每次 JOIN。
 CREATE TABLE IF NOT EXISTS rss_sources (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    name         TEXT,
-    url          TEXT UNIQUE,
-    bangumi_id   INTEGER,
-    enabled      INTEGER DEFAULT 1,
-    rule         TEXT DEFAULT 'new_only',
-    last_poll_at TEXT,
-    last_error   TEXT,
-    created_at   TEXT
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    name             TEXT,
+    url              TEXT UNIQUE,
+    local_subject_id INTEGER,                -- 本地 subjects.id（权威绑定）
+    bangumi_id       INTEGER,                -- 冗余：Bangumi 条目 ID（可为空）
+    enabled          INTEGER DEFAULT 1,
+    rule             TEXT DEFAULT 'new_only',
+    -- v12：标题过滤（**纯过滤，不参与判新**）
+    --   must_include —— 逗号/换行分隔，**全部**命中才下载
+    --   must_exclude —— 任一命中即**跳过**
+    -- 用途：同一站点一个订阅里混着不同字幕组/版本时，用它筛掉不想要的。
+    must_include     TEXT DEFAULT '',
+    must_exclude     TEXT DEFAULT '',
+    -- v13：是否**已保存过下载器设置**（0 = 没配过）。
+    --
+    -- 用户需求（原话）："下载器必须点保存才能启用这个订阅的下载，
+    -- 相当于一个'启用'开关"。含义：没配过下载器的订阅，检查时**只记录
+    -- 不下发**（避免用户还没想清楚过滤规则/保存位置，一加订阅就被下
+    -- 一堆东西到默认目录）。
+    --
+    -- 为什么单独一列而不是"看 must_include 是否为空"：用户可能**就是**
+    -- 不想过滤（两个框都留空），那也是一种有效的保存结果，不能因此
+    -- 判成"没配过"。
+    downloader_saved INTEGER DEFAULT 0,
+    -- v12：下载到「指定条目的目录」。
+    --   save_subject_id —— 要存到哪个**本地条目**的目录下（NULL = 用
+    --                      qBittorrent 的全局设置，不干预）
+    -- 下发时把该条目所在的目录交给 qBittorrent 当 save_path。
+    -- **注意**：存在这里的是"意图"，实际路径在下发那一刻由
+    -- `_resolve_save_path` 现算（目录可能被移动过）。
+    save_subject_id  INTEGER,
+    last_poll_at     TEXT,
+    last_error       TEXT,
+    created_at       TEXT
 );
 
 -- F19：下载记录（判新第三层 + 状态回查）
+--
+-- `last_error`（v11 起）记录**这一条为什么失败**。
+--
+-- **为什么必须落库**（踩坑，实测反馈"下载失败了，可以增加日志判断为什么
+-- 失败吗"）：早期失败原因只 append 到 `PollSummary.errors`（内存里的
+-- 临时列表，轮询一结束就没了），界面只能看到一个「失败 10」的计数 ——
+-- 用户完全不知道是"qBittorrent 没开"、"密码错"还是"磁力链失效"。
+-- 落库后每条记录各自带原因，界面能直接显示（也能事后追溯）。
 CREATE TABLE IF NOT EXISTS download_history (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     source_id     INTEGER REFERENCES rss_sources(id) ON DELETE CASCADE,
@@ -188,6 +234,7 @@ CREATE TABLE IF NOT EXISTS download_history (
     magnet        TEXT,
     torrent_hash  TEXT,
     status        TEXT DEFAULT 'pending',
+    last_error    TEXT,                      -- 失败原因（成功时为空串）
     created_at    TEXT,
     updated_at    TEXT
 );
@@ -312,22 +359,44 @@ class EpSyncState:
 
 @dataclass
 class RssSource:
-    """F19：RSS 订阅源。"""
+    """F19：RSS 订阅源。
+
+    绑定的两个字段（v10 起）：
+        local_subject_id —— 本地 subjects.id，**权威绑定标识**
+        bangumi_id       —— 冗余的 Bangumi 条目 ID（未匹配时为空）
+
+    带默认值：旧调用方按位置构造不受影响，`RssSource(**dict(row))` 也能对上。
+    """
 
     id: int
     name: str
     url: str
-    bangumi_id: Optional[int]
-    enabled: bool
-    rule: str
-    last_poll_at: str
-    last_error: str
-    created_at: str
+    # 见类说明：默认 None 让"老库迁移后还没补绑定"的行也能构造。
+    # 顺序与 `rss_sources` 表一致（local_subject_id 在 bangumi_id 之前），
+    # 便于对照；构造走关键字参数，顺序其实不影响。
+    local_subject_id: Optional[int] = None
+    bangumi_id: Optional[int] = None
+    enabled: bool = True
+    rule: str = "new_only"
+    # v12：标题过滤（纯过滤，不参与判新；空串 = 不过滤）
+    must_include: str = ""
+    must_exclude: str = ""
+    # v12：下载到哪个**本地条目**的目录（None = 不干预，用 qB 全局设置）
+    save_subject_id: Optional[int] = None
+    # v13：下载器是否已保存过（"启用开关"；见建表处说明）
+    downloader_saved: bool = False
+    last_poll_at: str = ""
+    last_error: str = ""
+    created_at: str = ""
 
 
 @dataclass
 class DownloadRecord:
-    """F19：下载记录。"""
+    """F19：下载记录。
+
+    `last_error`（v11 起）是该条**失败的原因**（成功时为空串）——
+    带默认值，让旧调用方与迁移前的老行都能构造。
+    """
 
     id: int
     source_id: int
@@ -339,6 +408,7 @@ class DownloadRecord:
     status: str
     created_at: str
     updated_at: str
+    last_error: str = ""
 
 
 def _now() -> str:
@@ -375,9 +445,37 @@ class Database:
             )
 
     def _migrate(self, old_version: int) -> None:
-        """增量迁移：只做加法（新增列），不破坏既有数据。"""
-        if old_version >= SCHEMA_VERSION:
-            return
+        """增量迁移：只做加法（新增列），不破坏既有数据。
+
+        **每个步骤都自己查列是否存在**，不依赖"版本号到了就跳过"。
+        原因（踩坑，实测）：早期只在方法开头做一次
+        `if old_version >= SCHEMA_VERSION: return`，于是**版本号一旦
+        领先于真实表结构，后面的迁移就永远不会执行** ——
+        实测遇到：`meta.schema_version` 已是 10，而 `rss_sources` 里
+        压根没有 v10 该加的 `local_subject_id` 列（那次先写了版本号、
+        迁移代码还没写完），此后每次启动都被这道 guard 挡掉，
+        列永远补不上、相关功能一直报 "no such column"。
+
+        现在 guard 只保留"完全没升级"的快路径，**每个步骤都按 PRAGMA
+        自查**：列在就跳过该步。这样即使版本号错乱也能自愈，代价是每次
+        启动多几次 PRAGMA 查询（微秒级，可忽略）。
+
+        `old_version` 参数保留仅用于日志/兼容既有调用签名。
+        """
+        # **各表的列集合在这里一次性取好**（踩坑，刚刚犯过）：
+        # 每个迁移步骤各自 inline `PRAGMA table_info` 容易写漏 ——
+        # v12 那段一开始直接用了 `rss_cols`，但那个变量是在**下面的**
+        # v10 段落里才定义的，于是启动时 `_migrate` 直接 NameError
+        # （整个程序起不来）。统一在开头取好，后面所有步骤复用。
+        rss_cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(rss_sources)")
+        }
+        dl_cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(download_history)")
+        }
+
         # v3：subjects 新增 series_name（聚合展示用）
         cols = {
             r["name"] for r in self._conn.execute("PRAGMA table_info(subjects)")
@@ -428,6 +526,73 @@ class Database:
         if "ep_align" not in cols:
             log.info("迁移：subjects 增加 ep_align 列")
             self._conn.execute("ALTER TABLE subjects ADD COLUMN ep_align TEXT")
+        # v12：rss_sources 新增标题过滤与"下载到指定条目目录"。
+        #
+        # 见建表处各列的说明。三个列都**允许为空/空串**：
+        #   must_include / must_exclude 空串 = 不过滤（旧行为）
+        #   save_subject_id 为 NULL = 用 qBittorrent 的全局保存路径
+        #
+        # 每步自查列（不依赖版本号，同 v10/v11 的说明）。
+        if "must_include" not in rss_cols:
+            log.info("迁移：rss_sources 增加 must_include 列")
+            self._conn.execute(
+                "ALTER TABLE rss_sources ADD COLUMN must_include TEXT DEFAULT ''")
+        if "must_exclude" not in rss_cols:
+            log.info("迁移：rss_sources 增加 must_exclude 列")
+            self._conn.execute(
+                "ALTER TABLE rss_sources ADD COLUMN must_exclude TEXT DEFAULT ''")
+        if "save_subject_id" not in rss_cols:
+            log.info("迁移：rss_sources 增加 save_subject_id 列")
+            self._conn.execute(
+                "ALTER TABLE rss_sources ADD COLUMN save_subject_id INTEGER")
+        # v13：downloader_saved（下载器"启用"闸门）。
+        #
+        # **老订阅怎么处理**（重要）：默认值给 0 = "没配过 → 不下发"，
+        # 但那样会让**已经在正常下载的用户升级后突然停掉**。
+        # 所以回填成 1（视为已启用）—— 他们本来就跑得好好的，
+        # 不该因为新增的一个开关被中断；**新订阅**才走"必须先保存"的流程。
+        if "downloader_saved" not in rss_cols:
+            log.info("迁移：rss_sources 增加 downloader_saved 列（老订阅视为已启用）")
+            self._conn.execute(
+                "ALTER TABLE rss_sources ADD COLUMN downloader_saved INTEGER DEFAULT 0")
+            self._conn.execute("UPDATE rss_sources SET downloader_saved=1")
+        # v11：download_history 新增 last_error（失败原因落库）。
+        #
+        # 见建表处的说明：原因原先只存在内存的 PollSummary.errors 里，
+        # 界面只能显示「失败 N」计数，用户无从知道为什么失败。
+        if "last_error" not in dl_cols:
+            log.info("迁移：download_history 增加 last_error 列")
+            self._conn.execute(
+                "ALTER TABLE download_history ADD COLUMN last_error TEXT")
+        # v10：rss_sources 新增 local_subject_id（订阅绑定本地条目）。
+        #
+        # **为什么要加这一列**（踩坑，实测反馈）：早期订阅只存
+        # `bangumi_id`，而未匹配 Bangumi 的条目根本没有这个值 ——
+        # 于是"全部下载 + 从订阅源新建条目"（建出来的多是本地条目）
+        # 这条链路上，新建成功了却**绑不上**（`linkSubject` 里有一道
+        # `if not subj.bangumi_id: 拒绝`）。
+        #
+        # 可见性说明：`ALTER TABLE ADD COLUMN` 只能加在表尾，所以列顺序
+        # 与 `SCHEMA_SQL` 里新建表的顺序**不完全一致**（新建库是
+        # local_subject_id 在前、老库迁移后它在最后）。这不影响任何逻辑：
+        # 读取一律用列名，不依赖位置。
+        if "local_subject_id" not in rss_cols:
+            log.info("迁移：rss_sources 增加 local_subject_id 列")
+            self._conn.execute(
+                "ALTER TABLE rss_sources ADD COLUMN local_subject_id INTEGER")
+            # 老数据回填：原来绑了 bangumi_id 的订阅，按 bangumi_id 反查
+            # 出本地 subject.id 补上 —— 否则升级后这些订阅会突然"没有绑定"
+            # （界面上的「→ XX动漫」标签会消失）。
+            self._conn.execute(
+                """
+                UPDATE rss_sources SET local_subject_id = (
+                    SELECT s.id FROM subjects s
+                    WHERE s.bangumi_id = rss_sources.bangumi_id
+                    LIMIT 1
+                )
+                WHERE bangumi_id IS NOT NULL
+                """
+            )
         # v9：subjects 新增 collect_type（Bangumi 收藏状态快照）。
         #
         # 用途：详情页海报下方的「想看 / 看过 / 在看 / 搁置 / 抛弃」选择器
@@ -1593,17 +1758,20 @@ class Database:
         self,
         name: str,
         url: str,
+        local_subject_id: Optional[int] = None,
         bangumi_id: Optional[int] = None,
         rule: str = "new_only",
     ) -> int:
         with self._cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO rss_sources(name, url, bangumi_id, enabled, rule, created_at)
-                VALUES (?,?,?,1,?,?)
+                INSERT INTO rss_sources
+                    (name, url, local_subject_id, bangumi_id, enabled, rule,
+                     created_at)
+                VALUES (?,?,?,?,1,?,?)
                 ON CONFLICT(url) DO UPDATE SET name=excluded.name
                 """,
-                (name, url, bangumi_id, rule, _now()),
+                (name, url, local_subject_id, bangumi_id, rule, _now()),
             )
             cur.execute("SELECT id FROM rss_sources WHERE url=?", (url,))
             return int(cur.fetchone()["id"])
@@ -1619,13 +1787,21 @@ class Database:
             for r in cur.fetchall():
                 d = dict(r)
                 d["enabled"] = bool(d["enabled"])
+                # SQLite 里是 0/1 整数，转成 bool（与 enabled 同样处理，
+                # 否则 QML 侧拿到 0/1 判断真假虽然也能用，但类型不一致）
+                if "downloader_saved" in d:
+                    d["downloader_saved"] = bool(d["downloader_saved"])
                 out.append(RssSource(**d))
             return out
 
     def update_rss_source(self, source_id: int, **fields: Any) -> None:
         allowed = {
-            "name", "url", "bangumi_id", "enabled",
+            "name", "url", "local_subject_id", "bangumi_id", "enabled",
             "rule", "last_poll_at", "last_error",
+            # v12
+            "must_include", "must_exclude", "save_subject_id",
+            # v13
+            "downloader_saved",
         }
         cols = {k: v for k, v in fields.items() if k in allowed}
         if not cols:
@@ -1642,12 +1818,32 @@ class Database:
             cur.execute("DELETE FROM rss_sources WHERE id=?", (source_id,))
 
     # ---------- F19：下载记录 ----------
+    # 视为"已下载过、不必重试"的状态。
+    #
+    # **为什么要把 failed 排除在外**（踩坑，实测）：查询原先只看"有没有这一行"，
+    # 于是**失败过的集永远不再重试**。实测遇到：comicat 订阅因为解析 bug
+    # 全部下发失败（10 条 failed），修好解析之后重新检查 —— 判新仍然报
+    # "下载历史中已存在"，那些集再也不会被处理，用户只能手动删库。
+    # 失败是**过程状态**、不是终态：修好配置/代码后应当能自动重试。
+    #
+    # 反过来 `skipped` 要算"已处理"（那是"本地已有该集、故意不下"的正常结果），
+    # `pending` 也算（已入库等用户确认，重复判定只会刷屏）。
+    _DOWNLOADED_STATES = ("pending", "pushed", "downloading", "done", "skipped")
+
     def is_episode_downloaded(self, source_id: int, ep_index: float) -> bool:
-        """第三层查重：该订阅的该集是否已有下载记录。"""
+        """第三层查重：该订阅的该集是否**已有有效的下载记录**。
+
+        失败（`failed`）的记录不算 —— 见 `_DOWNLOADED_STATES` 的说明，
+        否则修好问题后那几集永远不会重试。失败记录会在下一轮重新判定时
+        被 `add_download_record` 的 upsert 覆盖（状态回到 pending）。
+        """
+        marks = ",".join("?" for _ in self._DOWNLOADED_STATES)
         with self._cursor() as cur:
             cur.execute(
-                "SELECT 1 FROM download_history WHERE source_id=? AND ep_index=? LIMIT 1",
-                (source_id, float(ep_index)),
+                f"SELECT 1 FROM download_history"
+                f" WHERE source_id=? AND ep_index=? AND status IN ({marks})"
+                f" LIMIT 1",
+                (source_id, float(ep_index), *self._DOWNLOADED_STATES),
             )
             return cur.fetchone() is not None
 
@@ -1660,18 +1856,22 @@ class Database:
         subject_id: Optional[int] = None,
         status: str = "pending",
     ) -> int:
+        # **重写记录时清空 last_error**：同一个 (source, ep) 再次入库说明
+        # 是重新判定的新一轮，上次的失败原因不该继续挂着（否则修好之后
+        # 界面还显示旧的错）。见建表处关于 last_error 的说明。
         now = _now()
         with self._cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO download_history
                     (source_id, subject_id, ep_index, torrent_title,
-                     magnet, status, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?)
+                     magnet, status, last_error, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,'',?,?)
                 ON CONFLICT(source_id, ep_index) DO UPDATE SET
                     torrent_title=excluded.torrent_title,
                     magnet=excluded.magnet,
                     status=excluded.status,
+                    last_error='',
                     updated_at=excluded.updated_at
                 """,
                 (source_id, subject_id, float(ep_index), torrent_title,
@@ -1688,18 +1888,28 @@ class Database:
         record_id: int,
         status: str,
         torrent_hash: str = "",
+        last_error: Optional[str] = None,
     ) -> None:
+        """更新记录状态；`last_error` 非 None 时一并写入失败原因。
+
+        `last_error=None`（默认）表示"不动这一列" —— 成功路径不该去清它
+        （写入成功时本来就该保持空串，而失败重试成功时由 status 覆盖语义），
+        只有失败路径才显式传原因。
+        """
         with self._cursor() as cur:
+            sets = ["status=?", "updated_at=?"]
+            args: list = [status, _now()]
             if torrent_hash:
-                cur.execute(
-                    "UPDATE download_history SET status=?, torrent_hash=?, updated_at=? WHERE id=?",
-                    (status, torrent_hash, _now(), record_id),
-                )
-            else:
-                cur.execute(
-                    "UPDATE download_history SET status=?, updated_at=? WHERE id=?",
-                    (status, _now(), record_id),
-                )
+                sets.append("torrent_hash=?")
+                args.append(torrent_hash)
+            if last_error is not None:
+                sets.append("last_error=?")
+                args.append(str(last_error))
+            args.append(record_id)
+            cur.execute(
+                f"UPDATE download_history SET {','.join(sets)} WHERE id=?",
+                args,
+            )
 
     def list_downloads(self, source_id: Optional[int] = None) -> list[DownloadRecord]:
         with self._cursor() as cur:

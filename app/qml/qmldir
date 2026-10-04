@@ -34,3 +34,5 @@ FloatingActionButton 1.0 FloatingActionButton.qml
 AddAnimeDialog 1.0 AddAnimeDialog.qml
 ConfirmDialog 1.0 ConfirmDialog.qml
 CollectTypeSelector 1.0 CollectTypeSelector.qml
+SubscriptionForm 1.0 SubscriptionForm.qml
+RssDownloaderDialog 1.0 RssDownloaderDialog.qml

@@ -55,6 +55,20 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "category": "Bangumi",
         "save_path": "",
         "webui_url": "",
+        # qBittorrent 主程序路径。
+        #
+        # **为什么需要它**（实测诉求："在其退出但需要时打开"）：
+        # qBittorrent 的 GUI 与 Web UI 是**同一个进程** —— 用户从托盘
+        # 「退出」后 Web UI 一起消失，本程序就再也连不上，新集只能落成
+        # 「待确认」。有了路径，就能在下发前**按需把它拉起来**
+        # （见 QbClient.ensure_running）。
+        #
+        # 留空 = 不自动启动（保持旧行为，只在下发失败时给出提示）。
+        "exe_path": "",
+        # 连不上时是否自动启动 qBittorrent。
+        # 默认关：启动外部程序属于"有副作用"的操作，让用户显式打开
+        # （与 launcher 的「播放前自动启动小黄鸭」同一个取舍）。
+        "auto_start": "false",
     },
     "rss": {
         "poll_interval": "30",

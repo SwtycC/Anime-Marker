@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -48,6 +50,8 @@ class QbClient:
         category: str = "Bangumi",
         save_path: str = "",
         webui_url: str = "",
+        exe_path: str = "",
+        auto_start: bool = False,
         timeout: float = 3.0,
     ) -> None:
         self.host = host
@@ -57,10 +61,16 @@ class QbClient:
         self.category = category
         self.save_path = save_path
         self._webui_url = webui_url
+        #: qBittorrent 主程序路径（留空 = 不支持自动启动）。
+        self.exe_path = (exe_path or "").strip()
+        #: 连不上时是否自动拉起 qBittorrent（用户显式开启才做）。
+        self.auto_start = bool(auto_start)
         self.timeout = timeout
         self._client = None
         # 记录最近一次失败原因，避免日志被 urllib3 重试刷屏
         self.last_error = ""
+        #: 是否已经尝试过自动启动（**每次失败只拉起一次**，见 ensure_running）
+        self._start_attempted = False
 
     # ---------- 连接 ----------
     @property
@@ -109,6 +119,73 @@ class QbClient:
         except Exception as e:
             self._client = None
             raise QbError(f"读取 qBittorrent 版本失败：{e}") from e
+
+    # ---------- 按需启动 ----------
+    def ensure_running(self, wait: float = 12.0) -> str:
+        """**连不上就按需启动 qBittorrent**，返回一句结果说明。
+
+        背景（实测诉求）：qBittorrent 的 GUI 与 Web UI 是**同一个进程**，
+        用户从托盘「退出」后 Web UI 一起消失 —— 本程序随即连不上，新集
+        只能落成「待确认」。这个方法让"需要时把它们拉起来"变成自动的。
+
+        行为：
+          ① 已经能连上 → 直接返回（不做任何多余动作）；
+          ② 连不上且**没配 exe_path / 没开 auto_start** → 返回空串，
+             调用方保持原有报错路径（不改变既有行为）；
+          ③ 连不上但配了 → `Popen` 启动，然后**轮询等待端口可用**
+             （最多 `wait` 秒），成功返回说明、失败也返回说明。
+
+        **为什么返回字符串而不是抛异常**：调用方（下发流程）本来就有
+        "连不上 → 落库为失败并给出原因"的路径；这里自动启动成功/失败
+        都只是给那条路径补一句更准确的话，不该改变控制流。
+
+        **为什么只启动一次**（`_start_attempted`）：一次轮询里可能有多条
+        新集要下发，每条都试一次启动会反复 Popen（用户看到一堆进程）。
+        首次失败后就记住，后续条目直接走"连不上"的分支。
+
+        用 `Popen` 而不是 `os.startfile`/`shell=True`：路径来自配置，
+        直接以列表形式传参可以避免空格与特殊字符被 shell 解释
+        （`C:\\Program Files\\...` 里的空格正是常见坑）。
+        """
+        # ① 已经能连上
+        try:
+            return f"qBittorrent 已在运行（{self.test_connection()}）"
+        except QbError:
+            pass
+
+        # ② 没配路径 / 没开启
+        if not self.auto_start or not self.exe_path:
+            return ""
+        if self._start_attempted:
+            return "qBittorrent 仍未就绪（本次已尝试启动过，不再重复启动）"
+
+        if not Path(self.exe_path).exists():
+            self._start_attempted = True
+            return f"qBittorrent 路径不存在：{self.exe_path}"
+
+        self._start_attempted = True
+        try:
+            subprocess.Popen([self.exe_path])
+            log.info("已按需启动 qBittorrent：%s", self.exe_path)
+        except Exception as e:
+            log.warning("启动 qBittorrent 失败：%s", e)
+            return f"启动 qBittorrent 失败：{e}"
+
+        # ③ 等它就绪（Web UI 服务起来要一点时间，冷启动尤其明显）
+        deadline = time.time() + max(0.0, wait)
+        while time.time() < deadline:
+            time.sleep(0.5)
+            try:
+                version = self.test_connection()
+            except QbError:
+                continue
+            log.info("qBittorrent 已就绪（版本 %s）", version)
+            return f"已启动 qBittorrent（版本 {version}）"
+        return f"已启动 qBittorrent，但 {wait:.0f} 秒内 Web UI 仍未就绪"
+
+    def reset_start_flag(self) -> None:
+        """允许下一次再尝试自动启动（用户改完设置后由设置页调用）。"""
+        self._start_attempted = False
 
     # ---------- 下发 ----------
     def add(
