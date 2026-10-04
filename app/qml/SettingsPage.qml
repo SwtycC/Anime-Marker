@@ -245,6 +245,7 @@ Item {
         v["bangumi.proxy"] = proxyField.text.trim()
         v["bangumi.ep_timeline_count"] = epTimelineField.value
         v["bangumi.auto_upload"] = autoUploadBox.checked
+        v["bangumi.auto_complete_watched"] = autoCompleteBox.checked
         // 路径
         v["general.library_path"] = libraryField.text.trim()
         v["general.player_path"] = playerField.text.trim()
@@ -740,6 +741,25 @@ Item {
                         objectName: "autoUploadBox"
                         checked: root.getBool("bangumi.auto_upload", true)
                         text: "启用（关闭后可在「动态 → 上传」里手动补传）"
+                    }
+                }
+
+                // 「自动完结」（v15，实测需求）：在看页追的番，每集都看过后
+                // 自动把条目本身也标成「看过」，有 Token 时同步到 Bangumi。
+                // 触发点在"某一集被标看过"之后（播放看完 / 详情页手动勾都算），
+                // 判定是"看到第 N 集 ≥ 官方正片数"，不是"本地文件全看过"
+                // （本地常常缺集，按文件判会把追到一半的误判成看完）。
+                FormRow {
+                    width: parent.width
+                    label: "自动完结"
+                    hint: "当一部动漫的每一集都标为看过后，自动把该动漫也标记为「看过」；填了 Token 会同步到 Bangumi。\n\n"
+                          + "判定口径与在看页一致（看到第 N 集 ≥ 官方正片数），本地缺集不影响。\n\n"
+                          + "已经是「看过」的条目不会重复处理。"
+                    CheckBoxLine {
+                        id: autoCompleteBox
+                        objectName: "autoCompleteBox"
+                        checked: root.getBool("bangumi.auto_complete_watched", true)
+                        text: "每集都看过后，自动把该动漫标记为「看过」"
                     }
                 }
             }

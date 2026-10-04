@@ -25,7 +25,8 @@ from PySide6.QtCore import QThread, Signal
 from app.core.bangumi_api import BangumiClient, BangumiError
 from app.core.database import Database
 from app.core.matcher import (
-    SubjectMatcher, extract_season, is_extra_dir, is_movie_like, is_noise_dir,
+    SubjectMatcher, extract_part, extract_season, is_extra_dir, is_movie_like,
+    is_noise_dir,
 )
 from app.utils import bgm_log
 from app.utils.cover_cache import download as download_cover
@@ -34,21 +35,49 @@ log = logging.getLogger(__name__)
 
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".rmvb", ".ts", ".flv", ".mov", ".wmv"}
 
-NOISE_PATTERNS = [
-    r"(?i)\b(BDRip|WEB[- ]?DL|WEBRip|BluRay|HDTV|x264|x265|HEVC|AVC|10bit|8bit|1080p|720p|2160p|4K|60FPS|120FPS)\b",
-    r"(?i)\b(简体|繁体|简繁|内嵌|外挂|中字|日配|国配|合集|完全版|无修|招募|发布组)\b",
-    r"(?i)\b(TVRip|DVDRip|CR-WebRip|Baha|LoliHouse|Sakurato|CheeseAni|SubsPlease|Nekomoe|KTXP|KissSub)\b",
-    r"(?i)\b(Fin|Complete|Batch|v\d)\b",
-    r"_+",
-]
+# （这里原本有一份 NOISE_PATTERNS 列表，但**从来没有被引用过** —— 真正做
+#  噪声判定的是下面的 `_NOISE_OUTER_RE` 与 `_is_noise_word`。它列着「简繁」
+#  「内嵌」「中字」这些词，看起来像已经处理了，实际没生效：实测
+#  `[CheeseAni]…Coleus no Yume[1-3][…][简繁内封]` 的方括号被当成"作品名"
+#  保留下来，整条的关键词退化成「简繁内封」。已删除，词补进了下面。）
 
 # 括号块（[] 【】 () （）），由 _strip_bracket_blocks 判断内部是否为噪声
 _BRACKET_BLOCK_RE = re.compile(r"[\[【(（]([^\[\]【】()（）]*)[\]】)）]")
 
-# 常见发布组/字幕组/画质用词（用于判断括号内容是否为噪声）
+# 中日文汉字（用于判断目录名是否携带作品名信息）
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+# 无意义的占位目录名（Windows「新建文件夹」、下载工具随手建的「New Folder」）。
+#
+# **为什么单独识别**（实测）：「青春猪头少年不会梦到兔女郎学姐」下的正片
+# 被放进了一个「新建文件夹」，于是这一层成了一个**独立条目** ——
+#   ① 关键词退化成「青春猪头少年 新建文件夹」，搜什么都搜不到；
+#   ② 父层（发布组目录）只剩 SP/菜单等附属视频，又成了另一条独立条目，
+#      两条撞到同一个 Bangumi 条目上互相覆盖（后写的那条会把前一条的
+#      集数 prune 掉）。
+# 这类目录只是"一层壳"，不含作品信息，应当**透明穿透**：视频并入父层，
+# 名字也绝不参与关键词（见 _walk 与 _build_keywords）。
+_JUNK_DIR_RE = re.compile(
+    r"(?i)^\s*(新建文件夹|新建目录|未命名文件夹|未命名|new\s*folder|untitled(\s*folder)?)\s*$"
+)
+
+
+def is_junk_dir(name: str) -> bool:
+    """目录名是否为无信息的占位名（「新建文件夹」等）。"""
+    return bool(_JUNK_DIR_RE.match(name or ""))
+
+# 常见发布组/字幕组/画质/**字幕语言**用词（用于判断括号内容是否为噪声）
+#
+# 字幕语言那一组（简体/繁体/简繁/内嵌/外挂/中字/日配/国配/简日/繁日…）是
+# 实测补上的：它们**不是作品名**，但长度 ≥2、又含中文，会被
+# `_strip_bracket_blocks` 当成"括号本身就是作品名"而保留 ——
+# 实测 `[…][简繁内封]` 让整条的关键词退化成「简繁内封」，
+# 于是一个番外目录（柯里乌斯之梦）被匹配到了本篇第一季上。
 _NOISE_OUTER_RE = re.compile(
     r"(?i)(字幕组|发布组|压制|招募|rip|raw|fps|bit|hevc|avc|aac|flac|mkv|mp4|"
-    r"1080|720|2160|4k|web|bd|tv|chs|cht|gb|big5|jp|sc|tc)",
+    r"1080|720|2160|4k|web|bd|tv|chs|cht|gb|big5|jp|sc|tc|"
+    r"简体|繁体|简繁|繁體|内嵌|外挂|外掛|中字|日配|国配|双语|雙語|"
+    r"合集|完全版|无修|無修|简日|繁日)",
 )
 
 # 符号分隔符：统一替换为空格，提高搜索命中率
@@ -56,9 +85,22 @@ _NOISE_OUTER_RE = re.compile(
 # 注意不含「-」单独出现的情况（由 _EP_RANGE_RE / 收尾步骤处理）
 _SYMBOL_SEP_RE = re.compile(r"[/／\\：:；;、，,．・·〜～~｜|—–=＋+＆&！!？?。\u3000\s]+")
 
-# 纯季数标记（用于判断关键词是否"只有季数、没有作品名"）
+# 通用词（"季数/形态"的说法，单独出现时不含任何作品名信息）。
+# 见 ScanWorker._is_season_only 的说明 —— 拿它们当关键词搜会命中一批
+# 无关条目并拿到高分（「Season」→ Futurama Season 6；「剧场版」→ 空之境界 各章）。
+_GENERIC_ONLY_RE = re.compile(
+    r"(?i)^(season|part|movie|the\s*movie|剧场版|劇場版|电影|電影|"
+    r"ova|oad|sp|特别篇|特別篇|总集篇|總集篇|合集|全集|complete)$"
+)
+
+# 纯季数/篇章标记（用于判断关键词是否"只有标记、没有作品名"）
+#
+# 「第X部分」**必须排在「第X部」前面**，否则「第二部」先被吃掉、只剩一个「分」，
+# 判不出"这是纯标记"。实测：「第一部分」漏网后成了独立关键词，
+# 搜出「动物狂想曲 最终季 第一部分」并凭 150 分赢过正确条目。
 _SEASON_ONLY_RE = re.compile(
-    r"第[一二三四五六七八九十\d]+[季部]"
+    r"第[一二三四五六七八九十\d]+部分"
+    r"|第[一二三四五六七八九十\d]+(?:季|部(?!分))"
     r"|Season\s*\d+"
     r"|(?<![A-Za-z])S\d{1,2}(?![A-Za-z])"
     r"|\d+(?:st|nd|rd|th)\s*Season"
@@ -71,8 +113,16 @@ _SEASON_ONLY_RE = re.compile(
 # 不用 \b（点号会让边界失效），改用非数字断言
 _EP_RANGE_RE = re.compile(r"(?<!\d)\d{1,3}(?:\.\d+)?\s*[-~～]\s*\d{1,3}(?:\.\d+)?(?!\d)")
 
-# 单独的集数数字（如目录名末尾的 01-23 被去掉后残留的孤立数字）
-_STANDALONE_NUM_RE = re.compile(r"(?<![\w.])\d{1,4}(?:\.\d{1,2})?(?![\w.])")
+# 孤立的**四位数**（年份、1080 这类画质参数残留），出现在目录名里属于噪声。
+#
+# **只删四位数，短的（0 / 00 / 86 / 2）一律留下**（实测踩坑）：早先删的是
+# 1~4 位，结果作品名本身带数字的目录全被削掉尾巴 ——
+#   「咒术回战 0」→「咒术回战」（于是匹配到了**第一季**）
+#   「机动战士高达 00」→「机动战士高达」
+#   「86 -不存在的战区-」→「不存在的战区」
+# 而真正需要清理的噪声（2021 年、1080p）**恰好都是四位**，收窄到四位即可。
+# 短数字在做关键词时并无害处：搜「咒术回战 0」照样能搜到正确条目。
+_STANDALONE_NUM_RE = re.compile(r"(?<![\w.])\d{4}(?:\.\d{1,2})?(?![\w.])")
 
 # 拉丁文长片段阈值：超过则截断（目录名常带罗马字副标题/制作组信息）
 _LATIN_RUN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'\.\-]*(?:\s+[A-Za-z][A-Za-z0-9'\.\-]*)*")
@@ -101,6 +151,17 @@ def _trim_latin_runs(text: str) -> str:
     """
     has_cjk = len(re.findall(r"[\u4e00-\u9fff]", text)) >= 2
     if has_cjk:
+        # **\u552f\u4e00\u7684\u90a3\u4e2a\u62c9\u4e01\u8bcd\u8981\u7559\u4e0b**\uff08\u5b9e\u6d4b\u8e29\u5751\uff0c\u673a\u52a8\u6218\u58eb\u9ad8\u8fbe GQuuuuuuX\uff09\uff1a
+        # \u76ee\u5f55\u540d\u300c\u673a\u52a8\u6218\u58eb\u9ad8\u8fbe GQuuuuuuX\u300d\u91cc\u7684 GQuuuuuuX **\u4e0d\u662f**\u7f57\u9a6c\u97f3\u526f\u6807\u9898\uff0c
+        # \u800c\u662f\u5b98\u65b9\u540d\u7684\u4e00\u90e8\u5206\uff08Bangumi \u6b63\u5f0f\u540d\u5c31\u53eb\u300c\u6a5f\u52d5\u6226\u58ebGundam GQuuuuuuX\u300d\uff09\u3002
+        # \u65e9\u5148\u4e00\u5f8b\u4e22\u5f03\uff0c\u5173\u952e\u8bcd\u53ea\u5269\u300c\u673a\u52a8\u6218\u58eb\u9ad8\u8fbe\u300d\u2014\u2014 \u4e8e\u662f\u5339\u914d\u5230 1979 \u5e74\u7684
+        # \u521d\u4ee3\u300c\u673a\u52a8\u6218\u58eb\u9ad8\u8fbe\u300d\uff0c\u6574\u90e8 GQuuuuuuX \u6d88\u5931\u5728\u521d\u4ee3\u91cc\u3002
+        #
+        # \u5224\u636e\uff1a**\u6574\u4e32\u62c9\u4e01\u5185\u5bb9\u53ea\u6709\u4e00\u4e2a\u8bcd**\u3002\u7f57\u9a6c\u97f3\u526f\u6807\u9898\u4e00\u5b9a\u662f\u591a\u8bcd\u7684
+        # \uff08Mushoku Tensei Ittara Honki Dasu / Shiro Seijo to Kuro\uff09\uff0c
+        # \u800c\u5355\u4e2a\u8bcd\u51e0\u4e4e\u603b\u662f\u4f5c\u54c1\u540d\u7684\u4e00\u90e8\u5206\uff08GQuuuuuuX\u3001Eitishikkusu\u3001SAO\uff09\u3002
+        latin_words = _LATIN_WORD_RE.findall(text)
+        lone_latin = latin_words[0] if len(latin_words) == 1 else ""
         # 中文优先：丢弃罗马音副标题（如 Mushoku Tensei Isekai），
         # 但保留**开头的短拉丁词**——它们常是作品名的正式组成部分：
         #   「Re：从零开始的异世界生活」的 Re、「86 -不存在的战区-」的 86
@@ -125,6 +186,8 @@ def _trim_latin_runs(text: str) -> str:
         def _keep_short(m: re.Match) -> str:
             word = m.group(0)
             if (head_word and word == head_word) or word in glued_words:
+                return word
+            if lone_latin and word == lone_latin:
                 return word
             return " "
 
@@ -151,7 +214,9 @@ def _trim_latin_runs(text: str) -> str:
         kept = re.sub(r"\s+", " ", kept).strip()
         # 收尾：清掉因删词产生的孤立标点、连接符与孤立数字
         kept = re.sub(r"[\-~～—–!！?？.。]{1,3}", " ", kept)
-        kept = re.sub(r"(?<![\w.])\d{1,4}(?![\w.])", " ", kept)
+        # 同样**只删四位数**（理由见 _STANDALONE_NUM_RE）：短数字常常是作品
+        # 名的一部分（「咒术回战 0」「机动战士高达 00」），删了就再也对不上。
+        kept = re.sub(r"(?<![\w.])\d{4}(?![\w.])", " ", kept)
         kept = re.sub(r"\s+", " ", kept).strip(" -_·・,，、:：")
         if extras:
             kept = f"{kept} {' '.join(extras)}".strip()
@@ -183,7 +248,15 @@ def _stem_of(name: str) -> str:
             return Path(name).stem
         # 否则视为作品名：仅去掉结尾的扩展名
         return re.sub(r"\.[A-Za-z0-9]{1,5}$", "", name)
-    return Path(name).stem
+    if re.search(r"[\\]", name):
+        return Path(name).stem          # 真正的 Windows 路径
+    # **纯名字（目录名占绝大多数）：只去掉"形如扩展名"的尾巴，绝不能整段
+    # `Path().stem`** —— 它按**最后一个点**切，目录名里的点会被当成扩展名：
+    # 实测（关于我转生变成史莱姆这档事\第三季）发布组目录
+    #   「[LoliHouse] Tensei Shitara Slime Datta Ken 3rd Season [48.5-72][…]」
+    # 被切成「… 3rd Season [48」，剩下的「[48」带着半个方括号进了关键词，
+    # 于是那条**整集都匹配不上**（靠一个 70 分的兜底凑合，标题全是文件名）。
+    return re.sub(r"\.[A-Za-z0-9]{1,5}$", "", name)
 
 
 def clean_title(name: str) -> str:
@@ -276,6 +349,20 @@ _EP_TAIL_RE = re.compile(
 _EP_BRACKET_RE = re.compile(
     r"[\[【(（]\s*0*(\d+(?:\.\d+)?)(?:v\d+)?\s*" + _EP_END_MARK + r"\s*[\]】)）]",
     re.IGNORECASE)
+# 括号里的**双集号**：`[01_73]`、`[01-73]`、`[01／73]`。
+#
+# 字幕组用它同时标"本季第 1 集 / 全系列第 73 集"（实测：BeanSub 的
+# 史莱姆第四季就是 `[01_73]`…`[21_93]`）。**两个号都要当候选** ——
+# 到底哪个是官方集号取决于该条目在 Bangumi 上是不是连续编号，
+# 由 `_pick_ep_index` 拿官方集数表去挑。
+#
+# 上面那条 `_EP_BRACKET_RE` 接不住它（要求括号内只有数字，下划线会打断），
+# 结果整个第四季 21 集**一个集号都解析不出来**，全落进兜底桶显示成
+# 0.5 / 1 / 1.5… 标题也是文件名（实测反馈）。
+_EP_BRACKET_PAIR_RE = re.compile(
+    r"[\[【(（]\s*0*(\d+(?:\.\d+)?)\s*[_／/\-]\s*0*(\d+(?:\.\d+)?)"
+    r"\s*(?:v\d+)?\s*[\]】)）]",
+    re.IGNORECASE)
 # 独立数字（前后都不是字母数字）：如「[01]」夹在括号中、「66END 1080p」
 _EP_MID_RE = re.compile(
     r"(?<![\w.])0*(\d+(?:\.\d+)?)(?:v\d+)?" + _EP_END_MARK + r"(?![\w.])",
@@ -331,6 +418,11 @@ _EXTRA_RE = re.compile(
     r"WEB予告|予告|预告|PV|CM|Trailer|Preview|Teaser|"
     r"特典|映像特典|番外篇|番外|花絮|访谈|菜单|Making|Interview"
     r")"
+    # **右边必须不能再跟字母**（实测踩坑，间谍教室）：`[Spy Room][01]` 里的
+    # 「Sp」命中了 `SP`，于是 12 集正片全被当成"SP 特典"编号成 SP1…SP12，
+    # 真正的集数 01~12 一个都认不出来。要求紧跟的不是字母即可；
+    # `SP01`/`SP 01`/`SP_01`/`SP` 这些正常写法都不受影响。
+    r"(?![A-Za-z])"
     # 序号与关键词之间可能有分隔符：`SP01`、`SP 01`、`WEB予告 #02`、`特典-1`
     r"[\s#\-_]*"
     r"(?P<num>\d{1,3})?"                    # 可选序号（**保留前导零**）
@@ -448,6 +540,14 @@ def extract_ep_candidates(name: str) -> list[float]:
         val = float(m.group(1))
         if val <= _EP_BRACKET_MAX:
             cands.append(val)
+
+    # ⑤′ 括号里的双集号 `[01_73]`：两个号都收，由官方集数表挑（见该正则的说明）。
+    #     与上一条不重叠：[01] 里有不下划线、[01_73] 里有多余的号，互不匹配。
+    for m in _EP_BRACKET_PAIR_RE.finditer(stem):
+        for g in (1, 2):
+            val = float(m.group(g))
+            if val <= _EP_BRACKET_MAX:
+                cands.append(val)
 
     # ⑥ 其余独立数字 —— 兜底，可信度最低，靠官方集数表消歧
     for m in _EP_MID_RE.finditer(stem):
@@ -571,6 +671,16 @@ class ScanCandidate:
     folder_path: Path
     video_files: list[Path]
     keywords: list[str] = field(default_factory=list)   # 多候选，按优先级排列
+    # **兜底关键词**：只在上面这些「具体候选」一个都没匹配上时才用（见
+    # `_build_keywords` 与 `_process` 的两遍搜索）。
+    #
+    # 目前只有一样东西会进来：**裸系列名**（「咒术回战」「为美好的世界献上祝福」）。
+    # 它是"实在认不出这一层是什么"时的最后一根稻草，但对同系列每一部都
+    # 几乎同分 —— 实测（咒术回战 死灭回游）：具体候选「咒术回战 死灭回游」
+    # 正确地命中「咒术回战 死灭回游 前篇」(110)，可裸系列名「咒术回战」
+    # 让**第一季**拿到 130 的精确命中，反倒赢了 → 整部死灭回游被并进第一季。
+    # 所以它不能再和具体候选同场竞技，只能当"没别的办法了"的第二遍。
+    fallback_keywords: list[str] = field(default_factory=list)
     series_name: str = ""                               # 所属系列（用于聚合展示）
     bangumi_name: str = ""                              # 匹配到的 Bangumi 名称（日志用）
 
@@ -774,8 +884,16 @@ class ScanWorker(QThread):
         directory: Path,
         series_name: str,
         depth: int,
+        title_hint: str = "",
+        season_hint: Optional[int] = None,
     ) -> Iterable[ScanCandidate]:
-        """递归下探：只在「叶子目录」产出条目。"""
+        """递归下探：只在「叶子目录」产出条目。
+
+        `title_hint` —— 从上层传下来的「最近一个像作品名的目录名」，供叶子
+        目录名无信息时兜底（见 _build_keywords 的 hint 说明）。
+        `season_hint` —— 同理，从上层带下来的「第几季」（取自目录名里的
+        「第二季 / S2 / Part 2」），叶子目录名说不出季数时补上。
+        """
         if depth > MAX_DEPTH or is_noise_dir(directory.name):
             return
 
@@ -784,6 +902,7 @@ class ScanWorker(QThread):
         # 分类子目录
         sub_dirs: list[Path] = []
         extra_dirs: list[Path] = []      # SP/OVA 等附属内容
+        junk_dirs: list[Path] = []       # 「新建文件夹」这类无信息占位层
         try:
             for sub in sorted(directory.iterdir()):
                 if not sub.is_dir():
@@ -792,6 +911,12 @@ class ScanWorker(QThread):
                 if is_extra_dir(sub.name):
                     extra_dirs.append(sub)
                     continue
+                # 占位层（「新建文件夹」）：同样并入本层，且**不成为独立条目**。
+                # 判定必须在 sub_dirs 之前 —— 否则正片会被拆到另一条记录里，
+                # 与父层的 SP 条目撞到同一个 Bangumi 条目上互相覆盖。
+                if is_junk_dir(sub.name):
+                    junk_dirs.append(sub)
+                    continue
                 # 含视频（含深层）才算有效子目录
                 if _videos_in(sub, recursive=True):
                     sub_dirs.append(sub)
@@ -799,9 +924,9 @@ class ScanWorker(QThread):
             log.warning("读取目录失败 %s: %s", directory, e)
             return
 
-        # 附属内容目录里的视频也并入本层
+        # 附属内容 / 占位层目录里的视频也并入本层
         extra_videos: list[Path] = []
-        for ed in extra_dirs:
+        for ed in extra_dirs + junk_dirs:
             extra_videos.extend(_videos_in(ed, recursive=True))
 
         all_videos = direct_videos + extra_videos
@@ -817,35 +942,76 @@ class ScanWorker(QThread):
         else:
             next_series = series_name or directory.name
 
+        # 向下传递的「作品名提示」（**与 series_name 不同，别合并**）：
+        # series_name 取的是**最顶层**目录名（用于详情页「同系列」切换），
+        # 而这里要的是**离叶子最近**、且确实像作品名的那一层。
+        #
+        # 实测踩坑（青春猪头少年）：目录结构是
+        #   青春猪头少年/青春猪头少年不会梦到兔女郎学姐/[DMG&VCB] Seishun.../
+        # 叶子是发布组目录，清洗后只剩半截罗马音「Seishun Buta Yarou wa」
+        # （还因 MAX_LATIN_RUN 被截断）—— 三部剧场版的关键词**完全相同**，
+        # 且都是垃圾。真正的作品名（带中文的那一层）在中间，原先只当成
+        # 「父级」拼进去，导致：（a）拼出来的「父级 半截罗马音」谁都匹配不上；
+        # （b）只用父级时四部作品同分，前二名差距为 0 全部转人工。
+        if dir_clean and _CJK_RE.search(dir_clean) \
+                and not is_junk_dir(directory.name) \
+                and not is_season_like(directory.name, self.season_mode) \
+                and not is_noise_dir(directory.name):
+            next_title_hint = dir_clean
+        else:
+            next_title_hint = title_hint
+
+        # 向下传递的「季数提示」：目录名里写着的「第几季」一路带到叶子。
+        # 与 title_hint 正交 —— 目录名可以同时是作品名（title_hint）和
+        # 季数（如「第二季」本身没有作品名，但它贡献 season_hint）。
+        anc_season = extract_season(directory.name, self.season_mode)
+        next_season_hint = anc_season if anc_season is not None else season_hint
+
         # --- 情况 A：纯容器（无直接视频，只有子目录）→ 继续下探，不产出 ---
         if not all_videos and sub_dirs:
             for sub in sub_dirs:
-                yield from self._walk(sub, next_series, depth + 1)
+                yield from self._walk(sub, next_series, depth + 1,
+                                      next_title_hint, next_season_hint)
             return
 
         # --- 情况 B：叶子目录 → 产出条目 ---
         if all_videos:
-            kw_list = self._build_keywords(directory, series_name)
+            kw_list, fallback_kws = self._build_keywords(
+                directory, series_name, title_hint, season_hint)
             yield ScanCandidate(
                 folder_path=directory,
                 video_files=all_videos,
                 keywords=kw_list,
+                fallback_keywords=fallback_kws,
                 series_name=series_name,
             )
 
         # --- 情况 C：既有视频又有子目录 → 子目录各自继续 ---
         if sub_dirs:
             for sub in sub_dirs:
-                yield from self._walk(sub, next_series, depth + 1)
+                yield from self._walk(sub, next_series, depth + 1,
+                                      next_title_hint, next_season_hint)
 
     def _build_keywords(
         self,
         directory: Path,
         series_name: str,
-    ) -> list[str]:
-        """生成多候选搜索关键词，按优先级排列。"""
+        title_hint: str = "",
+        season_hint: Optional[int] = None,
+    ) -> tuple[list[str], list[str]]:
+        """生成多候选搜索关键词。
+
+        返回 `(具体候选, 兜底候选)` —— 两者是**分开搜索**的：
+        兜底候选（裸系列名）只在具体候选全军覆没时才会被用到，
+        见 `ScanCandidate.fallback_keywords` 与 `_process`。
+        """
         current = clean_title(directory.name)
+        if is_junk_dir(directory.name):
+            # 占位目录名（「新建文件夹」）不携带作品信息，绝不能进关键词。
+            # 正常不会走到这里（_walk 已把这类目录并入父层），留着兜底。
+            current = ""
         keywords: list[str] = []
+        fallbacks: list[str] = []
         parent = clean_title(series_name) if series_name else ""
 
         # 打包层（清洗后为空）：从原始目录名里提取可用信息
@@ -853,20 +1019,119 @@ class ScanWorker(QThread):
         if not current:
             current = self._extract_from_packed(directory.name)
 
+        # ---- 季数提示（season_hint）：叶子目录名说不出季数时，用目录链上的 ----
+        #
+        # 实测踩坑（为美好的世界献上祝福 第二季）：路径是
+        #   `为美好的世界献上祝福/第二季/[KissSub&FZSD&Xrip][Kono_..._o!_2][BDrip][01_11][...]`
+        # 叶子目录名**整串都是方括号参数**，清洗后为空；`_extract_from_packed`
+        # 也救不回来 —— 那个表示季数的 `_2` 只是一条下划线后缀，既不是
+        # 「S2」也不是「第二季」，所有季数正则都识别不到。于是关键词退化成
+        # 裸系列名「为美好的世界献上祝福」→ **精确命中第一季**，
+        # 第二季的剧集被整体并进第一季条目。
+        #
+        # 而"第二季"这三个字明明就写在上一层目录名上，一路带下来即可。
+        # 仅在叶子没能给出任何信息时套用（current 为空），不去动正常情形。
+        #
+        # **只在 2 季及以上才补**（实测，「为美好的世界献上祝福/第一季」）：
+        # Bangumi 上第一季的正名通常**不带任何季数标记**
+        # （就叫「为美好的世界献上祝福！」），而关键字一旦写了「第一季」，
+        # 就会被"关键词带季数、候选不带 → 名称分降级"那条规则扣到 60 分，
+        # 结果和「爆焰」（105）只差 5 分，前二名差距不足 → 反倒没法匹配。
+        # 而"第一季"本来就是**默认含义**，不写也认得出来，补它有害无益。
+        # ---- 发布组目录名里写着季数时，用「第X季」代替整串罗马音 ----
+        #
+        # 实测踩坑（关于我转生变成史莱姆这档事\第三季）：叶子是发布组目录
+        #   「[LoliHouse] Tensei Shitara Slime Datta Ken 3rd Season [48.5-72][…]」
+        # 清洗后是一整串罗马音，还会被 24 字上限截成半截；而**季数就明明白白
+        # 写在里面**（3rd Season）。拿这串罗马音去搜什么都搜不到 ——
+        # 实测那条只靠一个 70 分的兜底凑合匹配到了**第一季**，
+        # 26 集全部显示成文件名。
+        #
+        # 判据：叶子清洗后**不含中文**（含中文时它自己就是作品名，别动它）
+        # 且目录名里有明确的季数标记。
+        #
+        # **必须"追加"而不是"替换"**（实测踩坑，想要成为影之强者 S2）：
+        # 罗马音有时正是唯一能命中的东西 —— 那部的官方译名是「想要成为影之
+        # **实力者**！ 第二季」，与本地目录的「影之**强者**」对不上，
+        # 全靠「Kage no Jitsuryokusha」命中它的别名。替换掉罗马音之后
+        # 那条**直接变成未匹配**了。两种写法都给，让打分去选。
+        if current and parent and not _CJK_RE.search(current):
+            packed = self._packed_season(directory.name)
+            if packed and packed != current:
+                keywords.append(f"{parent} {packed}")
+
+        # ---- 季数目录下的「篇章」目录：把季数拼进关键词 ----
+        #
+        # 目录结构 `<作品>/<季>/<篇章名>/`（实测：地错 `第四季/灾厄篇`、`第四季/迷宫篇`）。
+        # Bangumi 的正名是「… 第四季 深章 灾厄篇」/「… 第四季 新章 迷宫篇」——
+        # **中间夹着「深章/新章」**，所以关键词「… 灾厄篇」跟它既不互相包含，
+        # 只能靠"公共前缀"拿到 55 分，而错误的第一季（名字被关键词包含）拿 60，
+        # 结果两集双双并进第一季。
+        #
+        # 关键差别就是**季数**：灾厄篇/迷宫篇都是第四季，第一季不是。
+        # 把目录链上的季数拼进关键词，季数这条硬条件就会把第一季筛掉；
+        # 而"同是第四季"的两条则靠 `_main_name_score` 的尾段检查区分
+        # （要求「灾厄篇」真的出现在候选名里）。
+        #
+        # 判据收紧到"名字以 篇/編/章 结尾、且自己没写季数"—— 这样
+        # 「Re:零 第三季 袭击篇」（自带季数）和「电锯人 剧场版 蕾塞篇」
+        # （上层不是季数目录）都不受影响。
+        if (season_hint is not None and season_hint >= 2 and parent and current
+                and extract_season(current, self.season_mode) is None
+                and re.search(r"[篇編章]$", current)):
+            current = f"第{season_hint}季 {current}"
+
+        part = extract_part(directory.name)
+        if part is not None:
+            # ---- 篇章目录（「第一部分」/「第二部分」）----
+            #
+            # 目录结构 `<作品>/<季>/<第N部分>/`：「第N部分」本身不是作品名，
+            # 但它和季数一样是**硬条件**（见 matcher.extract_part）。
+            # 关键词要把「季 + 篇章」都写进去，两者缺一不可：
+            #   * 只写「无职转生 第二部分」→ 第一季第2部分和第二季第2部分
+            #     **完全同分**（集数都是 12、名字都带「第2部分」）→ 差距 0 转人工；
+            #   * 只写「无职转生 第一季」→ 分不出前半后半。
+            # 「第一部分/第二部分」自己不能单独当关键词（`_is_season_only`
+            # 会把纯标记的候选剔掉），所以这里直接拼成完整的一段。
+            segs = [f"第{season_hint}季"] if season_hint else []
+            segs.append(f"第{part}部分")
+            current = " ".join(segs)
+        elif season_hint is not None and season_hint >= 2 and not current and parent:
+            current = f"第{season_hint}季"
+
+        # ---- 作品名提示（title_hint）：叶子目录名"说不出作品名"时用它 ----
+        #
+        # 触发条件（**故意很窄**，避免给整库引入新候选干扰前二名差距）：
+        #   ① 上层确实传来了一个像作品名的目录名；
+        #   ② 叶子目录名**不含中文**（发布组的罗马音，如
+        #      「[DMG&VCB-Studio] Seishun Buta Yarou wa ...」）或已清洗为空 ——
+        #      含中文时叶子名本身就是作品名，提示只会添乱；
+        #   ③ 它与 current / parent 都不同，否则只是重复。
+        #
+        # 实测（青春猪头少年）：一部 TV + 三部剧场版的叶子目录名都是
+        # 「Seishun Buta Yarou wa …」，且因 MAX_LATIN_RUN 都被截断成同一串
+        # 「Seishun Buta Yarou wa」。三部作品关键词完全一样、又都是垃圾，
+        # 只能靠拼上父级「青春猪头少年」去搜 —— 而父级对同系列的每一部
+        # 都是 60 分，前二名差距 0，**全部转人工**。用中间那层的
+        # 「青春猪头少年不会梦到兔女郎学姐」当关键词则是 100 分精确命中。
+        if (title_hint and not _CJK_RE.search(current)
+                and title_hint not in (current, parent)):
+            keywords.append(title_hint)
+
         if parent and current and current not in parent:
             # ① 父级 + 当前（季数/剧场版最常见）
             keywords.append(f"{parent} {current}")
             # ② 仅当前（外传/独立作品）
             keywords.append(current)
-            # ③ 仅父级（兜底）—— **仅当"当前"不是纯季数标记时才加**
+            # ③ 仅父级 —— **兜底候选，不进 keywords**（理由见
+            #    ScanCandidate.fallback_keywords 与 _process 的第二遍搜索）。
             #
             # 实测踩坑（Overlord 四季合并成一个条目）：目录结构是
             # `Overlord/S1`、`S2`、`S3`、`S4`，四季各自生成
-            # 「Overlord S1」…「Overlord S4」 + 兜底「Overlord」。
-            # 而 Bangumi 上第一季标题就叫「OVERLORD」（无季数标记）、
-            # 集数又同为 13 —— 兜底候选让它对四个季度都拿最高分，
-            # 四季全部匹配到第一季，再按 bangumi_id 合并成一个 subject
-            # （详情页集数重复 1,1,1,1,2,2…）。
+            # 「Overlord S1」…「Overlord S4」。而 Bangumi 上第一季标题就叫
+            # 「OVERLORD」（无季数标记）、集数又同为 13 —— 裸父级让它对
+            # 四个季度都拿最高分，四季全部匹配到第一季，再按 bangumi_id
+            # 合并成一个 subject（详情页集数重复 1,1,1,1,2,2…）。
             #
             # 判据：`current` 是纯季数标记时（S3 / 第二季 / III…），
             # 裸父级候选**没有任何区分四季的能力**，留着只会制造撞车。
@@ -874,8 +1139,10 @@ class ScanWorker(QThread):
             # 说明该季在 Bangumi 上确实没有独立条目，那也该转人工确认，
             # 而不是悄悄归到第一季。
             if not self._is_season_only(current):
-                keywords.append(parent)
+                fallbacks.append(parent)
         elif parent:
+            # 叶子什么都没说出来（打包层/季数提示也救不回来）→ 裸父级就是
+            # 我们唯一的关键词，只能放在具体候选里（放兜底等于没有候选）。
             keywords.append(parent)
             # 打包层提取出的信息若与父级不同，补一个「父级 + 提取值」
             if current and current not in parent:
@@ -898,13 +1165,45 @@ class ScanWorker(QThread):
                 continue
             seen.add(k)
             out.append(k)
-        return out or [clean_title(directory.name)]
+        if not out:
+            # 具体候选全被剔干净 → 退回兜底候选；再没有就退回清洗后的目录名
+            out = [k for k in (f.strip() for f in fallbacks) if k] \
+                or [clean_title(directory.name)]
+            return out, []
+        return out, fallbacks
 
     def _is_season_only(self, text: str) -> bool:
-        """判断关键词是否只由季数标记构成（不含作品名）。"""
+        """判断关键词是否**不含任何作品名信息**（只剩季数/通用词）。
+
+        两种情况都要丢掉：
+          ① 只剩季数标记（「第二季」「S1」）；
+          ② 只剩**通用词**（「Season」「剧场版」「Movie」）。
+             这类词是"季数/形态"的说法，不是作品名 —— 实测拿它去搜
+             「Season」会返回「Futurama Season 6」（英文名里含 season）
+             并凭 60+30+20=110 分**赢过正确条目**，把「轻音少女 Season 2」
+             匹配成了飞出个未来；「剧场版」则会给空之境界各章一堆 110。
+             **必须带数字才算数**（Season 3 / S1 / Part 2），
+             否则一律丢弃（注意「剧场版 蕾塞篇」这类含作品名的照常保留）。
+        """
         stripped = _SEASON_ONLY_RE.sub(" ", text)
         stripped = re.sub(r"[\s\-_·・:：,，]+", "", stripped)
-        return not stripped
+        if not stripped:
+            return True
+        return bool(_GENERIC_ONLY_RE.match(stripped))
+
+    @staticmethod
+    def _packed_season(raw_name: str) -> str:
+        """只取「明确的季数标记」，归一成「第X季」；取不到返回空串。
+
+        与 `_extract_from_packed` 的区别：后者还会兜底去方括号里挑一段
+        "像副标题"的拉丁文（那是"目录名什么都说不出来"时的最后一招），
+        这里只要季数 —— 用于**发布组目录名里的季数**，见 _build_keywords。
+        """
+        season = extract_season(raw_name, "all")
+        if season is None:
+            return ""
+        cn = "一二三四五六七八九十十一十二"
+        return f"第{cn[season - 1]}季" if 1 <= season <= 12 else f"第{season}季"
 
     @staticmethod
     def _extract_from_packed(raw_name: str) -> str:
@@ -917,12 +1216,9 @@ class ScanWorker(QThread):
         提取不到则返回空串。
         """
         # 优先：识别明确的季数标记（S4 / 2nd Season / 第X季 / II）
-        season = extract_season(raw_name, "all")
-        if season is not None:
-            cn = "一二三四五六七八九十十一十二"
-            if 1 <= season <= 12:
-                return f"第{cn[season - 1]}季"
-            return f"第{season}季"
+        season_word = ScanWorker._packed_season(raw_name)
+        if season_word:
+            return season_word
 
         # 次选：从方括号块里挑一段「像作品副标题」的拉丁文
         blocks = re.findall(r"\[([^\]]+)\]", raw_name)
@@ -943,6 +1239,22 @@ class ScanWorker(QThread):
     # ========== 二、匹配与入库 ==========
     def _process(self, cand: ScanCandidate) -> None:
         local_ep_count = len(cand.video_files)
+
+        # **单条重扫时保住 series_name**（实测踩坑）：只有这一个目录做候选时，
+        # `_walk` 无从得知它属于哪个系列 —— 系列名是**上层目录名**给的，
+        # 单扫没有上层。于是 cand.series_name 为空，而 upsert_* 会把空串原样
+        # 写回去，详情页的「同系列」整行随之消失（实测：对条目点一次
+        # 「重新扫描」，四个同系列按钮全没了）。
+        #
+        # 库里本来就有值，没理由被一次重扫抹掉 —— 补回来即可。全量扫描时
+        # cand.series_name 来自目录结构，不会走到这里。
+        if not cand.series_name:
+            try:
+                prev = self.db.find_subject_by_folder(str(cand.folder_path))
+            except Exception:  # pragma: no cover - 查库失败不该中断扫描
+                prev = None
+            if prev is not None and (prev.series_name or "").strip():
+                cand.series_name = prev.series_name.strip()
 
         # 「添加动漫」在**没填 Token** 时的路径：完全不联网，直接把目录里的
         # 视频作为本地条目入库（match_state="manual"，bangumi_id=NULL）。
@@ -974,6 +1286,22 @@ class ScanWorker(QThread):
             return
 
         result = self.matcher.search_best(cand.keywords, local_ep_count)
+
+        # 第二遍：具体候选都没匹配上时，才用裸系列名兜底。
+        #
+        # **必须只有"一个都没匹配上"时才走这里**：裸系列名对同系列每一部
+        # 都近乎同分，一旦参与第一遍竞争，它就会把**第一季**的精确命中
+        # 顶到最高分，反过来压掉具体候选的正确结果（咒术回战 死灭回游 →
+        # 被并进第一季；KONOSUBA 红传说 → 被并进正传）。只有当具体候选
+        # 什么都搜不到（Bangumi 上确实没有这一部的独立条目）时，退回
+        # 「至少归到这一系列」才是合理的。
+        if (result.subject is None and not result.network_failed
+                and cand.fallback_keywords):
+            fb = self.matcher.search_best(cand.fallback_keywords, local_ep_count)
+            if fb.subject is not None:
+                log.info("具体关键词未命中，改用系列名兜底 %s：%s",
+                         cand.display_name, fb.reason)
+                result = fb
 
         if result.subject is None:
             # **网络/接口失败与"确实没匹配项"要分开**（实测反馈）：
@@ -1159,6 +1487,45 @@ class ScanWorker(QThread):
                 extra_videos.append((v.stem, v))
             else:
                 plain_videos.append((v.stem, v))
+
+        # ---- 「单文件剧场版」：认作官方第 1 集 ----
+        #
+        # 剧场版的目录里通常就一个视频，文件名是发布组编的，例如
+        #   「[Airota][Kono Subarashii Sekai ni Shukufuku wo! Kurenaidensetsu]
+        #     [Movie][BDRip 1080p AAC AC3][...].mkv」
+        # 里面**没有任何集号** → 落进 plain 兜底桶 → 详情页显示成「0.5」
+        # 加一整行文件名（实测反馈："剧场版名字都没有，显示为文件名"）。
+        #
+        # 可这时官方条目**就只对应一集**（剧场版在 Bangumi 上就是"一集"），
+        # 本地也就这一个视频，一一对应没有任何歧义。直接认作官方那一集，
+        # 标题与 bangumi_ep_id 走正常回填路径，页面显示的就是条目名本身。
+        #
+        # 条件收紧到"整个目录只有这一个视频"：带 SP / 副音轨 / 菜单的目录
+        # 不算（那种情况下这个文件未必是正片）。
+        if (len(cand.video_files) == 1 and len(plain_videos) == 1
+                and not main_videos and not extra_videos and not extras_videos
+                and bgm_eps):
+            official: list[dict] = []
+            for e in bgm_eps:
+                try:
+                    if int(e.get("type") or 0) == 0:
+                        official.append(e)
+                except (TypeError, ValueError):
+                    continue
+            key: Optional[float] = None
+            if len(official) == 1:
+                try:
+                    key = float(official[0].get("sort") or official[0].get("ep"))
+                except (TypeError, ValueError):
+                    key = None
+            if key is not None:
+                main_videos = [(key, plain_videos[0][1])]
+                plain_videos = []
+                # 认作"已按号命中"：否则收尾的 _align_by_order 会把这一条
+                # 也当成"按顺序猜的"，给它打上 ep_align 标记，详情页平白
+                # 弹一条「集数对应可能不准确」的黄提示。
+                number_matched = True
+
         main_videos.sort(key=lambda x: x[0])
         # ---- 附加内容：先补号、再排序 ----
         #

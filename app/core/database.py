@@ -1369,6 +1369,56 @@ class Database:
             except (TypeError, ValueError):
                 return 0
 
+    def subject_watch_progress(self, subject_id: int) -> int:
+        """综合「看到第几集」：**本地**与 **Bangumi 集级记录**取最大。
+
+        **为什么要两路取最大**（口径与在看页一致，见 library._load_inprogress）：
+          - 本地 `episodes.watched`：在这台电脑上看的集（换设备/在网页上看的
+            不在这里）；
+          - `watched_episodes`：从 Bangumi 拉回来的集级标记（网页上点的
+            「看过 ep.5」会进这张表）。
+        只看本地会漏"在别处看完"的情形；只看远端会漏"没同步"的 —— 取 max。
+
+        只统计正片口径：`ep_index > 0`（附加内容在本地表里是
+        `main_max + 1000 + n` 的排序值，进来的话会给出上千的假进度；
+        远端表的 SP 行通常没有正片序号，一并排除）。
+        """
+        local = self.max_watched_ep_index(subject_id)
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT MAX(ep_index) AS m FROM watched_episodes"
+                " WHERE subject_id=? AND ep_index IS NOT NULL AND ep_index>0",
+                (subject_id,),
+            )
+            row = cur.fetchone()
+            remote = 0
+            if row and row["m"] is not None:
+                try:
+                    remote = int(float(row["m"]))
+                except (TypeError, ValueError):
+                    remote = 0
+        return max(local, remote)
+
+    def subject_all_watched(self, subject_id: int) -> bool:
+        """是否**每一集**都看过：观看进度 ≥ 官方正片数（`total_eps`）。
+
+        **为什么不用"本地 episodes 全部 watched"来判**（关键取舍）：
+        本地 `episodes` 只有**扫描到的文件** —— 本地只有 5 个文件、番有 12 集
+        时，"本地 5 集全看过"显然不等于"整部看完"，会误判。
+        用"看到第 N 集 ≥ 官方集数"（`subject_watch_progress >= total_eps`）
+        才是"追完了"的语义，也与在看页的进度口径一致。
+
+        `total_eps` 缺失（未匹配 Bangumi / 数据没有）时**不判** ——
+        没有官方集数就没有"每集"的基准，宁可漏判不可误判。
+        """
+        subj = self.get_subject(subject_id)
+        if subj is None:
+            return False
+        total = int(subj.total_eps or 0)
+        if total <= 0:
+            return False
+        return self.subject_watch_progress(subject_id) >= total
+
     def list_local_ep_indices(self, subject_id: int) -> set[float]:
         """本地已有集数序号集合（F19 三层查重第一层）。"""
         with self._cursor() as cur:

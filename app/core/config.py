@@ -46,6 +46,11 @@ DEFAULTS: dict[str, dict[str, str]] = {
         #       「动态 → 上传」小窗里决定（差集与幂等由那边保证）。
         # 两种情况下**本地记录都会先落袋** —— 关掉自动上传不会丢记录。
         "auto_upload": "true",
+        # 「自动完结」（v15，实测需求）：
+        #   一部动漫的**每一集**都标为看过后，自动把该动漫也标记为
+        #   「看过」（collect_type=2）；填了 Token 时同步到 Bangumi。
+        # 开关只控制"要不要自动改状态"，不管集级记录 —— 那是 auto_upload。
+        "auto_complete_watched": "true",
     },
     "qbittorrent": {
         "host": "127.0.0.1",

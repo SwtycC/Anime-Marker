@@ -128,12 +128,49 @@ class _SyncRunnable(QRunnable):
             Q_ARG(str, err))
 
 
+class _CompleteRunnable(QRunnable):
+    """后台把「整部看完」同步到 Bangumi 的条目收藏状态（type=2 看过）。
+
+    线程与边界约定与 `_SyncRunnable` 完全一致（同一段踩坑史）：
+    只做网络 POST、不碰数据库，结果经 `QMetaObject.invokeMethod`
+    交回主线程的 `_on_complete_finished` 落日志/提示。
+    """
+
+    def __init__(self, monitor: "ProgressMonitor", subject_id: int,
+                 bangumi_id: int, name: str) -> None:
+        super().__init__()
+        self._monitor = monitor
+        self._subject_id = subject_id
+        self._bangumi_id = bangumi_id
+        self._name = name
+
+    @Slot()
+    def run(self) -> None:
+        err = ""
+        try:
+            # type=2 =「看过」（1想看 2看过 3在看 4搁置 5抛弃，
+            # 与 subjects.collect_type 同一套值）
+            self._monitor.api.set_collection_type(self._bangumi_id, 2)
+        except Exception as e:          # pragma: no cover - 防御性
+            log.exception("同步「看过」到 Bangumi 异常 subject_id=%s",
+                          self._subject_id)
+            err = str(e)
+        QMetaObject.invokeMethod(
+            self._monitor, "_on_complete_finished", Qt.QueuedConnection,
+            Q_ARG(int, self._subject_id),
+            Q_ARG(str, self._name),
+            Q_ARG(str, err))
+
+
 class ProgressMonitor(QObject):
     """QTimer 驱动的进度监控器。"""
 
     progress_changed = Signal(int, float)   # episode_id, progress
     watched = Signal(int)                   # episode_id
     error = Signal(str)
+    #: 整部看完 → 自动标记「看过」成功（本地已改）。参数 (subject_id, 名称)。
+    #: PlayerBridge 转发给 qml_app，用于刷新海报墙/在看页的状态标签。
+    subject_completed = Signal(int, str)
 
     # 连续多少次读不到进度才提示一次（按默认 3s 轮询 ≈ 15 秒）
     MISS_HINT_AFTER = 5
@@ -146,6 +183,7 @@ class ProgressMonitor(QObject):
         trigger_threshold: float = 0.90,
         title_regex: str = "",
         auto_upload: bool = True,
+        auto_complete: bool = True,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -154,6 +192,9 @@ class ProgressMonitor(QObject):
         # 看完是否**立即**同步到 Bangumi（配置 `bangumi.auto_upload`）。
         # 关掉只影响"立刻传"这一步：本地记录照写，之后可用「动态 → 上传」补传。
         self.auto_upload = bool(auto_upload)
+        # 「自动完结」（配置 `bangumi.auto_complete_watched`，默认开）：
+        # 每集都看过 → 自动把条目标为「看过」（见 maybe_complete_subject）。
+        self.auto_complete = bool(auto_complete)
         self.threshold = trigger_threshold
         self.title_regex = title_regex or None
         self._timer = QTimer(self)
@@ -179,6 +220,7 @@ class ProgressMonitor(QObject):
         trigger_threshold: Optional[float] = None,
         title_regex: Optional[str] = None,
         auto_upload: Optional[bool] = None,
+        auto_complete: Optional[bool] = None,
     ) -> None:
         """在**运行中**更新监控参数（设置页保存后调用）。
 
@@ -204,6 +246,12 @@ class ProgressMonitor(QObject):
             if changed:
                 log.info("自动上传已%s（立即生效）",
                          "开启" if self.auto_upload else "关闭")
+        if auto_complete is not None:
+            changed = self.auto_complete != bool(auto_complete)
+            self.auto_complete = bool(auto_complete)
+            if changed:
+                log.info("自动完结已%s（立即生效）",
+                         "开启" if self.auto_complete else "关闭")
 
     def start(self, episode: Episode) -> None:
         self._episode = episode
@@ -325,6 +373,75 @@ class ProgressMonitor(QObject):
                 "读不到 PotPlayer 的播放进度，自动标记暂不可用"
                 "（可在条目详情页手动标记看过）")
 
+    def maybe_complete_subject(self, subject_id: int) -> None:
+        """「每集都看过」→ 自动把条目标为「看过」；有 Token 则同步 Bangumi。
+
+        **触发点（两个，都发生在"某一集刚被标看过"之后）**：
+          ① `_trigger_watched` —— 播放器看完自动标记（主场景：看完最后一集）；
+          ② `PlayerBridge.markWatched` —— 详情页手动勾。
+        两个入口都走这里，保证"无论怎么标，最后一集标完就完结"。
+
+        **判定**用 `db.subject_all_watched`（进度 ≥ 官方正片数），不是
+        "本地文件全看过" —— 本地往往缺集（只扫到 5 个文件、番有 12 集），
+        按文件判会把"追到一半"误判成"看完了"。
+
+        **顺序：本地先写，远端异步** —— 与 `_CollectTypeWorker`（用户手动
+        改状态，远端成功才落本地）**相反**，原因：
+          - 这里改的是"本地看完"这一**既成事实**的快照，不是用户意图；
+            写本地没有"失败要回滚"的问题；
+          - 远端失败（断网/没 Token）不该把本地状态也卡住 —— 用户看到
+            的应始终是"我看完了"。
+        与 `_CollectTypeWorker` 并发时最坏情况是互相覆盖一次快照，
+        下次进详情页回查即恢复一致（那里有回查机制）。
+
+        **重复触发安全**：判定便宜（两条 SQL），且 `collect_type == 2`
+        直接短路 —— 已经是「看过」就什么都不做。
+        """
+        if not self.auto_complete:
+            return
+        try:
+            if not self.db.subject_all_watched(subject_id):
+                return
+            subj = self.db.get_subject(subject_id)
+        except Exception as e:          # pragma: no cover - 防御性
+            log.exception("检查自动完结失败 subject_id=%s: %s", subject_id, e)
+            return
+        if subj is None or subj.collect_type == 2:
+            return
+
+        name = subj.name_cn or subj.name or ""
+        # 1) 本地快照先落（见上：顺序说明）
+        try:
+            self.db.set_subject_collect_type(subject_id, 2)
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("写入本地「看过」状态失败 subject_id=%s: %s",
+                        subject_id, e)
+        log.info("整部看完，自动标记「看过」：%s（subject_id=%s）",
+                 name, subject_id)
+        self.subject_completed.emit(int(subject_id), name)
+
+        # 2) 有 Token 且条目已匹配 Bangumi → 后台同步远端（不阻塞 UI）
+        if not subj.bangumi_id:
+            return
+        if not getattr(self.api, "has_token", False):
+            # 没 Token：连 GET 收藏列表都做不了，写远端必然 401 —— 静默跳过
+            log.info("未配置 Token，跳过同步「看过」到 Bangumi：%s", name)
+            return
+        self._pool.start(_CompleteRunnable(
+            self, int(subject_id), int(subj.bangumi_id), name))
+
+    @Slot(int, str, str)
+    def _on_complete_finished(self, subject_id: int, name: str,
+                              error: str) -> None:
+        """后台同步收藏状态的收尾（主线程）。失败只记日志 —— 本地已标记，
+        用户可随时在详情页手动改；弹窗反而打扰（与集级同步的提示策略不同，
+        那个失败会提示因为用户正等着看结果，这里是自动动作）。"""
+        if error:
+            log.warning("同步「看过」到 Bangumi 失败（本地已标记）：%s", error)
+            return
+        log.info("已同步「看过」到 Bangumi：%s（subject_id=%s）",
+                 name, subject_id)
+
     def _trigger_watched(self, ep: Episode) -> None:
         """看完一集：**先写本地，再推 Bangumi**（顺序不能反）。
 
@@ -343,6 +460,13 @@ class ProgressMonitor(QObject):
         self._triggered.add(ep.id)
         self.watched.emit(ep.id)
         log.info("已记录本地看过 episode_id=%s（第 %s 集）", ep.id, ep.ep_index)
+
+        # ---- 「自动完结」检查（v15）----
+        # 本地落袋后立刻查：这集是不是最后一集。是 → 条目自动标「看过」。
+        # 放在本地标记之后（而不是函数末尾）：即使该集没有 bangumi_ep_id、
+        # 或者自动上传关闭（走不到同步那几步），本地"看完最后一集"的
+        # 事实也已经成立，完结检查不该被跳过。
+        self.maybe_complete_subject(ep.subject_id)
 
         # ---- 2. 再同步到 Bangumi（失败不影响本地记录）----
         if not ep.bangumi_ep_id:

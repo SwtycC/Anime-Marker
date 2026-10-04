@@ -842,16 +842,25 @@ Item {
                 }
 
                 // 同系列切换
-                Row {
+                //
+                // **用 Flow 而不是 Row**（实测反馈）：同系列条数多、按钮上又是
+                // 完整标题时（KONOSUBA 五部、青春猪头少年四部），一行根本塞不下 ——
+                // Row 不会折行，超出的部分**直接溢出到窗口右边，永远点不到**。
+                // Flow 会自动折到下一行，和上面标签栏用的是同一个做法。
+                Flow {
+                    objectName: "siblingRow"
                     Layout.fillWidth: true
                     spacing: Theme.spacingSm
                     visible: root.siblings.length > 0
 
                     Text {
-                        anchors.verticalCenter: parent.verticalCenter
                         text: "同系列："
                         color: Theme.textTertiary
                         font.pixelSize: Theme.fontSm
+                        // Flow 不认 anchors，靠自身高度 + 垂直居中来跟 26px 的
+                        // 按钮对齐（用 anchors.verticalCenter 会被 Flow 忽略）。
+                        height: 26
+                        verticalAlignment: Text.AlignVCenter
                     }
 
                     Repeater {
@@ -871,7 +880,13 @@ Item {
                             Text {
                                 id: sibLabel
                                 anchors.centerIn: parent
-                                text: root.shortName(modelData.title)
+                                // 显示**完整**条目名（实测反馈）：早先会把与
+                                // seriesName 重复的前缀截掉，但那个前缀往往
+                                // 是整个系列唯一的辨识部分 ——
+                                // 「青春猪头少年不会梦到兔女郎学姐」变成
+                                // 「不会梦到兔女郎学姐」，「为美好的世界献上祝福！」
+                                // 更是只剩一个「！」。
+                                text: modelData.title
                                 color: Theme.textPrimary
                                 font.pixelSize: Theme.fontSm
                             }
@@ -1096,14 +1111,4 @@ Item {
         return (Math.round(v * 100) / 100).toString()
     }
 
-    /// 同系列按钮上的短名：去掉与系列名重复的部分
-    function shortName(full) {
-        var series = root.subject.seriesName || ""
-        if (series && full.indexOf(series) === 0) {
-            var rest = full.substring(series.length).replace(/^[\s\-_·:：]+/, "")
-            if (rest.length > 0)
-                return rest
-        }
-        return full
-    }
 }

@@ -39,6 +39,10 @@ class PlayerBridge(QObject):
     watched = Signal(int)                     # episode_id（自动标记成功）
     message = Signal(str)                     # 状态栏文字
     failed = Signal(str)                      # 播放失败
+    #: 整部看完 → 自动标记「看过」（参数 subject_id, 名称）。
+    #: 转发自 ProgressMonitor.subject_completed，qml_app 连到
+    #: LibraryBridge.reload() 刷新海报墙/在看页的状态标签。
+    subjectCompleted = Signal(int, str)
 
     def __init__(
         self,
@@ -63,11 +67,15 @@ class PlayerBridge(QObject):
             trigger_threshold=config.getfloat("monitor", "trigger_threshold", 0.95),
             title_regex=config.get("monitor", "title_regex", ""),
             auto_upload=config.getbool("bangumi", "auto_upload", True),
+            auto_complete=config.getbool(
+                "bangumi", "auto_complete_watched", True),
             parent=self,
         )
         self._monitor.progress_changed.connect(self._on_progress)
         self._monitor.watched.connect(self._on_watched)
         self._monitor.error.connect(self.failed)
+        # 「自动完结」结果 → 状态栏提示 + 转发给 qml_app（刷状态标签）
+        self._monitor.subject_completed.connect(self._on_subject_completed)
 
     def set_api(self, api: BangumiClient) -> None:
         """设置保存后重建 API 时调用。"""
@@ -91,6 +99,8 @@ class PlayerBridge(QObject):
                 "monitor", "trigger_threshold", 0.95),
             title_regex=self._config.get("monitor", "title_regex", ""),
             auto_upload=self._config.getbool("bangumi", "auto_upload", True),
+            auto_complete=self._config.getbool(
+                "bangumi", "auto_complete_watched", True),
         )
 
     # ---------- 状态属性 ----------
@@ -174,6 +184,15 @@ class PlayerBridge(QObject):
         except Exception as e:
             log.exception("手动标记失败 episode_id=%s", episode_id)
             self.failed.emit(f"标记失败：{e}")
+            return
+        # ---- 「自动完结」检查（v15）----
+        # 手动勾也可能是最后一集（比如用户补勾漏看的集）——
+        # 与播放自动标记走同一个入口（见 ProgressMonitor.maybe_complete_subject）。
+        # 查 episode 是 O(条目数) 的遍历（见 _find_episode 说明），
+        # 只在手动点击时发生一次，可接受。
+        ep = self._find_episode(episode_id)
+        if ep is not None:
+            self._monitor.maybe_complete_subject(ep.subject_id)
 
     # ---------- 内部 ----------
     def _find_episode(self, episode_id: int) -> Optional[Episode]:
@@ -199,3 +218,13 @@ class PlayerBridge(QObject):
     def _on_watched(self, episode_id: int) -> None:
         self.watched.emit(episode_id)
         self.message.emit(f"已自动标记看过：{self._playing_title}")
+
+    def _on_subject_completed(self, subject_id: int, name: str) -> None:
+        """整部看完已自动标记「看过」→ 状态栏提示 + 转发信号。
+
+        提示是必要的（自动动作必须让用户知道它发生了，否则表现为
+        "状态自己变了"）；转发给 qml_app 连 LibraryBridge.reload()，
+        让海报墙/在看页的状态标签立刻更新。
+        """
+        self.subjectCompleted.emit(subject_id, name)
+        self.message.emit("《%s》每集都已看过，已自动标记为「看过」" % name)

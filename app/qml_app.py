@@ -121,6 +121,11 @@ class QmlApp:
         self.scanner_bridge = ScannerBridge(self.db, self.config)
         self.settings_bridge = SettingsBridge(self.config)
         self.player_bridge = PlayerBridge(self.db, self.config, self.api)
+        # 「自动完结」（每集都看过 → 条目自动标「看过」）成功后刷媒体库：
+        # 海报墙/在看页上该条目的状态标签会立刻从「在看」变成「看过」。
+        # 跨桥连线放这里（PlayerBridge 不该认识 LibraryBridge）。
+        self.player_bridge.subjectCompleted.connect(
+            lambda sid, name: self.library_bridge.reload())
         self.match_bridge = MatchBridge(self.db, self.api)
         self.inprogress_bridge = InProgressBridge(self.db, self.config, self.api)
         # 收藏列表拉取完成后，让 QML 侧的 library.inProgress 重新取数

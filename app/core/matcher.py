@@ -9,6 +9,7 @@ Bangumi 搜索接口不保证按相关度排序，直接取 results[0] 会导致
 
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 from dataclasses import dataclass
@@ -25,9 +26,122 @@ SCORE_PREFIX = 55        # 前缀一致（应对「X～副标题～ 第3季」�
 SCORE_ALIAS_EXACT = 78   # 别名完全一致（低于正式名，见下方说明）
 SCORE_ALIAS_CONTAIN = 45 # 别名互相包含
 SCORE_WORD_OVERLAP = 20  # 有共同词
+SCORE_NAME_SIMILAR = 85  # 名称高度相似（民间译名与官方名只差一两个字）
+# 「候选名是关键词的一个小片段」时要求的最低覆盖率（见 _coverage）。
+#
+# **为什么需要**（实测踩坑）：目录名很长时（「命运石之门 全集 第一季 第二季
+# 剧场版 简繁中日双语内封字幕」「游戏人生 剧场版」），Bangumi 上那些**两个
+# 字的条目**（「命运」「游戏」）会因为名字被关键词整串包含而拿到 60 分，
+# 再加「集数接近 +20」就变成 80 —— 反倒压过真正该匹配的「命运石之门」（60）。
+# 覆盖率一算就露馅：「命运」只解释了关键词 30 个字里的 2 个（6.7%）。
+#
+# 取 0.5：实测该拦的都在 0.07~0.4（命运 0.07、游戏 0.29、轻音少女 0.4），
+# 该留的都在 0.5 以上（「咒术回战」占「咒术回战 死灭回游」正好 0.5）。
+CONTAIN_MIN_COVERAGE = 0.5
 SCORE_SEASON_MATCH = 40  # 季数一致
+SCORE_PART_MATCH = 40    # 篇章一致（「第N部分」，与季数平行，见 extract_part）
 SCORE_TYPE_MATCH = 30    # 条目类型一致（TV/剧场版）
 SCORE_EP_NEAR = 20       # 集数接近
+
+# 名称相似度判定的阈值与最小长度（见 score_subject 的「相似度兜底」）。
+#
+# **为什么要单独一档**（实测，青春猪头少年）：Baha 的繁体源码流把作品名写作
+# 「青春笨蛋少年不会梦到圣诞服女郎」，而 Bangumi 的正式名是
+# 「青春猪头少年不会梦到圣诞服女郎」——
+#   * 互相包含不成立（差两个字），
+#   * 词级重合也不成立（下面 `[一-鿿]{2,}` 对纯中文标题会**整串**
+#     匹配成一个"词"，两串不同名就一个共同词都没有），
+#   * 别名里只有「青春笨蛋少年不作圣诞服女郎的梦」（语序不同），也对不上。
+# 于是 -1000 被否决，只剩父级「青春猪头少年」这根稻草 —— 而它对同系列
+# 每一部都恰好 60 分，前二名差距 0，最终整部作品转人工。
+#
+# 两个条件**必须同时**满足，且都按"实测里最接近的两对"卡过：
+#
+#   正确命中：青春笨【蛋】少年… ↔ 青春猪【头】少年…   相似度 0.867，差 2 字 ✓
+#   必须拒绝：…献上【祝福】    ↔ …献上【爆焰】        相似度 0.800，差 2 字 ✗
+#             （「爆焰」是「为美好的世界献上祝福」的**外传**，不是同一部；
+#               只卡差异长度会把它放进来，前二名差距被压到 15 而转人工）
+#   必须拒绝：…【兔女郎学姐】   ↔ …【怀梦美少女】      相似度 0.733，差 4 字 ✗
+#   必须拒绝：…【兔女郎学姐】   ↔ …【圣诞服女郎】      相似度 0.800，差 3 字 ✗
+#
+# 阈值取 0.85：与"正确命中"的 0.867 只隔 0.017，看着很窄，但另一条
+# 连续差异的条件与之独立（这两组误命中分别是差 2 字和差 5 字，被它拦下），
+# 两条一起才是判据。最小长度 6 是防止「X战记」这类短名互相误判。
+#
+# 得分取 85（高于别名一致 78、低于正式名一致 100）的理由：
+# 它比"别名包含"这种弱证据强得多（整串 85% 以上逐字相同），
+# 又必须**严格低于**正式名一致，保证官方名精确命中时永远优先。
+# 另外它要在数值上压过"父级兜底关键词"给同系列其他作品的
+# 60(包含)+30(类型)+20(集数)=110 —— 85+30+20=135，差距 25 才够稳。
+NAME_SIMILAR_RATIO = 0.85
+NAME_SIMILAR_MIN_LEN = 6
+# 允许的**最长连续差异长度**（见 _max_diff_run）——
+# 真正的"民间译名差异"是**局部**的（只差一两个字），
+# 而"同系列里换了个篇章"是整段不同（兔女郎学姐 / 怀梦美少女 → 差 5 字）。
+NAME_SIMILAR_MAX_DIFF_RUN = 2
+
+
+# 「剧场版/电影」标记。Bangumi 习惯放**前面**（「电影 为美好的世界献上祝福！红传说」
+# 「剧场版 咒术回战 0」），本地目录习惯放**后面或干脆不写**
+# （「咒术回战 剧场版」「为美好的世界献上祝福！红传说」）。
+_MOVIE_MARK_RE = re.compile(r"(?i)(剧场版|劇場版|电影|電影|the\s*movie|movie)")
+
+
+def _strip_movie_marks(text: str) -> str:
+    """去掉「剧场版/电影」字样，用于名称比对的**第二次尝试**。
+
+    **为什么需要**（实测，KONOSUBA 红传说 / 咒术回战 0）：本地目录名
+    「为美好的世界献上祝福！红传说」与官方名「电影 为美好的世界献上祝福！
+    红传说」**只差一个前置的「电影」**，可就是这个错位让两边互相不包含 ——
+    于是正确条目只拿 60 分，反倒输给只解释了关键词前 10 个字的**正传**
+    （它拿 60+30=90）。挪开这几个字再比，两边完全一致 → 100 分。
+
+    只做"多一次尝试"（取更高分），不比原样更低 —— 所以不会让任何原本
+    能匹配的条目变差。
+    """
+    return _MOVIE_MARK_RE.sub("", text)
+
+
+def _name_match(norm_kw: str, nc: str) -> tuple[int, bool]:
+    """两串规范化名称的匹配分。返回 `(分数, 是否走了"挪开剧场版"那条)`。
+
+    第二条只在调用方要求时才会为真 —— 它决定"类型一致"那 30 分怎么算
+    （见 score_subject：靠挪开剧场版才匹配上的，说明那 30 分正是被挪掉的
+    「剧场版/电影」承担的，不该再判成"类型不符"扣掉）。
+    """
+    if nc == norm_kw:
+        return SCORE_EXACT, False
+    if norm_kw in nc:
+        return SCORE_CONTAIN, False
+    if nc in norm_kw and _coverage(nc, norm_kw) >= CONTAIN_MIN_COVERAGE:
+        # 候选名是关键词里的一小段 —— 覆盖率太低说明关键词里**多出来的
+        # 那些字**（「剧场版」「全集…」）候选根本解释不了，它多半只是
+        # 恰好同名的一个短条目。见 CONTAIN_MIN_COVERAGE。
+        #
+        return SCORE_CONTAIN, False
+    return 0, False
+
+
+def _coverage(short: str, long_: str) -> float:
+    """短串占长串的比例（长串为空时返回 0）。见 CONTAIN_MIN_COVERAGE。"""
+    if not long_:
+        return 0.0
+    return len(short) / len(long_)
+
+
+def _max_diff_run(a: str, b: str) -> int:
+    """两串的**最长连续差异长度**（取两侧差距的较大者）。
+
+    例：("青春笨蛋少年","青春猪头少年") → 2（"笨蛋"/"猪头"）
+        ("兔女郎学姐","怀梦美少女")     → 4（整段都不一样）
+    """
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    i = j = 0
+    worst = 0
+    for ai, bj, size in sm.get_matching_blocks():
+        worst = max(worst, ai - i, bj - j)
+        i, j = ai + size, bj + size
+    return worst
 
 # 别名命中为什么要**低于**正式名（实测权衡）：
 # 别名是更宽的口径 —— 一个条目可能有七八个别名，且包含"ANOHANA"这种
@@ -78,8 +192,38 @@ SHORT_CLIP_PATTERNS = [
 # ---- 季数识别 ----
 # 中文模式（默认启用）
 SEASON_PATTERNS_CN = [
-    (r"第\s*([一二三四五六七八九十\d]+)\s*[季部]", "cn"),
+    # 「第X部」算一季，但「第X部分」**不算** —— 后者是"同一季的前半/后半"，
+    # 不是季数，见 extract_part。
+    (r"第\s*([一二三四五六七八九十\d]+)\s*(?:季|部(?!分))", "cn"),
 ]
+
+# 「第 N 部分」（同一季的前半/后半）
+_PART_RE = re.compile(r"第\s*([一二三四五六七八九十\d]+)\s*部分")
+
+
+def extract_part(text: str) -> Optional[int]:
+    """从文本提取「第 N 部分」里的 N（没有则 None）。
+
+    **为什么要单列**（实测，无职转生 / 86 的目录结构
+    `<作品>/<季>/<第N部分>/`）：`extract_season` 原本把「第X部」当作"第X季"
+    的同义词，于是「**第二部分**」被读成"第 2 季"、「第一部分」被读成
+    "第 1 季" —— 可 Bangumi 上的「第2部分」根本不是一季，它是**同一季的后半**
+    （「无职转生～到了异世界就拿出真本事～ 第2部分」= 第一季的第 12~23 集）。
+
+    两者混为一谈之后，**第一季第2部分和第二季第2部分在打分上完全一样**
+    （季数都算 2、集数都是 12、名字都带「第2部分」），前二名差距 0，
+    只能反复转人工。拆成两个维度就能区分：
+        季数来自目录链（第一季/第二季），篇章来自目录名（第N部分）。
+    """
+    m = _PART_RE.search(text)
+    if not m:
+        return None
+    raw = m.group(1)
+    if raw in _CN_NUM:
+        return _CN_NUM[raw]
+    if raw.isdigit():
+        return int(raw)
+    return None
 # 「S1 / Season 1 / 2nd Season / Part 2」也默认启用：
 # 实测媒体库里这类写法很常见（如「Overlord S1」），不识别会导致关键词退化为「S1」而搜不到。
 SEASON_PATTERNS_EN = [
@@ -208,10 +352,26 @@ def extract_season(text: str, mode: str = "cn") -> Optional[int]:
 
 
 def is_movie_like(text: str) -> bool:
-    """文本是否像剧场版/单独篇章。"""
-    if any(h in text for h in SUBTYPE_MOVIE_HINTS):
+    """文本是否像剧场版/单独篇章（含「～篇/～章」后缀）。"""
+    if is_movie_type(text):
         return True
     return bool(re.search(r"篇$|编$|章$", text.strip()))
+
+
+def is_movie_type(text: str) -> bool:
+    """文本是否**明确**写着剧场版/电影（只看显式字样）。
+
+    **为什么与 `is_movie_like` 分开**（实测踩坑，咒术回战 死灭回游）：
+    「～篇」后缀只是"篇章"的写法，不代表条目是剧场版 ——
+    Bangumi 的正名是「咒术回战 死灭回游 **前篇**」，
+    而本地目录叫「死灭回游」。用 `is_movie_like` 去做"类型是否一致"的比对，
+    两边就被判成"一个是剧场版、一个不是"，白白扣掉 30 分（110 → 80），
+    于是**输给了同名的第一季**（90）——整个死灭回游被并进第一季。
+
+    `is_movie_like` 仍用于 `scanner.is_season_like`（判断目录名是不是
+    "篇章型"的一层），那里的宽口径是对的，不能一起收窄。
+    """
+    return any(h in text for h in SUBTYPE_MOVIE_HINTS)
 
 
 def _has_pattern(text: str, patterns: list[str]) -> bool:
@@ -225,11 +385,15 @@ def _strip_season(text: str, mode: str) -> str:
         「无职转生 第三季」→「无职转生」
     """
     out = normalize(text)
+    # 「第X部分」与季数是**两个维度**（见 extract_part），所以不论有没有季数
+    # 都要先去掉它 —— 否则「无职转生 第二部分」会残留一个「分」，
+    # 主名比对（前缀/包含）全线失准。
+    out = re.sub(r"第[一二三四五六七八九十\d]+部分", "", out)
     season = extract_season(text, mode)
     if season is None:
         return out
     # 去掉中文季数
-    out = re.sub(r"第[一二三四五六七八九十\d]+[季部]", "", out)
+    out = re.sub(r"第[一二三四五六七八九十\d]+(?:季|部(?!分))", "", out)
     # 去掉英文/数字季数
     out = re.sub(r"season\d+", "", out)
     out = re.sub(r"\ds\d+", "", out)
@@ -253,7 +417,10 @@ def _main_name_score(keyword: str, candidate: str, mode: str) -> tuple[int, str]
     if kw_main == cand_main:
         return SCORE_PREFIX, "主名一致"
     # 主名互相包含（Bangumi 常带 ～副标题～）
-    if kw_main in cand_main or cand_main in kw_main:
+    # 「候选 ⊂ 关键词」这一向要过覆盖率关，理由见 _contains_score
+    if kw_main in cand_main:
+        return SCORE_PREFIX, "主名包含"
+    if cand_main in kw_main and _coverage(cand_main, kw_main) >= CONTAIN_MIN_COVERAGE:
         return SCORE_PREFIX, "主名包含"
     # 关键词主名是候选主名的前缀（如「无职转生」vs「无职转生到了异世界就拿出真本事」）
     common = 0
@@ -263,7 +430,19 @@ def _main_name_score(keyword: str, candidate: str, mode: str) -> tuple[int, str]
         common += 1
     # 至少 4 个字符的前缀重合才认（避免「魔法」这类短前缀误命中）
     if common >= 4 and common >= len(kw_main) * 0.6:
-        return SCORE_PREFIX, f"主名前缀{common}字"
+        # **前缀之外的那一截必须也能在候选里找到**（实测踩坑，地错 第四季）：
+        # 关键词「在地下城寻求邂逅是否搞错了什么 **灾厄篇**」与
+        # 「…第四季 深章 **灾厄篇**」「…第四季 新章 **迷宫篇**」都有 19 字公共
+        # 前缀 —— 官方名中间夹着「第四季 深章」，所以两边既非包含也非被包含，
+        # 只能落到这条前缀规则上。可两队的前缀一样长，**光看前缀分不出
+        # 灾厄篇和迷宫篇**（实测两者都是 55 分，谁也赢不了谁）。
+        # 把"灾厄篇"这截也要求出现在候选名里，才真正区分得开。
+        tail = kw_main[common:]
+        if tail and tail not in cand_main:
+            return 0, ""
+        return SCORE_CONTAIN if tail else SCORE_PREFIX, (
+            f"主名前缀{common}字+尾段「{tail}」命中" if tail
+            else f"主名前缀{common}字")
     return 0, ""
 
 
@@ -273,6 +452,7 @@ def score_subject(
     local_ep_count: int = 0,
     season_mode: str = "cn",
     keyword_season: Optional[int] = None,
+    keyword_part: Optional[int] = None,
 ) -> tuple[int, str]:
     """给单个 Bangumi 候选打分，返回 (分数, 理由)。
 
@@ -297,21 +477,79 @@ def score_subject(
     reasons: list[str] = []
 
     norm_kw = normalize(keyword)
+    # 去掉「剧场版/电影」标记后再比一次的版本（见 _strip_movie_marks）
+    kw_strip = normalize(_strip_movie_marks(keyword))
     best_name_score = 0
+    best_via_strip = False     # 当前的最高分是否来自"挪开剧场版/电影"那次比对
     for cand in candidates:
         nc = normalize(cand)
         if not nc or not norm_kw:
             continue
-        if nc == norm_kw:
-            best_name_score = max(best_name_score, SCORE_EXACT)
-        elif norm_kw in nc or nc in norm_kw:
-            best_name_score = max(best_name_score, SCORE_CONTAIN)
-        else:
+        score_c, via_strip = _name_match(norm_kw, nc)
+        if score_c < SCORE_EXACT and kw_strip:
+            nc_strip = normalize(_strip_movie_marks(cand))
+            if nc_strip:
+                score_s, _ = _name_match(kw_strip, nc_strip)
+                # **「剧场版」是从关键词里删掉的时候要更严**：只认"候选把剩下
+                # 的部分完整覆盖了"这一种结论，不接受"完全相等 / 候选更短"。
+                #
+                # 否则会闹出这种笑话（实测，命运石之门\剧场版）：关键词
+                # 「命运石之门 剧场版」删掉「剧场版」后正好等于 **TV 正传**的名字，
+                # 于是正传白拿 100 分（130），把真正的剧场版
+                # 「命运石之门 负荷领域的既视感」(90) 挤掉。
+                # 而候选若真覆盖了剩下的「命运石之门 + 别的字」，那才说明它是
+                # 带副标题的剧场版。
+                if kw_strip != norm_kw and (score_s >= SCORE_EXACT
+                                            or kw_strip not in nc_strip):
+                    score_s = 0
+                if score_s > score_c:
+                    score_c, via_strip = score_s, True
+        if score_c > best_name_score:
+            best_name_score, best_via_strip = score_c, via_strip
+        if score_c == 0:
             # 词级重合：按 2-gram 粗算，避免完全不相关的条目得分
             kw_words = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", norm_kw))
             cand_words = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", nc))
             if kw_words and cand_words and (kw_words & cand_words):
                 best_name_score = max(best_name_score, SCORE_WORD_OVERLAP)
+
+    # ---- 相似度兜底：民间译名只差一两个字 ----
+    #
+    # 上面三档（完全一致 / 互相包含 / 词级重合）对**纯中文标题**是有盲区的：
+    #   * 「青春笨蛋少年不会梦到圣诞服女郎」与正式名
+    #     「青春猪头少年不会梦到圣诞服女郎」互相不包含；
+    #   * 词级重合那一档按 `[一-鿿]{2,}` 切词，对**没有空格的中文标题**
+    #     会整串匹配成一个"词"，两串一旦不同名就一个共同词都没有 ——
+    #     这一档实际上只对中英混排的标题有效。
+    # 结果就是"只差两个字"的正确条目拿 -1000 被否决（实测踩坑）。
+    #
+    # 这里用 difflib 的序列相似度补一档，只在**两边长度都不短**时启用，
+    # 避免短名（「X战记」/「X战记 2」）互相误判。
+    #
+    # 只比对**正式名**（name_cn / name），不比别名：别名一个条目动辄七八个，
+    # 放进来等于把误命中概率乘上别名数量，而"近义异译"这档本就是为了
+    # 救正式名对不上的情况 —— 别名能用早就用上面那两档命中了。
+    #
+    # 还有一条硬条件：**季数必须一致**（同为"无季数标记"也算一致）。
+    # 否则「进击的巨人 最终季」与「进击的巨人 第三季」只差两个字，
+    # 会被当成"民间译名"而错误自动匹配 —— 它们是**不同的季**。
+    best_reason_early = ""
+    if (not best_name_score and len(norm_kw) >= NAME_SIMILAR_MIN_LEN
+            and keyword_season == extract_season(name_cn or name, season_mode)):
+        for cand in candidates:
+            nc = normalize(cand)
+            if len(nc) < NAME_SIMILAR_MIN_LEN:
+                continue
+            sm = difflib.SequenceMatcher(None, norm_kw, nc, autojunk=False)
+            ratio = sm.ratio()
+            if ratio < NAME_SIMILAR_RATIO:
+                continue
+            run = _max_diff_run(norm_kw, nc)
+            if run > NAME_SIMILAR_MAX_DIFF_RUN:
+                continue
+            best_name_score = SCORE_NAME_SIMILAR
+            best_reason_early = f"名称高度相似({ratio:.2f} 差{run}字)：{cand}"
+            break
 
     # 别名打分：只给"完全一致 / 互相包含"两档，**不给词级重合**
     # （别名数量多，词级重合会大幅抬高低质量候选的分数）
@@ -364,7 +602,7 @@ def score_subject(
     # **别名命中时不要走这里**：兜底会把 best_name_score 覆盖成正式名的
     # `_main_name_score` 结果（通常更低或为 0），等于把别名的贡献抹掉。
     # 别名已是可用结论，无需再用正式名兜底。
-    best_reason = ""
+    best_reason = best_reason_early
     if best_alias_hit:
         best_reason = f"别名命中：{best_alias_hit}"
     elif best_name_score < SCORE_CONTAIN:
@@ -418,6 +656,28 @@ def score_subject(
                 f"(关键词要求第{keyword_season}季)")
             best_name_score = SCORE_CONTAIN
 
+    # ---- 篇章一致性（「第N部分」，与季数平行的第二个硬条件）----
+    #
+    # 目录结构 `<作品>/<季>/<第N部分>/` 里的「第N部分」说的是**同一季的前半/后半**
+    # （Bangumi 的「…～ 第2部分」= 第一季第 12~23 集），跟"第几季"是两回事，
+    # 见 extract_part。判据与季数完全对称：
+    #   * 条目标了别的篇章（条目=2、期望=1）→ 一票否决；
+    #   * 条目没标篇章 → **只在 N ≥ 2 时降级**：Bangumi 上"第 1 部分"通常就是
+    #     **不带任何篇章标记的那个条目**（「无职转生～到了异世界就拿出真本事～」
+    #     正是第一季前半），所以 N=1 时"没标记"是正常现象，不能扣。
+    if keyword_part is not None:
+        subject_part = extract_part(name_cn or name)
+        if subject_part is not None and subject_part != keyword_part:
+            return (
+                SCORE_IRRELEVANT,
+                f"篇章不符（条目=第{subject_part}部分，期望=第{keyword_part}部分）",
+            )
+        if subject_part is None and keyword_part > 1 and best_name_score > SCORE_CONTAIN:
+            reasons.append(
+                f"无篇章标记，名称分 {best_name_score}→{SCORE_CONTAIN}"
+                f"(关键词要求第{keyword_part}部分)")
+            best_name_score = SCORE_CONTAIN
+
     if best_name_score:
         suffix = f"（{best_reason}）" if best_reason else ""
         reasons.append(f"名称+{best_name_score}{suffix}")
@@ -430,9 +690,22 @@ def score_subject(
             score += SCORE_SEASON_MATCH
             reasons.append(f"季数一致({keyword_season})+{SCORE_SEASON_MATCH}")
 
+    # 篇章一致的加分（同上，与季数那段平行）
+    if keyword_part is not None:
+        if extract_part(name_cn or name) == keyword_part:
+            score += SCORE_PART_MATCH
+            reasons.append(f"篇章一致(第{keyword_part}部分)+{SCORE_PART_MATCH}")
+
     # 类型一致性：关键词像剧场版，条目也该像
-    kw_movie = is_movie_like(keyword)
-    subj_movie = is_movie_like(name_cn or name)
+    # 靠"挪开剧场版/电影"才匹配上的（best_via_strip），说明那层差异正是被
+    # 挪掉的那几个字承担的，不该再当成"类型不符"倒扣 30 分 —— 否则
+    # 「电影 X 红传说」这类条目永远比不过「X」。
+    if best_via_strip:
+        kw_movie = is_movie_type(_strip_movie_marks(keyword))
+        subj_movie = is_movie_type(_strip_movie_marks(name_cn or name))
+    else:
+        kw_movie = is_movie_type(keyword)
+        subj_movie = is_movie_type(name_cn or name)
     if kw_movie == subj_movie:
         score += SCORE_TYPE_MATCH
         reasons.append(f"类型一致+{SCORE_TYPE_MATCH}")
@@ -507,8 +780,9 @@ class SubjectMatcher:
     ) -> tuple[int, str]:
         """给单个候选项打分（供手动匹配对话框排序用）。"""
         season = extract_season(keyword, self.season_mode)
+        part = extract_part(keyword)
         return score_subject(
-            subject, keyword, local_ep_count, self.season_mode, season
+            subject, keyword, local_ep_count, self.season_mode, season, part
         )
 
     def search_best(
@@ -535,6 +809,7 @@ class SubjectMatcher:
             if not kw:
                 continue
             season = extract_season(kw, self.season_mode)
+            part = extract_part(kw)
             try:
                 results = self.api.search_subjects(kw, limit=10)
             except Exception as e:
@@ -547,7 +822,7 @@ class SubjectMatcher:
 
             for subj in results:
                 s, reason = score_subject(
-                    subj, kw, local_ep_count, self.season_mode, season
+                    subj, kw, local_ep_count, self.season_mode, season, part
                 )
                 # 被否决的候选（名称不相关 / 季数不符）不参与竞争
                 if s <= SCORE_IRRELEVANT:
