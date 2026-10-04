@@ -65,7 +65,7 @@ FALLBACKS: dict[str, str] = {
     "launcher.fullscreen_shortcut": "alt+enter",
     "launcher.fullscreen_settle": "3.0",
     "monitor.poll_interval": "3",
-    "monitor.trigger_threshold": "0.95",
+    "monitor.trigger_threshold": "0.90",
     # （季数识别 / 多季展示已移除，见 ALLOWED_KEYS 处的说明）
     "scanner.accept_score": "60",
     "scanner.accept_gap": "30",

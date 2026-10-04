@@ -965,7 +965,7 @@ Item {
                     NumberStepper {
                         id: thresholdField
                         objectName: "thresholdField"
-                        value: root.getFloat("monitor.trigger_threshold", 0.95)
+                        value: root.getFloat("monitor.trigger_threshold", 0.90)
                         minimum: 0.5
                         maximum: 1.0
                         step: 0.05

@@ -121,7 +121,8 @@ DEFAULTS: dict[str, dict[str, str]] = {
     },
     "monitor": {
         "poll_interval": "3",
-        "trigger_threshold": "0.95",
+        # 看完一集的判定阈值（播放进度达到多少算看完，0~1）。
+        "trigger_threshold": "0.90",
         "title_regex": "",
     },
     "ui": {
@@ -207,4 +208,4 @@ class Config:
 
     @property
     def trigger_threshold(self) -> float:
-        return self.getfloat("monitor", "trigger_threshold", 0.95)
+        return self.getfloat("monitor", "trigger_threshold", 0.90)

@@ -476,9 +476,32 @@ class LibraryBridge(QObject):
             # 现在只用本地 URL，拿不到就交给 QML 显示占位底色（原本就有的
             # 空态），不再让界面层承担联网职责。
 
-            # 「下一集」按钮：要播的集 ID（0 = 播不了）+ 播不了时的原因文案。
-            # 按钮**不隐藏**，点不动时把原因报到状态栏（见 _next_episode）。
-            next_ep_id, next_ep_hint = self._next_episode(local_id, it.ep_status)
+            # ---- 用**本地已看的最大集号**修正进度----
+            #
+            # 为什么取 `max(缓存, 本地最大集号)`：
+            # 两者各有覆盖不到的地方 —— 用户在**手机/网页**上标了第 10 集，
+            # 本地可能一条 watched 都没有（没在这台电脑上看过）；反过来
+            # 刚在本地看完、还没同步到 Bangumi 时，缓存又落后。取大的那个
+            # 才同时兼顾两种情况，且进度只会"前进"不会"回退"
+            # （回退会被用户当成 bug）。
+            #
+            # 注意这里**不改库**：只修正本次返回给界面的值。缓存该由
+            # 「刷新」重建，不要在只读路径上偷偷写数据。
+            #
+            # **位置要求**：必须在下面 `_next_episode` 之前算出来 ——
+            # 它也要用这个值（两处口径必须一致，否则会出现"进度显示 9
+            # 但「下一集」还是第 9 集"的自相矛盾）。
+            ep_status = int(it.ep_status or 0)
+            if local_id:
+                try:
+                    ep_status = max(
+                        ep_status,
+                        self._db.max_watched_ep_index(local_id))
+                except Exception as e:
+                    log.warning("读取本地已看最大集号失败 subject_id=%s: %s",
+                                local_id, e)
+
+            next_ep_id, next_ep_hint = self._next_episode(local_id, ep_status)
             # 「上传」按钮：本地看过但 Bangumi 未标的集数（0 = 无事可做），
             # 以及本地看过却没有 bangumi_ep_id、压根传不了的集数
             pending_up = len(pend_map.get(local_id, []))
@@ -492,7 +515,10 @@ class LibraryBridge(QObject):
                 # 只用本地缓存 URL（见上方说明：不回落在线的 lain.bgm.tv，
                 # 否则 QML 引擎会自己联网取图并刷超时错误）
                 "coverUrl": local_cover,
-                "epStatus": int(it.ep_status or 0),
+                # 已修正的进度（见上方 max(缓存, 本地) 的说明）。
+                # **必须用这个变量**，不要再写 `int(it.ep_status or 0)` ——
+                # 否则页面上的进度条与标题又会回到旧值。
+                "epStatus": ep_status,
                 "totalEps": int(it.total_eps or 0),
                 # 2 = 看过（当前唯一使用的类型，见 InProgressBridge）
                 "collectType": int(it.collect_type or 2),

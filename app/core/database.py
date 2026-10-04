@@ -1171,6 +1171,39 @@ class Database:
             )
             return int(cur.fetchone()["n"])
 
+    def max_watched_ep_index(self, subject_id: int) -> int:
+        """本地已看的**最大集号**（「看到第几集」），没看过返回 0。
+
+        **与 `count_locally_watched_eps()` 的区别很重要**（这是一个踩过的坑）：
+            count  —— 已看**条数**（看了 1 集 → 1）
+            max    —— 已看的**最大集号**（看了第 9 集 → 9）
+        只有"从第 1 集一集不落看下来"时两者才相等。中间的漏看（或像本次
+        实测那样只看了第 9 集）会让 count 远小于真实进度。
+
+        详情页/在看页的「进度」语义是 Bangumi 的 `ep_status` = **看到第 N 集**，
+        所以必须用这个 `max` 版本；拿 count 去比会把"第 9 集已看"算成
+        `max(8, 1) = 8`，页面看起来完全没反应。
+
+        只统计正片（`ep_label` 为空）：附加内容（SP/OVA）的 `ep_index` 是
+        `main_max + 1000 + n` 这种排序值，拿来当"集号"会得到上千的假进度。
+        取整后返回 int —— `ep_index` 允许小数（12.5 这种），但"看到第几集"
+        是个整数概念，向下取整不会高估进度。
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT MAX(ep_index) AS m FROM episodes"
+                " WHERE subject_id=? AND watched=1"
+                " AND (ep_label IS NULL OR ep_label='')",
+                (subject_id,),
+            )
+            row = cur.fetchone()
+            if not row or row["m"] is None:
+                return 0
+            try:
+                return int(float(row["m"]))
+            except (TypeError, ValueError):
+                return 0
+
     def list_local_ep_indices(self, subject_id: int) -> set[float]:
         """本地已有集数序号集合（F19 三层查重第一层）。"""
         with self._cursor() as cur:

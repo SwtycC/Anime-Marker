@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Effects
+import QtQuick.Window      // Screen.devicePixelRatio（按物理像素解码用）
 
 // 图标：外部 SVG + 按主题染色（薄封装）。
 //
@@ -93,8 +94,34 @@ Item {
             anchors.fill: parent
             visible: false
             source: root.svgUrl
-            sourceSize.width: 64      // 放大解码，缩小后边缘更干净
-            sourceSize.height: 64
+
+            // 按"实际显示尺寸 × DPR"解码（原先固定 64）。
+            //
+            // **先说清楚实测结论**：锯齿的成因**不是**这一步。实测过
+            // 三种解码尺寸缩到 22px 显示后的抗锯齿过渡像素数：
+            //     sourceSize=64 → 202 个
+            //     sourceSize=22 → 200 个
+            //     sourceSize=44 → 201 个
+            // 三者基本一致（差 ≤2，可视为噪声）—— 说明 64 → 22 的那次
+            // 缩小由 SmoothTransformation 处理得很干净，**不是**锯齿来源。
+            //
+            // 那为什么还是改成按显示尺寸解码：纯粹是省事省钱 ——
+            // 原来每次都把 16 单位的路径光栅成 64×64 位图（4096 像素），
+            // 再缩到 22×22 只用其中一小部分；现在直接生成需要的尺寸，
+            // 省掉一次大图分配与一次全图重采样。
+            //
+            // 真正影响观感的是下面 MultiEffect 的 `smooth` / 图层尺寸，
+            // 见那里的说明。改这里时**不要**以为它修了锯齿。
+            //
+            // 空尺寸兜底：组件尚未布局完成时 width/height 可能为 0
+            // （NavIcon 默认 implicitWidth 24，但调用方会覆盖），
+            // 为 0 会让 Image 不加载 —— 用 implicit 尺寸兜一下。
+            readonly property real _renderSize: root.width > 0
+                                                ? root.width : root.implicitWidth
+            sourceSize.width: Math.max(1, Math.round(
+                _renderSize * Screen.devicePixelRatio))
+            sourceSize.height: Math.max(1, Math.round(
+                _renderSize * Screen.devicePixelRatio))
             fillMode: Image.PreserveAspectFit
             asynchronous: false
         }

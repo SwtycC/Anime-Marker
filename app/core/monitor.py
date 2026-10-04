@@ -143,7 +143,7 @@ class ProgressMonitor(QObject):
         db: Database,
         api: BangumiClient,
         poll_interval: int = 3,
-        trigger_threshold: float = 0.95,
+        trigger_threshold: float = 0.90,
         title_regex: str = "",
         auto_upload: bool = True,
         parent: Optional[QObject] = None,

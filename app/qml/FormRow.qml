@@ -73,7 +73,7 @@ Item {
         Item {
             Layout.preferredWidth: root.labelWidth
             Layout.maximumWidth: root.labelWidth
-            Layout.alignment: Qt.AlignTop
+            Layout.alignment: Qt.AlignVCenter
             implicitHeight: labelText.implicitHeight
 
             Text {
