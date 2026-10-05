@@ -368,6 +368,24 @@ _EP_MID_RE = re.compile(
     r"(?<![\w.])0*(\d+(?:\.\d+)?)(?:v\d+)?" + _EP_END_MARK + r"(?![\w.])",
     re.IGNORECASE)
 
+# 「这是季数，不是集数」的前缀：Season 2 / S2 / 第2季 / 2nd Season 里的那个数字。
+#
+# **为什么必须排除**（实测踩坑，症状极隐蔽）：文件名
+#     [Dynamis One] Ao Ashi Season 2 - 01 (Baha 1920x1080 AVC AAC MP4) [xxx].mp4
+# 里 `Season 2` 的 **2** 会被 `_EP_MID_RE` 当"独立数字"收进来，且它
+# **出现在 `- 01` 之前**，于是候选列表是 `[2.0, 1.0]`（顺序按出现位置）。
+# `_pick_ep_index` 的规则是"优先挑能对上官方集数表的候选" —— 而 `2.0`
+# 恰好在官方集数表里（第 2 集确实存在），于是**第 1 集的文件被配上了
+# 第 2 集的标题**（实测：文件 `- 01` 显示成「2 思考的芦苇」）。
+#
+# 只在**紧邻前缀**时才排除（`Season 2` 有空格、`S2` 无空格都算），
+# 不会误伤正常的集号（如 `- 01` 前面没有这类词）。
+_SEASON_PREFIX_RE = re.compile(
+    r"(?i)(?:\bS(?:eason)?\s*$|第\s*$|\b\d+(?:st|nd|rd|th)\s+season\s*$)")
+# 「Season 2」里数字还可能在**后面**跟着 season（2nd Season 的顺序反之），
+# 这里再补一条后缀：`2nd Season` 的 `2` 后面跟的是 `nd Season`。
+_SEASON_SUFFIX_RE = re.compile(r"(?i)^\s*(?:st|nd|rd|th)\s+season\b")
+
 # 括号块集数的可信度上限（实测踩坑）：
 # 「(2021) 01」里的年份、「[1080]」里的画质参数也会命中 _EP_BRACKET_RE。
 # 正片集数几乎不可能 ≥200（超长篇也多为重播编号），超过上限的一律不进
@@ -550,7 +568,21 @@ def extract_ep_candidates(name: str) -> list[float]:
                 cands.append(val)
 
     # ⑥ 其余独立数字 —— 兜底，可信度最低，靠官方集数表消歧
+    #
+    # **但要先排除「季数」**（实测踩坑）：`Season 2` / `S2` / `第2季` 里的
+    # 数字会被本规则当候选捡回来，而且常常**排在真正的集号之前**
+    # （`Season 2 - 01` → 候选 `[2, 1]`）。`_pick_ep_index` 优先挑"能对上
+    # 官方集数表"的候选，季数往往也能对上（第 2 集当然存在）→
+    # **每一集都被解析成第 2 集**或整部偏移。
+    # 判据：数字紧跟在 `Season`/`S`/`第` 之后（可带空格），或紧跟
+    # `2nd/3rd… Season` 这类序数后缀。
     for m in _EP_MID_RE.finditer(stem):
+        before = stem[:m.start()]
+        after = stem[m.end():]
+        if _SEASON_PREFIX_RE.search(before):
+            continue
+        if _SEASON_SUFFIX_RE.match(after):
+            continue
         cands.append(float(m.group(1)))
 
     return cands

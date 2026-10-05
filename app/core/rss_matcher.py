@@ -468,21 +468,20 @@ class RssMatcher:
             log.warning("订阅 #%s 算不出保存路径，用 qBittorrent 默认设置",
                         source.id)
             return ""
-        if exists:
-            return path
 
-        # 目录还不存在（订阅源新建的条目）→ 建出来。
-        #
-        # **已记路径且真实存在**的情况在 plan_save_path 里就返回了、
-        # 不会走到这里 —— 那种目录是用户磁盘上真实的结构，不该动它。
-        try:
-            Path(path).mkdir(parents=True, exist_ok=True)
-            log.info("已创建下载目录：%s", path)
-        except OSError as e:
-            log.warning("创建下载目录失败（%s）：%s，用默认保存路径", path, e)
-            return ""
+        if not exists:
+            # 目录还不存在（订阅源新建的条目）→ 建出来。
+            #
+            # **已记路径且真实存在**的情况在 plan_save_path 里就返回了、
+            # 不会走到这里 —— 那种目录是用户磁盘上真实的结构，不该动它。
+            try:
+                Path(path).mkdir(parents=True, exist_ok=True)
+                log.info("已创建下载目录：%s", path)
+            except OSError as e:
+                log.warning("创建下载目录失败（%s）：%s，用默认保存路径", path, e)
+                return ""
 
-        # ---- 把算出的目录**写回条目**（关键，见下方说明）----
+        # ---- 把目录**写回条目**（两个分支都要写，见下方说明）----
         #
         # **为什么必须写回**：`startSubject`（详情页「重新扫描该条目」）
         # 的入口判据就是 `subjects.folder_path` ——
@@ -492,22 +491,32 @@ class RssMatcher:
         #     没有 folder_path → 算出的目录只用于这次下载、不落库
         #     → 用户下载完想扫一遍看看集数 → 「重新扫描」直接报错
         #     → 条目永远没有集数（详情页一直显示"没有集数"），
-        #        `total_eps` 也一直是 0（连"是否看完"都判不了）。
+        #       `total_eps` 也一直是 0（连"是否看完"都判不了）。
         #
-        # 写回之后这条链路就闭合了：下载 → 目录落库 → 可重新扫描 →
-        # 拿到集数与标题。
-        #
-        # **只在"原来没有路径"时写**（本方法走到这里必然如此，
-        # 因为已有路径的分支在上面 `exists` 就 return 了）——
-        # 不会覆盖用户磁盘上既有的真实结构。
+        # **踩坑（实测"扫描出一个新条目"，同一目录出现两张卡）**：
+        # 早期这段写回放在了 `if exists: return path` **之后** —— 于是
+        # "目录已经存在"（比如用户手动建好了、或上一轮下载已经建过）
+        # 时就**跳过了写回**，`folder_path` 仍然是空。后果不止是扫不了：
+        #     ① 扫描匹配失败 → `upsert_pending_subject` 按 `folder_path`
+        #        判重 → 查不到空路径的它 → **新插一条 pending 占位**；
+        #     ② 再扫一次匹配成功 → `upsert_subject` 按 `bangumi_id` 找到
+        #        原条目并更新它 —— 于是同一目录留下**两条**：
+        #        一条 auto（原条目）+ 一条孤儿 pending（实测 #890/#891）。
+        # 现在把写回**移到 `exists` 判断之外**，两个分支都会补上路径，
+        # 判重键因此能对上，不再产生重复条目。
         #
         # 失败只记日志：写不进去不该让整次下载失败（文件照样下到 path）。
         try:
             sid = int(getattr(source, "save_subject_id", 0)
                       or source.local_subject_id or 0)
             if sid:
-                self.db.update_rss_subject_folder(sid, path)
-                log.info("已把下载目录记入条目 #%s：%s", sid, path)
+                cur = self.db.get_subject(sid)
+                if cur is not None and not (cur.folder_path or "").strip():
+                    # **只在原本为空时写**：已有值说明那是扫描得到的
+                    # 真实目录结构，不该被覆盖（例如用户把下载目录
+                    # 指向了另一个已扫描条目）。
+                    self.db.update_rss_subject_folder(sid, path)
+                    log.info("已把下载目录记入条目 #%s：%s", sid, path)
         except Exception as e:          # pragma: no cover - 防御性
             log.warning("写回条目目录失败（不影响本次下载）：%s", e)
         return path
