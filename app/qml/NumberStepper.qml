@@ -26,6 +26,16 @@ Item {
     implicitWidth: 220
     implicitHeight: 34
 
+    // 禁用态：整体降透明度 + 关掉内部交互。
+    //
+    // **必须显式处理**（踩坑，与 CheckBoxLine 同一个坑）：`Item` 的
+    // `enabled: false` **不会**自动禁用子项 —— 下面的两个 MouseArea
+    // 和 TextInput 都是独立 Item，不显式跟上的话，按钮看起来变灰了、
+    // 点下去照样改数值（用户会以为设置坏了）。而 TextInput 更是会
+    // 直接抢焦点，光标还能进到框里打字。
+    opacity: enabled ? 1.0 : 0.45
+    Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
+
     readonly property int _btnSize: 30
 
     function format(v) {
@@ -99,10 +109,6 @@ Item {
 
     // ---- 四段式布局：减号 | 输入框 | 单位 | 加号 ----
     //
-    // 踩坑记录：早期实现是 `field` 锚在 `parent.left`、两个按钮锚在右侧，
-    // 结果是「输入框在减号左边」，而不是夹在两个按钮中间 ——
-    // 视觉上像两个独立的加减按钮 + 一个无关的输入框。
-    //
     // 现在用一个 Row 从左到右顺序排列，间距统一为 spacingMd，
     // 天然形成「− [输入框] 单位 +」的组合。注意 Row 不会拉伸子项，
     // 因此输入框必须显式给宽度（不能用 fillWidth）。
@@ -141,6 +147,8 @@ Item {
             MouseArea {
                 id: minusMouse
                 anchors.fill: parent
+                // 禁用时显式关掉（见根项 opacity 处的说明）
+                enabled: root.enabled
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: root.nudge(-1)
@@ -172,6 +180,9 @@ Item {
                 selectionColor: Theme.accent
                 selectedTextColor: Theme.accentText
                 text: root.format(root.value)
+                // 禁用时不可获得焦点 / 不可编辑（见根项说明）
+                enabled: root.enabled
+                activeFocusOnTab: root.enabled
 
                 onEditingFinished: root.commit()
                 onActiveFocusChanged: {
@@ -217,6 +228,8 @@ Item {
             MouseArea {
                 id: plusMouse
                 anchors.fill: parent
+                // 禁用时显式关掉（见根项 opacity 处的说明）
+                enabled: root.enabled
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: root.nudge(1)

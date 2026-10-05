@@ -240,7 +240,14 @@ class ScannerBridge(QObject):
             return
         folder = (subj.folder_path or "").strip()
         if not folder:
-            self.failed.emit("该条目没有记录目录路径，无法重新扫描")
+            # ---- 没有记录目录 → **按 RSS 的规则推算一次**----
+            #
+            # 这里复用同一套推算（`RssMatcher.plan_save_path`，纯计算、
+            # 不创建目录）：算出来的目录**真实存在**才继续扫，
+            # 不存在就还是报错（这时确实没东西可变，报错是对的）。
+            folder = self._guess_folder(subj) or ""
+        if not folder or not Path(folder).is_dir():
+            self.failed.emit("该条目还没有目录（先下载一次，或手动指定目录）")
             return
 
         self._api = self._api or BangumiClient()
@@ -280,6 +287,34 @@ class ScannerBridge(QObject):
         self._set_running(True)
         worker.start()
         log.info("单条目扫描已启动：subject_id=%s（%s）", subject_id, folder)
+
+    def _guess_folder(self, subj) -> str:
+        """该条目没记目录时，按 **RSS 的同一套规则**推算它"应该在哪"。
+
+        只是**借规则算个路径**（`RssMatcher.plan_save_path` 是纯计算、
+        不创建目录、不落库），算出来可能与实际不同 —— 所以调用方必须
+        再判一次 `is_dir()`，只有真实存在才拿去扫描。
+
+        **为什么复用而不再写一套**：路径规则（媒体库根 / 系列名 / 季子目录、
+        以及"系列名靠条目名兜底推断"）散在两处必然漂移，很快就会出现
+        "下载器说下到 A、扫描器去扫 B"。
+        """
+        try:
+            from app.core.database import RssSource
+            from app.core.rss_matcher import RssMatcher
+
+            # 造一个"临时订阅"只为借用它的推算入口：
+            # save_subject_id 指向本条 → plan_save_path 就会按它算。
+            fake = RssSource(id=0, name="", url="",
+                             save_subject_id=int(subj.id),
+                             local_subject_id=int(subj.id))
+            matcher = RssMatcher(self._db, None, self._config)
+            path, _note, _exists = matcher.plan_save_path(fake)
+            log.info("条目 #%s 没有目录记录，按规则推算为：%s", subj.id, path)
+            return path or ""
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("推算条目 #%s 的目录失败：%s", getattr(subj, "id", "?"), e)
+            return ""
 
     @Slot(str, bool, result="QVariantMap")
     def addFolder(self, folder: str, match: bool = True) -> dict:

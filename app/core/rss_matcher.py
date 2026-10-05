@@ -3,7 +3,7 @@
 对应 §5.10.2 与 §8.4：
 1. 标题清洗 → 提取动漫名 + 集数序号
 2. 两层查重：本地媒体库 → qBittorrent 任务
-3. 按规则（source.rule 优先，否则 rss.rule）决定是否下发
+3. 按该订阅自己的规则（`rss_sources.rule`：只下新集 / 全部下载）决定是否下发
 
 注：原第 3 层"download_history"已按实测需求去掉，见 `_dedup`。
 """
@@ -24,11 +24,8 @@ from app.utils.title_parser import extract_episode_index, clean_anime_title
 
 log = logging.getLogger(__name__)
 
-# 下载规则
+# 下载规则（**只剩两个**）
 #
-# **界面能选的只有前两个**（`bridges/rss.py` 的 RULES）。后三个是早期的
-# 设计，界面上没有入口，但保留在 VALID_RULES 里以免旧配置里的值被判成
-# "未知规则"而回退。
 #
 # **踩坑（实测，很隐蔽）**：`RULE_ALL` 原先**没有被定义**，`VALID_RULES`
 # 里也没有 `"all"` —— 而界面上的「全部下载」存的正是 `"all"`。
@@ -38,13 +35,9 @@ log = logging.getLogger(__name__)
 # 现在补上定义并加进 VALID_RULES。
 RULE_NEW_ONLY = "new_only"        # 只下本地媒体库没有的集
 RULE_ALL = "all"                  # 不看本地，没下载过就下（补齐用）
-RULE_FILL_GAP = "fill_gap"        # （旧）补缺
-RULE_COMPLETE_PACK = "complete_pack"   # （旧）等整包
-RULE_MANUAL = "manual"            # （旧）仅通知不下发
 
 VALID_RULES = {
     RULE_NEW_ONLY, RULE_ALL,
-    RULE_FILL_GAP, RULE_COMPLETE_PACK, RULE_MANUAL,
 }
 
 # 合集 / 整包关键词
@@ -84,6 +77,82 @@ def _split_terms(text: str) -> list[str]:
 # 点与空格**同样非法（`CLANNAD .` 会让 mkdir 失败）。番名里带 `?` `:`
 # 的不少（如「Fate/stay night」「Re:从零开始」）。
 _ILLEGAL_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+# 季数表达：第N季 / 第N部分 / 第N期 / SN / Season N / Nth season / Ⅱ Ⅲ Ⅳ…
+#
+# **只用于"系列目录下的子目录名"**（方案 A），不参与任何匹配逻辑 ——
+# 匹配靠 Bangumi 与标题清洗，这里纯粹是给文件找个不重名的落脚点。
+#
+# **顺序有讲究**（`_season_dir_name` 取**第一个**命中的）：越具体的排前面。
+_SEASON_HINTS = [
+    # ① 「第N季/期/部/篇」——最明确，优先
+    r"第\s*[0-9一二三四五六七八九十]+\s*[季期部篇]",
+    r"(?i)\bS(?:eason)?\s*\d+\b",
+    r"(?i)\b\d+(?:st|nd|rd|th)\s+season\b",
+    # 罗马数字（Ⅱ Ⅲ Ⅳ …）
+    r"[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+",
+    # ② 中文「篇章名 + 篇」——**必须排在最后且要求前置字非空**，
+    #    否则会把「第N篇」里的单个"篇"字、以及番名里恰好以"篇"结尾的字
+    #    （如某些作品名）一起吞掉。
+    #    实测案例：'鬼灭之刃 刀匠村篇' → 期望 '刀匠村篇'。
+    #    用 `[^\s]{1,6}篇` 限长，避免把整句都吃进来。
+    r"[^\s]{1,6}篇",
+]
+_SEASON_RES = [re.compile(p) for p in _SEASON_HINTS]
+
+
+def _split_series_season(full_name: str) -> tuple[str, str]:
+    """把条目名切成 `(系列名, 季部分)`；没有季数标记时返回 `("", "")`。
+    """
+    s = (full_name or "").strip()
+    if not s:
+        return "", ""
+    for rx in _SEASON_RES:
+        m = rx.search(s)
+        if not m:
+            continue
+        season = m.group(0).strip()
+        series = (s[:m.start()] + s[m.end():]).strip(" -_/。，,、")
+        # 系列名太短就没有意义（如名字开头就是「第二季」）——
+        # 宁可退回平铺，也不要建一个叫「第」的目录。
+        if len(series.strip()) >= 2:
+            return series.strip(), season
+    return "", ""
+
+
+def _season_dir_name(full_name: str, series: str) -> str:
+    r"""从条目名里摘出"季"的部分，作为系列目录下的子目录名。
+
+
+    **为什么要单独摘一层**（而不是直接拿条目名当子目录）：
+    条目名常常是「系列名 + 季」甚至再拼上外文名（如
+    '青之芦苇 第二季 / Ao Ashi Season -'）。直接用来建目录会得到
+    一长串带斜杠的怪名字；而 `_safe_dir_name` 会把 `/` 换成空格，
+    变成 '青之芦苇 第二季 Ao Ashi Season -' —— 与用户既有的
+    '第二季'、'S2' 风格不一致，也不整洁。
+
+    **摘不到就退回整名**：像「CLANNAD 〜AFTER STORY〜」这种"篇"不叫季，
+    它有自己完整的名字，直接用它反而更清楚。
+
+    **注意剥掉系列名再摘**：`series='Overlord'` 时若整名里同时含
+    'Overlord' 与 'S2'，直接搜 `S\d` 没问题；但某些名字里系列名本身
+    就带数字（如 '86 -不存在的战区-'），先把系列名剥掉能避免误摘。
+    """
+    s = (full_name or "").strip()
+    if not s:
+        return ""
+    rest = s
+    if series and series in rest:
+        rest = rest.replace(series, " ").strip(" -_/")
+    for rx in _SEASON_RES:
+        m = rx.search(rest)
+        if m:
+            seg = m.group(0).strip()
+            # 统一成"第N季"风格（罗马数字/英文季数不做转换 —— 用户的
+            # 目录里 S1/S2 与本名混用很常见，保持原样最不容易认错）
+            return _safe_dir_name(seg) or _safe_dir_name(s)
+    return _safe_dir_name(s)
 
 
 def _safe_dir_name(name: str) -> str:
@@ -136,7 +205,7 @@ class RssMatcher:
           - 界面能单独告诉用户"被规则过滤掉了几条"，而不是混进"跳过"里；
           - `judge` 的语义保持干净（它只回答"要不要下这一集"）。
 
-        规则（用户需求原话："添加必须包含，必须不包含"）：
+        规则：
           must_include —— **全部**命中才算通过（多个词是"且"的关系）。
                           写成"且"而不是"或"：用户填多个词时通常是想要
                           更精确的筛选（如「简日」+「1080p」），
@@ -207,7 +276,7 @@ class RssMatcher:
         #
         # ---- 「下载器」闸门（v13）----
         #
-        # 用户需求（原话）："下载器必须点保存才能启用这个订阅的下载，
+        # "下载器必须点保存才能启用这个订阅的下载，
         # 相当于一个'启用'开关"。没点过保存就只入库为待确认，
         # **不往 qBittorrent 下发** —— 避免用户还没想好过滤规则/保存位置，
         # 刚加完订阅就被下一堆东西（还可能落到默认目录里）。
@@ -224,10 +293,6 @@ class RssMatcher:
         #
         # 移到前面后语义仍然正确：先回答"这集要不要"（闸门/开关/查重），
         # 只是把"由于没启用所以不下"这类**前置原因**优先说清楚。
-        if rule == RULE_MANUAL:
-            return JudgeResult(entry, ep_for_db, True, False,
-                               "规则=manual，仅通知不下发", subj_id, is_pack)
-
         # `assume_enabled`（预览）时跳过下面两个闸门 —— 见 __init__ 说明。
         # 预览必须跳过：用户在**还没保存**时点预览，问的就是"保存后会下
         # 哪些"；若这里照拦，预览会把每条都报成"未配置下载器"，等于没用。
@@ -246,10 +311,6 @@ class RssMatcher:
         #
         # ---- 「全部下载」：完全不做查重 ----
         #
-        # 用户给的定义（原话）："获取订阅源中**所有**，再经过滤器，下载"。
-        # 即：这个规则的语义就是"把订阅源里的内容全拉一份"，**不参考本地
-        # 目录、也不参考下载记录** —— 想重新下、想补一份完整资源时用它。
-        #
         # 这与 `new_only` 的区别是"两个世界"：
         #   new_only —— 两层查重全走（本地已有 / qB 任务名）
         #   all      —— 一层都不走，筛完过滤词就下
@@ -267,27 +328,17 @@ class RssMatcher:
                 return JudgeResult(entry, ep_for_db, False, False, hit,
                                    subj_id, is_pack)
 
-        if rule == RULE_COMPLETE_PACK and not is_pack:
-            # 整包规则下，单集是否下载取决于是否补缺
-            if self._has_gap(subj_id, ep_for_db):
-                return JudgeResult(entry, ep_for_db, True, True,
-                                   "整包规则但存在缺集，下载该单集", subj_id, is_pack)
-            return JudgeResult(entry, ep_for_db, True, False,
-                               "整包规则，等待合集资源", subj_id, is_pack)
-
-        if rule == RULE_FILL_GAP and self._is_already_local(subj_id, ep_for_db):
-            return JudgeResult(entry, ep_for_db, False, False,
-                               "补缺规则：本地已有该集", subj_id, is_pack)
-
-        # 走到这里 = 允许下载。适用 `RULE_ALL`（上面 new_only 的"本地已有"
-        # 分支没命中）以及旧的 fill_gap / complete_pack 的兜底情形。
+        # 走到这里 = 允许下载。
         #
-        # `RULE_ALL` 的语义就是"不看本地媒体库里有没有，只要没下载过就下" ——
-        # 所以它**不需要额外分支**，落到这个默认返回即可。
+        # 两条规则在此汇合：
+        #   `new_only` —— 上面查重的两层都没命中（本地没有、qB 也没有）；
+        #   `RULE_ALL` —— 本来就**不走查重**（它的语义就是"不参考本地，
+        #                 把订阅源里的内容全拉一份"），直接落到这里。
+        # 所以这里**不需要按规则分支**，一个默认返回同时服务两者。
         reason = "整包资源命中" if is_pack else "判定为新集"
         return JudgeResult(entry, ep_for_db, True, True, reason, subj_id, is_pack)
 
-    # ---------- 三层查重 ----------
+    # ---------- 两层查重 ----------
     def _dedup(
         self,
         entry: FeedEntry,
@@ -334,65 +385,132 @@ class RssMatcher:
         return ""
 
     # ---------- 保存路径（下载到指定条目的目录）----------
-    def resolve_save_path(self, source: RssSource) -> str:
-        """算出这次下载该用哪个保存路径；空串 = 不干预（用 qB 全局设置）。
+    def plan_save_path(self, source: RssSource) -> tuple[str, str, bool]:
+        """**纯推算**这次下载用哪个目录，**不创建任何东西**。
 
-        用户需求："选择条目，就在媒体库目录下搜寻或新建目录，把动漫放入其中"，
-        并明确"**使用对应的深层目录**"（即 `subjects.folder_path` 原样用，
-        不再往上找番名那一层）。
+        返回 `(路径, 说明文案, 目录是否已存在)`：
+          - 两个字符串都为空 = 交回 qBittorrent 的全局设置；
+          - 说明文案直接给界面显示（"「xx」的目录：\nF:\\…"），
+            **由这里算而不是 QML 拼**，否则界面与真正落盘的目录
+            会变成两套逻辑，迟早对不上（用户看到 A、文件却进了 B）。
 
-        处理顺序：
-          ① 规则里指定了 `save_subject_id` → 取该条目的 `folder_path`；
-          ② 该条目没记路径（如"从订阅源新建"出来的本地条目）→ 用
-             **媒体库根目录 + 条目名** 拼一个，并**创建它**；
-          ③ 规则没指定 → 退回订阅绑定的条目（`local_subject_id`）同理；
-          ④ 都没有 → 返回空串（交给 qBittorrent 自己的设置）。
-
-        **为什么在这里创建目录**：qBittorrent 收到不存在的 `save_path`
-        时行为不一致（有的版本自动建、有的直接把文件丢到默认目录），
-        与其赌版本，不如我们建好再给 —— 创建失败则返回空串（退回默认），
-        并在日志说明，不让"建目录失败"演变成"下载到莫名其妙的地方"。
         """
         sid = int(getattr(source, "save_subject_id", 0)
                   or source.local_subject_id or 0)
         if not sid:
-            return ""
+            return "", "", False
         subj = self.db.get_subject(sid)
         if subj is None:
-            log.warning("订阅 #%s 指定的保存条目 %s 不存在，用默认保存路径",
-                        source.id, sid)
-            return ""
+            # 条目不存在（如它被删了，而订阅还记着这个 id）。
+            # **不在这里打 warning**：本方法会被界面的预览频繁调用，
+            # 每次刷新都刷一行日志没有意义；真正下发时的告警
+            # 留在 resolve_save_path（那里才是"出问题"的地方）。
+            return "", "", False
+
+        label = subj.name_cn or subj.name or ""
 
         raw = (subj.folder_path or "").strip()
         if raw:
-            # **已记路径：只做存在性兜底，不强制创建** —— 这个目录是当初
-            # 扫描时真实存在的，现在不在多半是用户自己移动/改名了，
-            # 贸然创建一个同名空目录反而会把资源下到错地方。
             p = Path(raw)
             if p.is_dir():
-                return str(p)
-            log.warning("订阅 #%s 的保存目录不存在（%s），用默认保存路径",
-                        source.id, raw)
-            return ""
+                return str(p), "「%s」的目录：\n%s" % (label, p), True
+            # 已记路径但目录不在了（用户移动/改名）：不猜、不建
+            return "", "", False
 
-        # 没有路径（订阅源新建的条目）：媒体库根 + 条目名
+        # ---- 没有路径（订阅源新建的条目）→ 按「系列」归位----
         roots = self._library_roots()
         if not roots:
-            log.warning("订阅 #%s 的条目没有目录，且媒体库未配置，用默认保存路径",
+            return "", "", False
+        root = roots[0]
+        full_name = _safe_dir_name(subj.name_cn or subj.name or "")
+        if not full_name:
+            return "", "", False
+
+        # 系列名优先用**扫描得来**的（那是磁盘上的真实结构，比从名字猜准）；
+        # 扫描没有（"从订阅源新建"、从未扫描过的条目）就**从条目名推断**。
+        series = _safe_dir_name(getattr(subj, "series_name", "") or "")
+        season = ""
+        if not series:
+            guess_series, guess_season = _split_series_season(full_name)
+            series = _safe_dir_name(guess_series)
+            season = guess_season
+
+        if series:
+            if not season:
+                season = _season_dir_name(full_name, series)
+            target = root / series / _safe_dir_name(season)
+        else:
+            # 真的推不出系列（名字里没有季数标记，如「CLANNAD」）→
+            # 平铺。此时它本身就是一整部作品，不该硬套一层。
+            target = root / full_name
+        exists = target.is_dir()
+        note = ("「%s」的目录：\n%s" % (label, target))
+        return str(target), note, exists
+
+    def resolve_save_path(self, source: RssSource) -> str:
+        """算出这次下载该用哪个保存路径；空串 = 不干预（用 qB 全局设置）。
+
+        **推算交给 `plan_save_path`**（那里是纯计算，界面预览也用同一份
+        逻辑），这里只负责**把目录建出来** —— 真正的下发需要目录存在。
+
+        **推算规则全在 `plan_save_path`**（含"按系列归位"的方案 、
+        以及"已有 folder_path 就原样用、不擅自改"的取舍），
+        本方法只额外做一件事：**目录不存在就建出来**。
+
+        **为什么要建**：qBittorrent 收到不存在的 `save_path` 时行为不一致
+        （有的版本自动建、有的直接把文件丢到默认目录），与其赌版本，
+        不如我们建好再给 —— 创建失败则返回空串（退回默认），
+        并在日志说明，不让"建目录失败"演变成"下载到莫名其妙的地方"。
+        """
+        path, note, exists = self.plan_save_path(source)
+        if not path:
+            # 推算不出：说清是"哪个原因"掉进默认路径的，便于排查
+            log.warning("订阅 #%s 算不出保存路径，用 qBittorrent 默认设置",
                         source.id)
             return ""
-        name = _safe_dir_name(subj.name_cn or subj.name or "")
-        if not name:
-            log.warning("订阅 #%s 的条目没有可用名称，用默认保存路径", source.id)
-            return ""
-        target = roots[0] / name
+        if exists:
+            return path
+
+        # 目录还不存在（订阅源新建的条目）→ 建出来。
+        #
+        # **已记路径且真实存在**的情况在 plan_save_path 里就返回了、
+        # 不会走到这里 —— 那种目录是用户磁盘上真实的结构，不该动它。
         try:
-            target.mkdir(parents=True, exist_ok=True)
-            log.info("已为《%s》创建下载目录：%s", name, target)
+            Path(path).mkdir(parents=True, exist_ok=True)
+            log.info("已创建下载目录：%s", path)
         except OSError as e:
-            log.warning("创建下载目录失败（%s）：%s，用默认保存路径", target, e)
+            log.warning("创建下载目录失败（%s）：%s，用默认保存路径", path, e)
             return ""
-        return str(target)
+
+        # ---- 把算出的目录**写回条目**（关键，见下方说明）----
+        #
+        # **为什么必须写回**：`startSubject`（详情页「重新扫描该条目」）
+        # 的入口判据就是 `subjects.folder_path` ——
+        #     folder = (subj.folder_path or "").strip()
+        #     if not folder: self.failed.emit("该条目没有记录目录路径，无法重新扫描")
+        # 而"从订阅源新建"的条目 `folder_path` 是空的，于是形成死循环：
+        #     没有 folder_path → 算出的目录只用于这次下载、不落库
+        #     → 用户下载完想扫一遍看看集数 → 「重新扫描」直接报错
+        #     → 条目永远没有集数（详情页一直显示"没有集数"），
+        #        `total_eps` 也一直是 0（连"是否看完"都判不了）。
+        #
+        # 写回之后这条链路就闭合了：下载 → 目录落库 → 可重新扫描 →
+        # 拿到集数与标题。
+        #
+        # **只在"原来没有路径"时写**（本方法走到这里必然如此，
+        # 因为已有路径的分支在上面 `exists` 就 return 了）——
+        # 不会覆盖用户磁盘上既有的真实结构。
+        #
+        # 失败只记日志：写不进去不该让整次下载失败（文件照样下到 path）。
+        try:
+            sid = int(getattr(source, "save_subject_id", 0)
+                      or source.local_subject_id or 0)
+            if sid:
+                self.db.update_rss_subject_folder(sid, path)
+                log.info("已把下载目录记入条目 #%s：%s", sid, path)
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("写回条目目录失败（不影响本次下载）：%s", e)
+        return path
 
     def _library_roots(self) -> list[Path]:
         """配置里的媒体库根目录（可能有多个，取第一个已有的）。"""
@@ -413,15 +531,24 @@ class RssMatcher:
             return False
         return ep_index in self.db.list_local_ep_indices(subject_id)
 
-    def _has_gap(self, subject_id: Optional[int], ep_index: float) -> bool:
-        """是否存在缺集（本地没有该集即算缺）。"""
-        return not self._is_already_local(subject_id, ep_index)
-
     # ---------- 辅助 ----------
     def _resolve_rule(self, source: RssSource) -> str:
-        rule = (source.rule or "").strip() or self.config.get("rss", "rule", RULE_NEW_ONLY)
+        """取该订阅的下载规则；未知值回退 `new_only`。
+
+        **不再有"全局默认规则"**（原 `config.get("rss", "rule")`）：设置页
+        那排规则按钮已删，规则完全由**每个订阅自己**持有（`rss_sources.rule`，
+        添加/编辑订阅时在表单里选）。旧配置里的 `rss.rule` 一并弃用，
+        避免出现"界面上没有、行为却跟着它走"的隐性来源。
+
+        回退仍然保留：`source.rule` 为空（极老的数据）或存着已废弃的
+        `fill_gap` / `complete_pack` / `manual` 时，照常当作 `new_only`，
+        不让整轮轮询因为一个无法识别的字符串而中断。
+        """
+        rule = (source.rule or "").strip()
         if rule not in VALID_RULES:
-            log.warning("未知下载规则 %s，回退 new_only", rule)
+            if rule:
+                log.warning("订阅 #%s 的规则 %r 无效（已废弃或为空），回退 new_only",
+                            source.id, rule)
             return RULE_NEW_ONLY
         return rule
 

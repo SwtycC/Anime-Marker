@@ -45,7 +45,7 @@ ALLOWED_KEYS = {
     "qbittorrent.password", "qbittorrent.category", "qbittorrent.save_path",
     "qbittorrent.webui_url", "qbittorrent.exe_path", "qbittorrent.auto_start",
     # RSS
-    "rss.poll_interval", "rss.rule", "rss.auto_download", "rss.poll_on_start",
+    "rss.poll_interval", "rss.auto_download", "rss.poll_on_start",
     # 界面
     "ui.theme_mode", "ui.accent_color", "ui.poster_width",
 }
@@ -84,7 +84,6 @@ FALLBACKS: dict[str, str] = {
     "qbittorrent.exe_path": "",
     "qbittorrent.auto_start": "false",
     "rss.poll_interval": "30",
-    "rss.rule": "new_only",
     "rss.auto_download": "false",
     "rss.poll_on_start": "true",
     "ui.theme_mode": "light",

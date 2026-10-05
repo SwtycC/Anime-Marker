@@ -44,6 +44,17 @@ Window {
     /// 当前选中的条目 id（0 = 不指定，用 qBittorrent 全局路径）
     property int selectedId: 0
 
+    /// 保存路径预览（后端算好：{path, note, exists}）。
+    ///
+    /// **由后端算**（`rss.savePathPreview`）—— 路径规则全在
+    /// `RssMatcher.plan_save_path`，QML 复刻一遍会有两套规则。
+    /// 依赖 `selectedId`：用户在列表里改选条目时自动重算。
+    readonly property var savePathInfo: {
+        if (typeof rss === "undefined" || !rss || dlg.selectedId === 0)
+            return null
+        return rss.savePathPreview(dlg.sourceId, dlg.selectedId)
+    }
+
     /// 是否正在重新扫描（来自全局 scanner 桥接）。
     /// 只读绑定，用于禁用按钮 / 显示转圈。
     readonly property bool scanRunning: typeof scanner !== "undefined"
@@ -290,17 +301,30 @@ Window {
                 }
             }
 
+            // 保存位置说明：**目录由后端算好**（rss.savePathPreview），
+            // QML 只负责显示。
+            //
+            // **为什么不在这里拼字符串**（实测需求："可以在这段文字的
+            // 下一行写清楚目录在哪，像其他已存在条目一样"）：以前"没有
+            // folder_path"的条目只说一句"媒体库根目录下新建「xx」"，
+            // 用户看不到**具体路径**，也就不知道会不会和别的季分家。
+            // 但路径规则（按系列归位、季子目录名、媒体库根）全在后端
+            // `plan_save_path` 里 —— 在 QML 复刻一遍就会有两套规则，
+            // 迟早出现"界面显示 F:\A、文件却下到 F:\B"。
+            // 所以统一走后端：它算出 path + 现成文案，这里照抄即可。
             Text {
                 width: parent.width
                 text: {
                     if (dlg.selectedId === 0)
                         return "未指定 —— 使用 qBittorrent 自己的保存路径"
-                    var s = dlg.selectedSubject()
-                    var f = dlg.folderOf(s)
-                    if (f !== "")
-                        return "「" + ((s && s.title) || "") + "」的目录：\n" + f
-                    return "媒体库根目录下新建「" + ((s && s.title) || "该条目")
-                           + "」（目录不存在，下发时自动创建）"
+                    var info = dlg.savePathInfo
+                    var note = info && info.note ? info.note : ""
+                    if (note === "")
+                        // 后端算不出（条目被删 / 媒体库未配置）
+                        return "无法确定保存目录，将使用 qBittorrent 自己的路径"
+                    return info.exists
+                           ? note
+                           : note + "\n（目录不存在，下发时自动创建）"
                 }
                 color: Theme.textSecondary
                 font.pixelSize: Theme.fontXs

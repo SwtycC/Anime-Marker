@@ -264,9 +264,37 @@ Item {
                                     }
                                 }
 
-                                Item { width: 1; height: 1; Layout.fillWidth: true }
+                                // ---- 弹簧：把「启用」推到最右侧 ----
+                                //
+                                // **踩坑（实测："可以水平往右移，移动到最右侧
+                                // 吗"）**：这里原来是
+                                //     Item { width: 1; height: 1; Layout.fillWidth: true }
+                                // —— 那是从 **RowLayout** 里抄来的写法，而本行是
+                                // **`Row`**。`Layout.fillWidth` 属于 QtQuick.Layouts
+                                // 的附加属性，**在 Row 里完全无效**（Row 不认
+                                // Layout 属性，只会用子项的 width）。
+                                // 于是这个 Item 永远只有 1px 宽，"启用"就紧贴在
+                                // 绑定标签屁股后面，看着偏左。
+                                //
+                                // Row 里做弹簧要用**显式宽度**：占满"前面已用的
+                                // 宽度"之外的全部空间。用 `parent.width` 减去
+                                // 之前所有子项的隐式宽度与间距（`children[0]` 是
+                                // 名称 Text，但它的 width 被 `Math.min(...)` 限制过，
+                                // 直接取它的实际 width 才对）。
+                                // 采用 `x + width` 的实时算法最容易跟住布局：
+                                // 弹簧 Item 放在倒数第二，它的 x 就是前面内容的
+                                // 右边缘，因此 width = 父宽 − x − 右侧开关宽度 − 间距。
+                                Item {
+                                    id: spring
+                                    height: 1
+                                    width: Math.max(0,
+                                                    parent.width - x
+                                                    - enableBox.width
+                                                    - Theme.spacingSm)
+                                }
 
                                 CheckBoxLine {
+                                    id: enableBox
                                     anchors.verticalCenter: parent.verticalCenter
                                     text: "启用"
                                     checked: modelData.enabled
@@ -612,6 +640,20 @@ Item {
         padding: Theme.spacingLg
         title: "绑定本地条目"
 
+        /// 把推断出的名称写进「新建条目」输入框。
+        ///
+        /// **为什么要绕这一层**（踩坑，实测"小窗获取依旧没有生效"）：
+        /// `newSubjectField` 声明在下面 `contentItem` 的 Column 内部，
+        /// 那个 id **对文件根作用域不可见** —— 直接在末尾的
+        /// `Connections.onTitleSuggested` 里写 `newSubjectField.text = name`
+        /// 会**静默失效**（不报错、不生效；实测 emit 后 text 仍为空）。
+        /// 而 `bindDialog` 这个 id 在根作用域可见，所以在它上面暴露一个
+        /// 方法，外层通过 `bindDialog.setName(name)` 调用即可 ——
+        /// 方法体在 Dialog 内部求值，那里能看到 `newSubjectField`。
+        function setName(value) {
+            newSubjectField.text = value || ""
+        }
+
         background: Rectangle {
             color: Theme.surfaceBg
             border.width: Theme.lineThin
@@ -770,9 +812,20 @@ Item {
                     onClicked: {
                         if (typeof rss === "undefined" || !rss)
                             return
+                        // **不要写 `root.matchBox`**（实测报错，见下方日志）：
+                        // `matchBox` 是本组件作用域里的一个 id，而 `root`
+                        // （SubscriptionPage）上**没有**这个属性 ——
+                        // `root.matchBox` 求值为 undefined，再取 `.checked`
+                        // 就抛：
+                        //     TypeError: Cannot read property 'checked' of undefined
+                        // 该异常发生在 onClicked 内，会**中断整个处理函数** ——
+                        // `createSubjectFromSource` 根本没被调用、弹窗也没关，
+                        // 表现就是"点了「新建并绑定」完全没反应"。
+                        // QML 的 id 在**同一组件内**（含嵌套子项）直接可见，
+                        // 去掉前缀即可。
                         rss.createSubjectFromSource(
                             root.bindingId, newSubjectField.text.trim(),
-                            root.matchBox.checked)
+                            matchBox.checked)
                         bindDialog.close()
                     }
                 }
@@ -936,13 +989,38 @@ Item {
         function onFailed(msg) { root.statusMessage(msg) }
         // 推断出的番名 → 自动填入「名称」框。
         //
-        // **两个表单都要填**：表单已抽成 SubscriptionForm 且**新增/编辑
-        // 各一个实例**（都调用同一个 suggestSubjectName）。这里不知道是
-        // 哪一个发起的，所以两个都写 —— 反正同一时刻只有一个可见，
-        // 写另一个没有副作用（下次打开会被 setValues 重置）。
+        // **三个地方都要填**（踩坑，实测反馈"获取到的名称可以直接填在
+        // 框里"）：`suggestSubjectName` 有**三个**调用方 ——
+        //   ① 添加订阅表单的「获取」  → addForm
+        //   ② 编辑订阅表单的「获取」  → editForm
+        //   ③ 绑定弹窗里的「获取」    → newSubjectField
+        // 信号本身不带"是谁发起的"，所以这里**全部写一遍**：同一时刻
+        // 只有一处可见，写另外两处没有副作用（表单下次打开会被
+        // `setValues` 重置；`newSubjectField` 也在打开绑定弹窗时清空）。
+        //
+        // 早期这里只写了前两个，于是③那条路径抓到了名字（状态栏也提示
+        // "已获取名称：…"）却**填不进输入框** —— 用户以为"获取"没生效。
+        //
+        // ---- 逐个 try，绝不让一个失败拖垮后面的 ----
+        //
+        // **致命踩坑（实测"小窗获取依旧没有生效"）**：`editForm` 声明在
+        // 下面 `Repeater` 的 **delegate 内部**（每个订阅卡片各一份）。这意味着：
+        //   ① 它在 delegate 作用域里 —— 根作用域的 Connections 访问不到；
+        //   ② **一个订阅都没有时，delegate 根本不会被创建**，`editForm`
+        //      就是 `undefined`。
+        // 于是 `editForm.setNameOnly(name)` 抛 `TypeError`，**中断整个
+        // handler** —— 排在它后面的 `bindDialog.setName()` 永远执行不到。
+        // 现象正是用户报的："小窗获取依旧没有生效"（状态栏却正常显示
+        // "已获取名称"，因为那是另一个信号 onMessage 干的）。
+        //
+        // 修法：**每个目标各自 try 包裹**。填不上某一个不影响其余，
+        // 语义上也确实如此 —— 三个目标互不依赖，一个不存在不该拖垮全部。
         function onTitleSuggested(sourceId, name) {
-            addForm.setNameOnly(name)
-            editForm.setNameOnly(name)
+            try { addForm.setNameOnly(name) } catch (e) { /* 表单还没建 */ }
+            try { editForm.setNameOnly(name) } catch (e) { /* delegate 未创建 */ }
+            // 必须走 bindDialog.setName()，不能直接写 `newSubjectField.text`
+            // —— 那个 id 对根作用域不可见（见 bindDialog 里的说明）。
+            try { bindDialog.setName(name) } catch (e) { /* 同上 */ }
         }
     }
 

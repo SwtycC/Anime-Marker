@@ -155,6 +155,14 @@ class QmlApp:
         # 轮询结果交给桥接层，由它转成 QML 能读的属性（见 RssBridge）
         self.rss_service.progress.connect(self.rss_bridge.setProgress)
         self.rss_service.poll_finished.connect(self.rss_bridge.onPollFinished)
+        # 「从订阅源新建条目」完成 → 刷新媒体库缓存。
+        #
+        # **为什么必须连**（实测"新建完条目后下载器无法马上识别"）：
+        # `LibraryBridge.subjects` 是带 `_dirty` 的缓存，新建条目只写了
+        # 数据库，不置脏的话「下载器」弹窗读到的还是旧列表 —— 刚建的条目
+        # 搜不到，用户只能选错条目或选不上，`save_subject_id` 随之失效。
+        self.rss_bridge.subjectCreated.connect(
+            lambda sid, name: self.library_bridge.reload())
         # 桥接层的「立即检查」→ 服务层轮询
         self.rss_bridge.pollRequested.connect(self._on_poll_requested)
         # 桥接层的「下发」→ 服务层推送

@@ -725,6 +725,25 @@ class Database:
                 (cover_path, _now(), subject_id),
             )
 
+    def update_rss_subject_folder(self, subject_id: int, folder_path: str) -> None:
+        """把 RSS 下载时算出的目录**补记到条目上**（`folder_path`）。
+
+        **为什么需要**（实测：详情页「重新扫描」报"该条目没有记录目录路径"）：
+        "从订阅源新建"的条目 `folder_path` 是空的（它不指向任何已存在的
+        目录），而 `ScannerBridge.startSubject` 的入口判据正是这个字段 ——
+        不补记的话，用户下载完想扫一遍看看集数，会被直接拒绝，
+        形成"永远没有集数、`total_eps` 恒为 0"的死循环。
+
+        **只更新 folder_path**，不碰其它字段：调用方是下载链路，它只
+        知道"这次把文件放哪了"，无权改名字/匹配状态/集数等。
+        `updated_at` 一并刷新（与其它 setter 一致）。
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE subjects SET folder_path=?, updated_at=? WHERE id=?",
+                (str(folder_path), _now(), int(subject_id)),
+            )
+
     def set_subject_ep_align(self, subject_id: int, by_order: bool) -> None:
         """标记该条目的集数是按号还是按顺序与官方对应的（详情页警示用）。
 

@@ -277,8 +277,8 @@ Item {
         v["qbittorrent.exe_path"] = qbExeField.text.trim()
         v["qbittorrent.auto_start"] = qbAutoStartBox.checked
         // RSS
+        v["rss.poll_on_start"] = rssPollOnStartBox.checked
         v["rss.poll_interval"] = rssPollField.value
-        v["rss.rule"] = rssRuleSeg.currentValue
         v["rss.auto_download"] = rssAutoBox.checked
         return v
     }
@@ -1258,6 +1258,30 @@ Item {
                     hint: "定时抓取订阅源，按规则判定是否下发下载"
                 }
 
+                // 「启动时检查 / 自动轮询」开关（实测要求："把这个做成开关
+                // 吧，放在轮询间隔上面。这个开关关了，则轮询间隔置灰"）。
+                //
+                // 它同时管两件事（原 `rss.poll_on_start` 只管第一件）：
+                //   ① 程序启动后**立刻**检查一次；
+                //   ② 之后按「轮询间隔」**周期性自动检查**。
+                // 关掉 = 完全不动手，只在你点「立即检查」时才抓一次 ——
+                // 这才符合"关了自动轮询"的直觉。若只关 ① 而保留 ②，
+                // 用户会看到"启动时没查，过 30 分钟却自己下了一堆"，
+                // 与"我把它关了"的预期相反。
+                FormRow {
+                    width: parent.width
+                    label: "自动轮询"
+                    hint: "开启后：程序启动时立即检查一次，之后每隔「轮询间隔」自动检查。\n\n"
+                          + "关闭后：完全不自动检查，只在你点「立即检查」时抓取一次（订阅页右上角）。\n\n"
+                          + "注意：关掉它并不会停止 qBittorrent 里已经在下载的任务。"
+                    CheckBoxLine {
+                        id: rssPollOnStartBox
+                        objectName: "rssPollOnStartBox"
+                        checked: root.getBool("rss.poll_on_start", true)
+                        text: "启动时检查并定时轮询"
+                    }
+                }
+
                 FormRow {
                     width: parent.width
                     label: "轮询间隔"
@@ -1270,25 +1294,24 @@ Item {
                         step: 5
                         suffix: "分钟"
                         width: 180
+                        // **联动置灰**（实测要求）：自动轮询关掉时，间隔
+                        // 这个值就没有意义了 —— 留在可编辑状态会让用户
+                        // 改了却发现没反应（"是不是坏了"）。
+                        // 值仍然会随 collect() 一起保存，重新打开开关后
+                        // 原来设的分钟数还在，不用重设。
+                        enabled: rssPollOnStartBox.checked
                     }
                 }
 
-                FormRow {
-                    width: parent.width
-                    label: "默认下载规则"
-                    SegmentedControl {
-                        id: rssRuleSeg
-                        objectName: "rssRuleSeg"
-                        currentValue: root.getValue("rss.rule", "new_only")
-                        options: [
-                            { "label": "只下新集", "value": "new_only" },
-                            { "label": "补缺集",   "value": "fill_gap" },
-                            { "label": "完结整包", "value": "complete_pack" },
-                            { "label": "仅通知",   "value": "manual" }
-                        ]
-                    }
-                }
-
+                // 「默认下载规则」整行已移除（实测："三个按钮全部移除吧，
+                // 不需要后端定义，配置里也移除"）。
+                //
+                // 下载规则改为**完全由每个订阅自己决定** —— 添加/编辑订阅
+                // 的表单里有「判新规则」（只下新集 / 全部下载）。这里再放
+                // 一个"全局默认"只会造成两处规则打架：
+                // 用户改了全局默认，却发现已有订阅的行为没变（它们用各自的值），
+                // 而新建订阅又会被这个默认值影响 —— 一个改不到点子上的开关。
+                // 对应地 `config.rss.rule` 与后端定义一并删除。
                 FormRow {
                     width: parent.width
                     label: "自动下载"

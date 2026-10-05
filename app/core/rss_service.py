@@ -313,26 +313,55 @@ class RssService(QObject):
         self._timer.timeout.connect(lambda: self.poll())
 
     def start(self) -> None:
+        """按配置启动定时轮询（设置页「自动轮询」开关控制）。
+
+        **开关同时管"启动时查一次"与"之后定时查"**（实测要求把这个做成
+        开关）。原先它对应 `poll_on_start`，只管前者：关掉后启动时安静了，
+        但 30 分钟后定时器照常触发 —— 用户看到"我明明关了自动，它自己
+        下起来了"，与预期相反。所以这里把定时器的启动也纳入同一个开关。
+
+        关闭时不启动定时器，只在你点「立即检查」时抓一次（`poll()` 不受
+        本开关影响，那是手动动作）。
+        """
+        enabled = self.config.getbool("rss", "poll_on_start", True)
         minutes = max(1, self.config.getint("rss", "poll_interval", 30))
+        if not enabled:
+            self._timer.stop()
+            log.info("自动轮询已关闭（仅手动「立即检查」会抓取）")
+            return
         self._timer.setInterval(minutes * 60 * 1000)
         self._timer.start()
         log.info("RSS 轮询已启动，间隔 %s 分钟", minutes)
-        if self.config.getbool("rss", "poll_on_start", True):
-            self.poll()
+        self.poll()
 
     def set_qb(self, qb: Optional[QbClient]) -> None:
         """替换 qBittorrent 客户端（设置页改完地址/密码后由 QmlApp 调用）。"""
         self.qb = qb
 
     def apply_config(self) -> None:
-        """设置保存后重新下发轮询间隔（同 ProgressMonitor.apply_config 的坑）。
+        """设置保存后重新下发轮询间隔与开关（同 ProgressMonitor.apply_config 的坑）。
 
-        `_timer.setInterval` 对**运行中**的 QTimer 同样有效，无需重启定时器，
-        所以用户改完「检查间隔」立刻生效。
+        **三件事都要重算**，不能只改间隔：
+          ① 开关**打开** → 起定时器（若之前是关的，必须重新 start，
+             否则用户"打开开关"后要重启程序才生效）；
+          ② 开关**关闭** → 停定时器（否则它还在后台悄悄轮询）；
+          ③ 开关开着 → 顺带更新间隔。
+
+        `_timer.setInterval` 对**运行中**的 QTimer 同样有效，无需重启定时器。
         """
+        enabled = self.config.getbool("rss", "poll_on_start", True)
         minutes = max(1, self.config.getint("rss", "poll_interval", 30))
+        if not enabled:
+            if self._timer.isActive():
+                self._timer.stop()
+            log.info("自动轮询已关闭（立即生效）")
+            return
         self._timer.setInterval(minutes * 60 * 1000)
-        log.info("RSS 轮询间隔已更新为 %s 分钟", minutes)
+        if not self._timer.isActive():
+            self._timer.start()
+            log.info("自动轮询已开启（立即生效），间隔 %s 分钟", minutes)
+        else:
+            log.info("RSS 轮询间隔已更新为 %s 分钟", minutes)
 
     def stop(self) -> None:
         """停掉定时器，并**等待所有在跑的轮询线程结束**（退出时调用）。
@@ -387,26 +416,26 @@ class RssService(QObject):
         """触发一次轮询（异步）。
 
         **生命周期：`start()` 时进 `_live_workers`，线程真正结束时移除。**
-
-        踩坑记录（三轮才修对，值得留着）：
-
-        ① 初版 `self._worker = PollWorker(...)` 裸赋值。上一次还在跑时
-           被覆盖 → 旧对象被 GC，而线程还在跑 → Qt 报
-           `QThread: Destroyed while thread '' is still running`。
-        ② 于是加了"覆盖前给旧对象挂 `deleteLater`"——**这反而更糟**：
-           对象销毁后 `self._worker` 仍指向它，下一次 `is_running()`
-           访问已销毁的 C++ 对象，抛 `RuntimeError: Internal C++ object
-           (PollWorker) already deleted`，表现为「立即检查」点了完全
-           没反应、日志刷满堆栈（实测反馈）。
-        ③ 改成"在 QThread `finished` 里置 None + deleteLater"，那个
-           RuntimeError 没了，但**退出时**又出现 `Destroyed while
-           thread is still running` —— 因为 `finished` 早于对象真正
-           销毁，置 None 之后 `stop()` 就**找不到它去 wait** 了
-           （实测反馈）。所以才有 `_live_workers` 这个集合。
-
-        不用同步 `wait()`：poll 从 UI 线程调用，`wait()` 会把界面卡住到
-        整轮轮询结束（几秒到几十秒）。等待只发生在 `stop()`（退出时）。
         """
+        # 踩坑记录（三轮才修对，值得留着）：
+
+        # ① 初版 `self._worker = PollWorker(...)` 裸赋值。上一次还在跑时
+        #    被覆盖 → 旧对象被 GC，而线程还在跑 → Qt 报
+        #    `QThread: Destroyed while thread '' is still running`。
+        # ② 于是加了"覆盖前给旧对象挂 `deleteLater`"——**这反而更糟**：
+        #    对象销毁后 `self._worker` 仍指向它，下一次 `is_running()`
+        #    访问已销毁的 C++ 对象，抛 `RuntimeError: Internal C++ object
+        #    (PollWorker) already deleted`，表现为「立即检查」点了完全
+        #    没反应、日志刷满堆栈（实测反馈）。
+        # ③ 改成"在 QThread `finished` 里置 None + deleteLater"，那个
+        #    RuntimeError 没了，但**退出时**又出现 `Destroyed while
+        #    thread is still running` —— 因为 `finished` 早于对象真正
+        #    销毁，置 None 之后 `stop()` 就**找不到它去 wait** 了
+        #    （实测反馈）。所以才有 `_live_workers` 这个集合。
+
+        # 不用同步 `wait()`：poll 从 UI 线程调用，`wait()` 会把界面卡住到
+        # 整轮轮询结束（几秒到几十秒）。等待只发生在 `stop()`（退出时）。
+        
         if self.is_running():
             log.info("上一次轮询尚未结束，跳过本次触发")
             return
@@ -485,11 +514,6 @@ def _now_iso() -> str:
 def _explain_qb_error(exc: Exception, magnet: str = "",
                       torrent_url: str = "") -> str:
     """把 qBittorrent 的异常翻译成**能照着做**的一句话。
-
-    **为什么需要**（实测反馈"下载失败了，可以增加日志判断为什么失败吗"）：
-    `qbittorrentapi` 抛出的原始异常对用户毫无意义（如
-    `LoginFailed` / `ConnectionError` / `Forbidden`），而界面只有一列
-    「失败」。用户看到 10 条失败却不知道从哪下手。
 
     按症状分类（与 `bangumi_api.describe_connection_error` 同一套思路）：
     连接类 / 认证类 / 种子链接类 / 其余原样返回。

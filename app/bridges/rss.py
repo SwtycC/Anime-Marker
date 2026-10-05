@@ -17,6 +17,7 @@ RSS 解析器（feedparser 或 xml.etree）配合，且需要「三层判新」�
 
 from __future__ import annotations
 
+import copy
 import logging
 import re
 from typing import Optional
@@ -31,6 +32,23 @@ from app.core.rss_matcher import RssMatcher
 from app.utils.title_parser import clean_anime_title
 
 log = logging.getLogger(__name__)
+
+
+def _with_save_subject(src: RssSource, subject_id: int) -> RssSource:
+    """返回一个「把保存条目换成 subject_id」的**副本**（不落库）。
+
+    用于「下载器」弹窗的路径预览：用户在下拉里改选了条目、还没点保存，
+    界面就要显示那个条目的路径。直接改原对象会把没保存的选择写进内存
+    里的订阅，之后 `reload()` 又拿数据库覆盖 —— 状态会漂移。
+    复制一份既拿到结果，又不影响任何真实状态。
+    """
+    try:
+        clone = copy.copy(src)
+        clone.save_subject_id = int(subject_id)
+        return clone
+    except Exception:               # pragma: no cover - dataclass 不可写时
+        return src
+
 
 # 判新规则（决定"哪些集才下载"）
 #
@@ -495,6 +513,13 @@ class RssBridge(QObject):
     message = Signal(str)
     #: 推断出订阅源的动漫名（参数：来源 id, 名字）—— 界面据此预填输入框
     titleSuggested = Signal(int, str)
+    #: 「从订阅源新建条目」完成（参数：新条目本地 id, 名称）。
+    #:
+    #: 为什么需要（实测"新建完条目后下载器无法马上识别"）：媒体库桥接的
+    #: `subjects` 是缓存，新建后必须让 QML 侧知道"条目变了" —— 既要刷新
+    #: 下载器弹窗的保存位置列表，也要让订阅卡片上的绑定标签立刻出现。
+    #: QmlApp 接到后调用 `library_bridge.reload()`（跨桥连线在 qml_app）。
+    subjectCreated = Signal(int, str)
     #: 界面请求「立即检查」（QmlApp 接到后转给 RssService.poll()）。
     #:
     #: 参数 `source_id`：0 = 检查**全部**启用订阅（「立即检查」按钮）；
@@ -1216,6 +1241,37 @@ class RssBridge(QObject):
         self._downloads_dirty = True
         self.downloadsChanged.emit()
 
+    @Slot(int, int, result="QVariantMap")
+    def savePathPreview(self, source_id: int, subject_id: int) -> dict:
+        """给「下载器」弹窗用：**算一遍"会下到哪"**，但不创建任何目录。
+
+        返回 `{"path": 完整路径, "note": 界面显示的两行文案, "exists": 是否存在}`；
+        `path` 为空表示"不干预，用 qBittorrent 自己的保存路径"。
+
+        **为什么由后端算而不是 QML 拼**（实测需求："在这段文字的下一行
+        写清楚目录在哪"）：QML 若自己拼一遍，就出现了**第二套路径规则** ——
+        界面显示 `F:\动漫\青之芦苇\第二季`、文件却可能因为后端规则稍有
+        不同而落到别处。用户最不能接受的就是"看到的和实际的不一致"。
+        所以复用一个 `RssMatcher.plan_save_path`（纯推算、无副作用）。
+
+        `subject_id` 传 0 时用订阅自己绑定的条目（与真正下发时的口径一致）。
+        """
+        try:
+            src = next((s for s in self._db.list_rss_sources()
+                        if s.id == int(source_id)), None)
+            if src is None:
+                return {"path": "", "note": "", "exists": False}
+            if subject_id > 0:
+                # 用户在弹窗里改选了别的条目 → 临时用它算（不落库）
+                src = _with_save_subject(src, int(subject_id))
+            matcher = RssMatcher(self._db, None, self._config)
+            path, note, exists = matcher.plan_save_path(src)
+            return {"path": path, "note": note, "exists": bool(exists)}
+        except Exception as e:          # pragma: no cover - 防御性
+            log.exception("推算保存路径失败 source=%s subject=%s: %s",
+                          source_id, subject_id, e)
+            return {"path": "", "note": "", "exists": False}
+
     @Slot(int, result="QVariantMap")
     def downloadStats(self, source_id: int) -> dict:
         """单个订阅的下载统计（失败/完成计数）。"""
@@ -1350,6 +1406,13 @@ class RssBridge(QObject):
             self.message.emit(f"已新建并绑定条目「{label}」（未匹配 Bangumi）")
         else:
             self.message.emit(f"已新建并绑定条目「{label}」")
+
+        # ---- 通知媒体库刷新----
+        #
+        # 订阅列表（`sourcesChanged`）也要通知：绑定后卡片上会显示
+        # 「→ 番名」的小标签，不刷新就会一直空着。
+        self.reload()
+        self.subjectCreated.emit(int(subject_id), label)
 
     def waitWorkers(self, ms: int = 3000) -> None:
         """退出时等待进行中的网络线程（QmlApp.shutdown 调用）。"""
