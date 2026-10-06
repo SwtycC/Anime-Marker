@@ -22,11 +22,19 @@ a = Analysis(
         # （MultiEffect 拿不到遮罩 → 遮罩失效），开发态却看不出问题。
         # 由 paths.resource_path("poster_mask.png") 读取。
         ('resources/poster_mask.png', 'resources'),
+        # 离线帮助页（状态栏「更多 → 帮助」用系统浏览器打开）。
+        # 与 poster_mask 同理必须单列 —— 它在 resources/ 根下，不在
+        # icons 目录里。由 paths.resource_path("help.html") 读取，
+        # 缺了的话那一项会提示"帮助文档缺失"。
+        ('resources/help.html', 'resources'),
         # QML 界面文件：映射到 _MEIPASS/qml，与 paths.qml_dir() 的契约一致。
         # .qml 是运行时加载的，PyInstaller 静态分析发现不了，必须显式打包。
         ('app/qml', 'qml'),
         # 许可证：PySide6 是 LGPL-3.0，分发二进制时必须随附许可信息与全文；
-        # MIT / Apache / BSD 等也要求保留各自的版权声明。详见 THIRD_PARTY_LICENSES.md。
+        # MIT / Apache / BSD 等也要求保留各自的版权声明。
+        # THIRD_PARTY_LICENSES.md 是"哪个依赖用哪个许可证"的索引，
+        # licenses/ 是各许可证原文 —— 两者缺一不可，都必须存在，
+        # 否则 PyInstaller 会因 datas 源文件缺失直接报错终止。
         ('LICENSE', '.'),
         ('THIRD_PARTY_LICENSES.md', '.'),
         ('licenses', 'licenses'),
@@ -70,7 +78,12 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='resources/icons/app.ico',
+    # 应用图标：**暂缺，故不指定**（Windows 用默认 exe 图标）。
+    #
+    # 注意 `icon=` 指向的文件**必须存在**，否则 PyInstaller 直接报错终止。
+    # 项目里目前没有任何 .ico（resources/icons/ 只放 SVG，见该目录 README）。
+    # 以后补图标时：把 .ico 放进 resources/，再解开下面这行并改对路径。
+    # icon='resources/app.ico',
 )
 
 coll = COLLECT(

@@ -234,6 +234,7 @@ dsh/
 
 # 文件
 技术文档.md
+docs/BUILD.md
 
 # ===== Anime Marker 隐私数据（不上传，运行时自动生成）=====
 # 用户配置（含 Bangumi Token）

@@ -1,7 +1,8 @@
-# licenses/
+# THIRD_PARTY_LICENSES.md
 
-本目录存放**运行时依赖**的许可证与版权声明，随发行包一起分发
-（`anime_marker.spec` 已把整个目录打进 `dist/AnimeMarker/`）。
+本文件说明**运行时依赖**的许可证与版权声明。正文提到的各许可证**原文**
+存放在同级的 [`licenses/`](licenses/) 目录，两者一起随发行包分发
+（`anime_marker.spec` 已把它们打进 `dist/AnimeMarker/`）。
 
 | 文件 | 对应依赖 | 许可证 | 来源 |
 | --- | --- | --- | --- |
