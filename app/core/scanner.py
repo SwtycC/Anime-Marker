@@ -49,7 +49,7 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 # 无意义的占位目录名（Windows「新建文件夹」、下载工具随手建的「New Folder」）。
 #
-# **为什么单独识别**（实测）：「青春猪头少年不会梦到兔女郎学姐」下的正片
+# **为什么单独识别**：「青春猪头少年不会梦到兔女郎学姐」下的正片
 # 被放进了一个「新建文件夹」，于是这一层成了一个**独立条目** ——
 #   ① 关键词退化成「青春猪头少年 新建文件夹」，搜什么都搜不到；
 #   ② 父层（发布组目录）只剩 SP/菜单等附属视频，又成了另一条独立条目，
@@ -329,7 +329,7 @@ _EP_EN_RE = re.compile(r"(?i)\bE[P]?\s*0*(\d+(?:\.\d+)?)\b")
 
 # 完结标记（可拼进各集数正则）：
 # 「[66END]」「66 END」「(12完)」「[25 Fin]」—— 完结集常在集数后跟标记。
-# **必须允许它**（实测踩坑）：数字正则原本要求"数字后面是边界/结尾"，
+# **必须允许它**：数字正则原本要求"数字后面是边界/结尾"，
 # 而 [66END] 里 66 后面紧贴字母 END，三层正则全部失配 → 这一集解析不出
 # 集号，落进兜底桶被顺延成 max+0.5（Re:零 S3 的 66 集显示成 65.5）。
 # 注意标记后的边界检查（尾部 $ / 前瞻 (?![\w.])）仍然生效，所以
@@ -385,7 +385,7 @@ _EP_MID_RE = re.compile(
 
 # 「这是季数，不是集数」的前缀：Season 2 / S2 / 第2季 / 2nd Season 里的那个数字。
 #
-# **为什么必须排除**（实测踩坑，症状极隐蔽）：文件名
+# **为什么必须排除**：文件名
 #     [Dynamis One] Ao Ashi Season 2 - 01 (Baha 1920x1080 AVC AAC MP4) [xxx].mp4
 # 里 `Season 2` 的 **2** 会被 `_EP_MID_RE` 当"独立数字"收进来，且它
 # **出现在 `- 01` 之前**，于是候选列表是 `[2.0, 1.0]`（顺序按出现位置）。
@@ -420,14 +420,17 @@ EXTRA_FILE_PATTERNS = [
     r"(?i)\bPreviews?\b", r"(?i)\bTeasers?\b", r"宣传影像", r"(?i)\bPV\s*\d*\b",
     r"(?i)\bCM\s*\d*\b", r"劇中ゲーム", r"剧中游戏",
     # 菜单 / 特典 / 花絮 / 舞台挨拶
-    r"(?i)\bMenu\b", r"特典", r"花絮", r"访谈", r"舞台挨拶", r"舞台问候",
+    # （Menu 不能用 \bMenu\b：`[Menu01_1]` 里 Menu 后面紧跟数字、没有词边界，
+    #  原写法接不住 —— 改成只要求**左边**不是字母数字。）
+    r"(?i)(?<![a-z0-9])Menu",
+    r"特典", r"花絮", r"访谈", r"舞台挨拶", r"舞台问候",
     r"(?i)\bMaking\b", r"(?i)\bInterview\b",
     # 音声特典 / 评论音轨
     r"音声特典", r"(?i)\bAudio\s*Comment",
 ]
 
 
-# ---- 附加内容（SP / OVA / NCOP / 特典…）识别 ----
+# ---- 附加内容（SP / OVA / NCOP / Menu / 特典…）识别 ----
 #
 # 这些都不是"正片集数"，而是**附加内容**，各自有独立的编号语义。
 # 常见写法（实测覆盖）：
@@ -440,26 +443,48 @@ EXTRA_FILE_PATTERNS = [
 #    [DMG]... WEB予告 #02 [BDRip]...           → 标签 WEB予告 #02
 #    [Group][Show][特典1]...                   → 标签 特典1
 #    [Group][Show][SP][1080p]...              → 无序号，按出现顺序补号
+#    [DMG]... Menu Vol.01 [BDRip]...          → 标签 Menu01（实测：路人女主 ♭）
+#    [DMG&VCB]... [Menu01_1][Ma10p]...        → 标签 Menu01_1（实测：青春猪头）
+#    [DMG] 劇場版 ... Fine Menu-A [BDRip]...   → 标签 Menu-A（实测：路人女主 Fine）
 #
 # **必须在正片解析之前判定**：`SP05` 里的 `05` 会被 `_EP_MID_RE` 命中，
-# 若先走正片分支，SP 会被当成第 5 集与正片撞号。
+# 若先走正片分支，SP 会被当成第 5 集与正片撞号。Menu 同理 —— `Menu Vol.01`
+# 里的 `01` 也会被当集号（实测：Menu 文件被顺延编号成 11.5/12/12.5，
+# 混在正片列表里 ✗）。
 _EXTRA_RE = re.compile(
     r"(?i)(?<![a-z0-9])"
     r"(?P<kind>"
     r"SP|OVA|OAD|EX|"                       # 英文缩写
     r"NC(?:OP|ED)|"                         # NCOP / NCED（无字幕 OP/ED）
     r"WEB予告|予告|预告|PV|CM|Trailer|Preview|Teaser|"
-    r"特典|映像特典|番外篇|番外|花絮|访谈|菜单|Making|Interview"
+    r"音声特典|映像特典|特典|番外篇|番外|花絮|访谈|"
+    r"Menu|菜单|舞台挨拶|舞台问候|宣传影像|劇中ゲーム|剧中游戏|"
+    r"Making|Interview"
     r")"
     # **右边必须不能再跟字母**（实测踩坑，间谍教室）：`[Spy Room][01]` 里的
     # 「Sp」命中了 `SP`，于是 12 集正片全被当成"SP 特典"编号成 SP1…SP12，
     # 真正的集数 01~12 一个都认不出来。要求紧跟的不是字母即可；
     # `SP01`/`SP 01`/`SP_01`/`SP` 这些正常写法都不受影响。
     r"(?![A-Za-z])"
-    # 序号与关键词之间可能有分隔符：`SP01`、`SP 01`、`WEB予告 #02`、`特典-1`
-    r"[\s#\-_]*"
-    r"(?P<num>\d{1,3})?"                    # 可选序号（**保留前导零**）
-)
+    # 序号与关键词之间可能有分隔符：`SP01`、`SP 01`、`WEB予告 #02`、`特典-1`；
+    # 「Menu Vol.01」还有一层 Vol. 前缀（标签里不带 Vol，统一成 Menu01）。
+    #
+    # **分隔符必须写进每个分支内部，不能放在分支外共享**：
+    # 若写成共享的 `[\s#\-_]*(?P<num>...)?`，贪婪的分隔符会把「Menu-A」的
+    # `-` 先吃掉，而 num 是**可选**的 —— 吃掉之后 num 匹配失败也整体成功，
+    # 引擎不会为可选组回头交还分隔符，字母分支永远轮不到（标签只剩 Menu）。
+    # 各分支自带分隔符 + 代码里再剥，才能都拿到。
+    r"(?P<num>"
+    r"[\s#\-_]*(?:Vol\.?\s*)[\s#\-_]*\d{1,3}(?:[._\-]\d{1,2})*"  # Vol 分支
+    r"|[\s#\-_]*\d{1,3}(?:[._\-]\d{1,2})*"                       # 01 / 01_1 / 01-2
+    r"|[\s#\-_]*\-[A-Za-z](?![A-Za-z0-9])"                       # Menu-A 的 -A
+    r")?"                                                        # （后面不能再跟
+)                                                                #   字母数字，防
+                                                                 #   "Menu Disc"）
+
+#: "单词型"关键词：显示时统一为首字母大写（menu → Menu）。
+#: 缩写型（SP/OVA/NCOP…）则统一全大写 —— 见 extract_extra_index。
+_WORD_KINDS = ("menu", "making", "trailer", "preview", "teaser", "interview")
 
 
 def extract_extra_index(name: str) -> Optional[str]:
@@ -467,25 +492,33 @@ def extract_extra_index(name: str) -> Optional[str]:
 
     不是附加内容返回 None，交由正片逻辑处理。
 
-    **返回标签而不是数值**（实测需求）：用户要求"文件名写啥就是啥" ——
-    `SP01` 显示成 `SP01`（不抹掉前导零）、`OVA01` 显示成 `OVA01`、
-    `NCOP3` 显示成 `NCOP3`。数值装不下这些前缀，所以这里直接给字符串，
-    由 `episodes.ep_label` 列存储（见 database 的 v8 迁移）。
-
     无序号时返回**光秃的关键词**（如 `SP`、`特典`），由调用方按出现顺序
     补号（`SP` → `SP1`、下一个 → `SP2`），避免多个无序号项互相覆盖。
 
     排序用的数值另由 `extra_sort_index()` 给出（排在正片之后）。
+
+    **大小写按关键词的"惯例形态"归一**（v16）：`sp01` → `SP01`、`ova` →
+    `OVA`（缩写就该全大写）；但 `menu` / `making` 这类**单词**大写成
+    MENU/MAKING 反而难看 —— 统一成首字母大写（`Menu01` 而不是 `MENU02`，
+    实测：Menu 文件几乎都是 title-case 写法）。全大写缩写原样保留。
     """
     stem = Path(name).stem
     m = _EXTRA_RE.search(stem)
     if not m:
         return None
     kind = m.group("kind")
-    num = m.group("num")
-    # 关键词统一大写（NCOP/SP/OVA 这类），中文/原文保持原样
-    kind = kind.upper() if kind.isascii() else kind
-    # 标签 = 原关键词 + 原序号（前导零保留）：`SP01`、`WEB予告02`、`特典1`
+    low = kind.lower()
+    if low in _WORD_KINDS:
+        kind = low.capitalize()              # menu/MENU → Menu
+    elif kind.isascii() and kind.islower():
+        kind = kind.upper()                  # sp01 → SP01
+    # 序号归一：剥掉分支自带的分隔符，再剥掉 Vol. 前缀（Menu Vol.01 → 01）。
+    # **字母分卷的 -A 保留前导 -**：那是它显示形态的一部分（Menu-A ≠ MenuA），
+    # Vol 剥除对它无副作用（"-A" 不匹配 vol 前缀）。
+    num = re.sub(r"(?i)^vol\.?\s*", "",
+                 (m.group("num") or "").lstrip(" \t#"))
+    # 标签 = 原关键词 + 原序号（前导零保留）：`SP01`、`WEB予告02`、`特典1`、
+    # `Menu01`、`Menu01_1`、`Menu-A`
     return f"{kind}{num}" if num else kind
 
 
@@ -500,9 +533,6 @@ def extra_sort_index(label: str, pos: int, main_max: float) -> float:
     为什么用 `pos` 而不是标签里的序号：序号在不同类型间会重复
     （`SP1` 与 `OVA1` 都是 1），用它排序会让两个不同类型的内容撞到
     同一个槽位、顺序不稳定；`pos` 是列表里的唯一位置，天然有序。
-
-    为什么不用负数（早期实现）：负数会把附加内容排到**正片之前**，
-    而用户的预期是"附加内容在正片下面"（实测反馈）。
 
     为什么加 1000 的偏置：正片将来可能变多（长篇番 100+ 集），
     直接把附加内容排在 `main_max + 1` 会与正片撞号；
@@ -523,7 +553,7 @@ def is_extra_file(name: str) -> bool:
 def extract_ep_candidates(name: str) -> list[float]:
     """从文件名提取**全部**集数候选，按可信度从高到低排列。
 
-    为什么返回候选列表而不是单一值（实测踩坑）：
+    为什么返回候选列表而不是单一值：
     「[Sakurato] 86—Eitisnikkusu— [01v2][AVC-8bit 1080p AAC][CHS]」这类
     **标题本身就是数字**的文件名，标题里的 86 与括号里的 01 都是
     "看起来合法"的集数 —— 只取第一个命中的话，86 排在前面、整部作品
@@ -653,7 +683,7 @@ def _align_by_order(
 ) -> tuple[list[tuple[float, Path]], bool]:
     """官方集数与本地序号**完全对不上**但数量一致时，按顺序配对。
 
-    背景（实测）：Re:零 第三季在 Bangumi 被拆成「袭击篇」「反击篇」
+    背景：Re:零 第三季在 Bangumi 被拆成「袭击篇」「反击篇」
     两个条目，官方 sort 跨篇章连续（袭击篇 51~58、反击篇 59~66），而
     字幕组的文件名按本篇章从 [01] 编起 —— 按号匹配全部落空，集标题
     永远回填不上（详情页左列显示的是本地序号 1~8、右边一排文件名）。
@@ -739,7 +769,7 @@ class ScanCandidate:
     #
     # 目前只有一样东西会进来：**裸系列名**（「咒术回战」「为美好的世界献上祝福」）。
     # 它是"实在认不出这一层是什么"时的最后一根稻草，但对同系列每一部都
-    # 几乎同分 —— 实测（咒术回战 死灭回游）：具体候选「咒术回战 死灭回游」
+    # 几乎同分 —— （咒术回战 死灭回游）：具体候选「咒术回战 死灭回游」
     # 正确地命中「咒术回战 死灭回游 前篇」(110)，可裸系列名「咒术回战」
     # 让**第一季**拿到 130 的精确命中，反倒赢了 → 整部死灭回游被并进第一季。
     # 所以它不能再和具体候选同场竞技，只能当"没别的办法了"的第二遍。
@@ -788,7 +818,7 @@ class ScanWorker(QThread):
     match_failed = Signal(str, str)
     # 某个条目**被写成待确认（pending）**：携带 (名称, 原因)。
     #
-    # **为什么需要它**（踩坑，实测）：桥接层原先靠"日志文本里是否含
+    # **为什么需要它**：桥接层原先靠"日志文本里是否含
     # 「待手动确认」"来计数 `_pending` —— 属于把展示用的字符串当成协议。
     # 后来给网络失败单独发了一条文案不同的日志（"⚠ 联网匹配失败"），
     # 计数便**静默漏掉**了这类条目：界面显示"待确认 0"，可库里明明
@@ -903,26 +933,17 @@ class ScanWorker(QThread):
                     series_name="",
                 )
                 return
-            # **推断上级系列名**（实测踩坑）：
+            # **复算祖先上下文**（见 `_ancestor_state`）：
             #
-            # 单扫不能像全扫那样从媒体库根逐层下探，只能"以目标目录为起点"。
-            # 但目标目录本身可能是**季数目录**（典型：`Overlord\S2`），
-            # 此时它的父目录名（`Overlord`）才是系列名。
-            #
-            # 早期这里直接 `_walk(folder, series_name="")`，把 `S2` 当成了
-            # 系列根 —— 于是：
-            #   ① 关键词退化成 `['S2']`（丢掉作品名），搜索出一堆无关/近似
-            #      条目，前二名差距不足而反复转人工（实测日志：
-            #      `[S2] 名称+60 季数一致(2)+40 类型一致+30` → 差距 15）；
-            #   ② `series_name` 存成空串，详情页「同系列」切换失效。
-            #
-            # 判据与 `_walk` 里"向下传递系列名"的第 ① 条一致：目录名像季数
-            # /篇章时，沿用上层系列名。这里没有"上层传下来的 series_name"，
-            # 就用父目录名充当（父目录名不像季数才有意义，否则继续上溯一层）。
-            parent_hint = ""
-            if is_season_like(folder.name, self.season_mode):
-                parent_hint = folder.parent.name
-            yield from self._walk(folder, series_name=parent_hint, depth=0)
+            # 单扫不能像全扫那样从媒体库根逐层下探，但**必须把逐层下探
+            # 得到的那几个状态复算出来** —— series_name / title_hint /
+            # season_hint 三个都由"上层目录逐级传下来"，少算一层，关键词
+            # 就退化成半截罗马音（甚至只剩「第一季」），于是同一条目
+            # "重新扫描"的结果与"全库扫描"不一样：明明全扫能匹配上，
+            # 单扫却转人工。
+            series_name, title_hint, season_hint, depth = self._ancestor_state(folder)
+            yield from self._walk(folder, series_name, depth,
+                                  title_hint, season_hint)
             return
 
         for root in self.library_paths:
@@ -941,6 +962,119 @@ class ScanWorker(QThread):
                         keywords=[kw],
                         series_name="",
                     )
+
+    def _descend_state(
+        self,
+        directory: Path,
+        series_name: str,
+        title_hint: str,
+        season_hint: Optional[int],
+    ) -> tuple[str, str, Optional[int]]:
+        """进入 `directory` 这一层时，三个「向下传递」的状态各自怎么变。
+
+        `_walk` 每下一层调一次；**单条目重扫也复用它**（见
+        `_ancestor_state`）—— 两处必须是同一套规则，否则"重新扫描该条目"
+        与"全库扫描扫到该条目"会得出不同的关键词（实测踩坑）。
+        """
+        # 向下传递的系列名，分三种情况：
+        # ① 当前目录名像季数/篇章（「第二季」「剧场版 蕾塞篇」）→ 沿用上层系列名
+        # ② 当前目录名清洗后为空（纯噪声打包层，如「[KTXP][XX][01-12][BDRip]」）
+        #    → 沿用上层系列名，它是下载工具多建的一层，不构成新系列
+        # ③ 其余（「无职转生」「Fate」）→ 自己就是系列名
+        dir_clean = clean_title(directory.name)
+        if is_season_like(directory.name, self.season_mode) or not dir_clean:
+            next_series = series_name
+        else:
+            next_series = series_name or directory.name
+
+        # 向下传递的「作品名提示」（**与 series_name 不同，别合并**）：
+        # series_name 取的是**最顶层**目录名（用于详情页「同系列」切换），
+        # 而这里要的是**离叶子最近**、且确实像作品名的那一层。
+        #
+        # 实测踩坑（青春猪头少年）：目录结构是
+        #   青春猪头少年/青春猪头少年不会梦到兔女郎学姐/[DMG&VCB] Seishun.../
+        # 叶子是发布组目录，清洗后只剩半截罗马音「Seishun Buta Yarou wa」
+        # （还因 MAX_LATIN_RUN 被截断）—— 三部剧场版的关键词**完全相同**，
+        # 且都是垃圾。真正的作品名（带中文的那一层）在中间，原先只当成
+        # 「父级」拼进去，导致：（a）拼出来的「父级 半截罗马音」谁都匹配不上；
+        # （b）只用父级时四部作品同分，前二名差距为 0 全部转人工。
+        if dir_clean and _CJK_RE.search(dir_clean) \
+                and not is_junk_dir(directory.name) \
+                and not is_season_like(directory.name, self.season_mode) \
+                and not is_noise_dir(directory.name):
+            next_title_hint = dir_clean
+        else:
+            next_title_hint = title_hint
+
+        # 向下传递的「季数提示」：目录名里写着的「第几季」一路带到叶子。
+        # 与 title_hint 正交 —— 目录名可以同时是作品名（title_hint）和
+        # 季数（如「第二季」本身没有作品名，但它贡献 season_hint）。
+        anc_season = extract_season(directory.name, self.season_mode)
+        next_season_hint = anc_season if anc_season is not None else season_hint
+        return next_series, next_title_hint, next_season_hint
+
+    def _ancestor_state(
+        self, folder: Path
+    ) -> tuple[str, str, Optional[int], int]:
+        """单条目重扫：复算「从媒体库根走到 `folder` 的父级」这段的传递状态。
+
+        返回 `(series_name, title_hint, season_hint, depth)`，正是
+        `_walk` 走到 `folder` 时**收在手里**的那四个值。
+
+        **为什么必须复算**（"重新扫描该条目"之后变成
+        「匹配待确认」，同一条目全库扫描却好好的）：
+        单条目重扫原先只推了一件"父目录名像季数就拿它当 series_name"，
+        `title_hint` / `season_hint` 一律留空 —— 于是同一个目录，
+        "全库扫描"与"单独重扫"算出的关键词完全不同：
+
+            F:\\...\\青春猪头少年\\青春猪头少年不会梦到兔女郎学姐\\[DMG&VCB] Seishun...
+                全扫 → ['青春猪头少年不会梦到兔女郎学姐',
+                        '青春猪头少年 Seishun Buta Yarou wa', ...]
+                重扫 → ['Seishun Buta Yarou wa']   ← 半截罗马音，
+                                                     多部同分 → 前二名差距 0 转人工
+            F:\\...\\命运石之门\\Steins;Gate 全集\\第一季
+                全扫 → ['命运石之门 第一季']        ← 系列名取的是**最顶层**
+                重扫 → ['第一季']                   ← 系列名取成了中间的容器目录
+                                                      「Steins;Gate 全集」，
+                                                      结果连作品名都没进关键词 → 无候选
+
+        两者必须一致 —— "重新扫描该条目"的语义就是"把这一条按全库扫描的
+        方式重跑一遍"，唯一的区别是不遍历其他条目。
+
+        `folder` 不在任何媒体库路径下时（用户改过媒体库路径、旧条目仍能
+        单扫）无法复算，退回旧行为：目录名像季数就用父目录名当系列名。
+        """
+        for root in self.library_paths:
+            try:
+                parts = folder.relative_to(root).parts
+            except ValueError:
+                continue
+            series_name, title_hint, season_hint = "", "", None
+            cur = root
+            # 走到 folder 的**父级**为止：folder 自己的那一层由 _walk 处理
+            # （它才是最终调 `_build_keywords` 的那一层）。
+            for name in parts[:-1]:
+                cur = cur / name
+                series_name, title_hint, season_hint = self._descend_state(
+                    cur, series_name, title_hint, season_hint)
+            # 深度要和全库扫描一致：媒体库根的直接子目录是 depth=0
+            return series_name, title_hint, season_hint, max(0, len(parts) - 1)
+        # 兜底（不在任何媒体库路径下，无法复算祖先链）：沿用旧判据 ——
+        # 目录名像季数/篇章时，父目录名就是系列名。
+        #
+        # 但**要把名字清洗一遍再存**：早期这里用的是父目录的**原始**名字，
+        # 于是纯参数目录名成了系列名 —— 实测
+        # 「[DMG] 冴えない彼女の育てかた [BDRip][S1+S2+MOVIE]」被写进
+        # `subjects.series_name`，那一条在详情页**直接"被丢出系列"**
+        # （同系列的其他几条存的是「路人女主的养成方法」，对不上）。
+        # 清洗后为空（整串都是方括号参数）时宁可留空：留空只是"没有系列"，
+        # 而写一个垃圾名会让它和真正的系列成员对不上。
+        parent_hint = ""
+        if is_season_like(folder.name, self.season_mode):
+            parent_hint = clean_title(folder.parent.name)
+            if is_noise_dir(folder.parent.name):
+                parent_hint = ""
+        return parent_hint, "", None, 0
 
     def _walk(
         self,
@@ -994,41 +1128,8 @@ class ScanWorker(QThread):
 
         all_videos = direct_videos + extra_videos
 
-        # 向下传递的系列名，分三种情况：
-        # ① 当前目录名像季数/篇章（「第二季」「剧场版 蕾塞篇」）→ 沿用上层系列名
-        # ② 当前目录名清洗后为空（纯噪声打包层，如「[KTXP][XX][01-12][BDRip]」）
-        #    → 沿用上层系列名，它是下载工具多建的一层，不构成新系列
-        # ③ 其余（「无职转生」「Fate」）→ 自己就是系列名
-        dir_clean = clean_title(directory.name)
-        if is_season_like(directory.name, self.season_mode) or not dir_clean:
-            next_series = series_name
-        else:
-            next_series = series_name or directory.name
-
-        # 向下传递的「作品名提示」（**与 series_name 不同，别合并**）：
-        # series_name 取的是**最顶层**目录名（用于详情页「同系列」切换），
-        # 而这里要的是**离叶子最近**、且确实像作品名的那一层。
-        #
-        # 实测踩坑（青春猪头少年）：目录结构是
-        #   青春猪头少年/青春猪头少年不会梦到兔女郎学姐/[DMG&VCB] Seishun.../
-        # 叶子是发布组目录，清洗后只剩半截罗马音「Seishun Buta Yarou wa」
-        # （还因 MAX_LATIN_RUN 被截断）—— 三部剧场版的关键词**完全相同**，
-        # 且都是垃圾。真正的作品名（带中文的那一层）在中间，原先只当成
-        # 「父级」拼进去，导致：（a）拼出来的「父级 半截罗马音」谁都匹配不上；
-        # （b）只用父级时四部作品同分，前二名差距为 0 全部转人工。
-        if dir_clean and _CJK_RE.search(dir_clean) \
-                and not is_junk_dir(directory.name) \
-                and not is_season_like(directory.name, self.season_mode) \
-                and not is_noise_dir(directory.name):
-            next_title_hint = dir_clean
-        else:
-            next_title_hint = title_hint
-
-        # 向下传递的「季数提示」：目录名里写着的「第几季」一路带到叶子。
-        # 与 title_hint 正交 —— 目录名可以同时是作品名（title_hint）和
-        # 季数（如「第二季」本身没有作品名，但它贡献 season_hint）。
-        anc_season = extract_season(directory.name, self.season_mode)
-        next_season_hint = anc_season if anc_season is not None else season_hint
+        next_series, next_title_hint, next_season_hint = self._descend_state(
+            directory, series_name, title_hint, season_hint)
 
         # --- 情况 A：纯容器（无直接视频，只有子目录）→ 继续下探，不产出 ---
         if not all_videos and sub_dirs:
@@ -1563,11 +1664,17 @@ class ScanWorker(QThread):
         # 本地也就这一个视频，一一对应没有任何歧义。直接认作官方那一集，
         # 标题与 bangumi_ep_id 走正常回填路径，页面显示的就是条目名本身。
         #
-        # 条件收紧到"整个目录只有这一个视频"：带 SP / 副音轨 / 菜单的目录
-        # 不算（那种情况下这个文件未必是正片）。
-        if (len(cand.video_files) == 1 and len(plain_videos) == 1
-                and not main_videos and not extra_videos and not extras_videos
-                and bgm_eps):
+        # 条件：整个目录**没有别的正片、也没有无法归类的视频**，只有这一个
+        # plain 文件。v16 放宽了"带附加内容不算"的限制（实测：路人女主 Fine
+        # 的目录 = 本体 + Menu-A/B + 舞台挨拶 + PV + WEB予告，旧条件要求
+        # "整个目录只有一个视频"于是失效，本体落进顺延桶显示成「2」，
+        # 而真正的第 1 集位置被 Menu-A 占了）—— 已被识别为附加内容的
+        # （extras_videos，带 SP/Menu/PV 标签的那些）不再妨碍本体的判定：
+        # 它们已经明确不是正片，剩下的唯一 plain 文件就是本体。
+        # 无法归类的（extra_videos）仍然一票否决：那种目录连"哪个是正片"
+        # 都说不准，宁可维持旧行为。
+        if (len(plain_videos) == 1 and not main_videos
+                and not extra_videos and bgm_eps):
             official: list[dict] = []
             for e in bgm_eps:
                 try:
@@ -1599,16 +1706,22 @@ class ScanWorker(QThread):
         # 补号规则：**按关键词分组**（`[SP][SP]` → SP1/SP2；
         # `[NCOP][SP]` → NCOP1/SP1），从 1 开始往上找第一个空位，
         # 避免不同类互相占号，也避免与已有的 `SP01`/`SP02` 撞车。
+        #
+        # **"已有编号"包括尾部字母**（v16）：`Menu-A`/`Menu-B` 的 -A/-B 就是
+        # 它自己的序号（发布组的碟片分卷写法），必须原样保留 —— 若只认数字，
+        # 会被当成"无序号"补号成 Menu1/Menu2，文件名里的 -A/-B 信息就丢了。
+        # 字母尾巴要求前面有分隔符：`Making` 本身以字母结尾，若不要求分隔符
+        # 会被当成"尾部字母序号 g"而永远跳过补号。
         if extras_videos:
             used_by_kind: dict[str, set[int]] = {}
             for label, _ in extras_videos:
-                m = re.search(r"(\d+)$", label)
-                if m:
-                    kind = re.sub(r"\d+$", "", label)
-                    used_by_kind.setdefault(kind, set()).add(int(m.group(1)))
+                m = re.search(r"(\d+|[\-_\s][A-Za-z])$", label)
+                if m and m.group(1).isdigit():
+                    used_by_kind.setdefault(label[:m.start()], set()).add(
+                        int(m.group(1)))
             filled_extras: list[tuple[str, Path]] = []
             for label, v in extras_videos:
-                if re.search(r"\d+$", label):
+                if re.search(r"(\d+|[\-_\s][A-Za-z])$", label):
                     filled_extras.append((label, v))
                     continue
                 used = used_by_kind.setdefault(label, set())
@@ -1622,11 +1735,18 @@ class ScanWorker(QThread):
         # 排序：按（关键词, 序号）—— 先按类型分组（NCOP…、OVA…、SP…），
         # 同类型内按序号升序。**不能只按序号排**：不同类型会互相交错
         # （NCOP1/NCOP2/SP01/SP02… 混着显示很难读）。
+        # 尾部是字母的（Menu-A < Menu-B）按字母位次折算成数参与排序。
         def _extras_sort_key(item: tuple[str, Path]) -> tuple[str, float]:
             label, _ = item
-            m = re.search(r"(\d+)$", label)
-            return (re.sub(r"\d+$", "", label),
-                    float(m.group(1)) if m else 0.0)
+            m = re.search(r"(\d+|[\-_\s][A-Za-z])$", label)
+            if not m:
+                return (label, 0.0)
+            tail = m.group(1)
+            if tail.isdigit():
+                num = float(int(tail))
+            else:
+                num = float(ord(tail[-1].upper()) - ord("A") + 1)
+            return (label[:m.start()], num)
 
         extras_videos.sort(key=_extras_sort_key)
         # 官方序号与本地编号完全对不上但数量一致 → 按顺序配对并改用官方

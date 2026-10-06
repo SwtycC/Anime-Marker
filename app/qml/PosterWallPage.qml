@@ -887,12 +887,51 @@ Item {
         return parts.join(" · ")
     }
 
-    // 数据变化时刷新（library.subjects 变化会自动触发 Repeater 重建，
-    // 这里只需保证滚动位置回到顶部）
+    // 数据变化时刷新：library.subjects 变化会自动触发 Repeater 重建，
+    // 这里负责**把滚动位置保住**。
+    //
+    // **不要在这里写 `flick.contentY = 0`**：
+    // `subjectsChanged` 不只是"列表内容真的变了"，它也是**单条目重扫的
+    // 收尾** —— QmlApp._on_scan_finished 第一件事就是 `library.reload()`。
+    // 用户点「重新扫描」时人在详情页，海报墙在后台被这条信号顶回顶部，
+    // 返回时看到的就是"跳到了顶上"。
+    // 而重扫只改集数，卡片**顺序和数量都没变**，没有任何理由移动视口。
+    //
+    // 重建期间 Flow 的 implicitHeight 会跟着变（contentHeight 随之变），
+    // Flickable 可能把越界的 contentY 夹掉，所以：
+    //   ① 收到信号时先把当前位置记下来；
+    //   ② 高度变化后再贴回去（夹进新的可视范围）。
+    // 只在重建那一小段时间内生效（`keepScroll` 计时器），窗口一过就作废
+    // —— 否则用户之后自己滚动，会被这条"记忆"反复拉回旧位置。
     Connections {
         target: typeof library !== "undefined" && library ? library : null
         function onSubjectsChanged() {
-            flick.contentY = 0
+            if (flick.contentY > 1) {
+                root._pendingY = flick.contentY
+                keepScroll.restart()
+            }
+        }
+    }
+
+    /// 数据重建期间要保住的滚动位置（-1 = 没有待保位置）
+    property real _pendingY: -1
+
+    /// 重建窗口：这段时间内的 contentHeight 变化都会把 `_pendingY` 贴回去
+    Timer {
+        id: keepScroll
+        interval: 400
+        onTriggered: root._pendingY = -1
+    }
+
+    // Flickable 没有自己的 `contentHeightChanged` 处理槽可用（root 是
+    // 普通 Item，没有 contentHeight 属性），故用 Connections 监听。
+    Connections {
+        target: flick
+        function onContentHeightChanged() {
+            // 回顶动画正在跑时别插手（那是用户明确要求的"去顶部"）
+            if (root._pendingY < 0 || scrollTopAnim.running)
+                return
+            flick.contentY = Math.max(0, Math.min(root._pendingY, root.scrollMax))
         }
     }
 }

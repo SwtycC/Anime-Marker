@@ -223,8 +223,13 @@ class ScannerBridge(QObject):
         与 `start()` 共用同一套 worker 与信号：进度、日志、完成回调、
         finished 通知全都照旧 —— 界面无需为单扫写第二套处理逻辑。
 
-        注意 `library_paths` 传空列表：单扫不看媒体库配置（用户可能已
-        改过路径，而这条旧条目仍应能刷新），候选来源由 `only_folder` 决定。
+        **媒体库路径照常传下去，但候选来源仍由 `only_folder` 决定**
+        （`_collect_candidates` 一给 `only_folder` 就只从目标目录下探）。
+        那条路径另有用途：单扫要**复算祖先上下文**才能和全扫算出同一套
+        关键词（见 `ScanWorker._ancestor_state`）—— 早先这里刻意传 `[]`，
+        结果同一条目"重扫"与"全扫"得到不同关键词、甚至被写下不同的
+        `series_name`（实测："重新扫描后变成待确认"、"被丢出系列"）。
+        用户改过媒体库路径、旧条目已不在库下时，复算自然失败并退回旧行为。
         """
         if self._running:
             log.info("扫描进行中，忽略单条目扫描请求")
@@ -257,7 +262,15 @@ class ScannerBridge(QObject):
         self._total = 0
 
         worker = ScanWorker(
-            [],                       # 不用媒体库路径（见方法说明）
+            # **媒体库路径要传**（见方法说明）：它**不参与挑选候选**
+            # （`only_folder` 一给，`_collect_candidates` 就只从目标目录
+            # 下探，压根不看这里），只用来**复算祖先上下文**
+            # —— 单扫算关键词时要知道"从媒体库根走到这里都经过了哪些层"。
+            # 早先这里传的是 `[]`，于是复算无从下手、退回旧行为：
+            # 关键词退化成半截罗马音（匹配转人工）、series_name 被写成
+            # 中间的容器目录名（条目"被丢出系列"）。传了之后，目标目录
+            # **不在**任何媒体库路径下时依旧走那条旧兜底路径，不会更差。
+            self._config.library_paths,
             self._api,
             self._db,
             season_mode=SEASON_MODE,
@@ -416,7 +429,17 @@ class ScannerBridge(QObject):
         self._total = 0
 
         worker = ScanWorker(
-            [],
+            # 媒体库路径：**只用于复算祖先上下文**（关键词 / series_name
+            # 都靠它，见 ScanWorker._ancestor_state），不参与挑候选
+            # （`only_folder` 一给就只从所选目录下探）。
+            #
+            # 早先传 `[]`，于是加进来的目录若**名字本身不是作品名** ——
+            # 典型是发布组目录「[DMG&VCB-Studio] Seishun Buta Yarou wa …」——
+            # 关键词会退化成被 MAX_LATIN_RUN 截断的半截罗马音，多部作品
+            # 同分、前二名差距 0，直接转人工（与"重新扫描"那次是同一个坑）。
+            # 所选目录不在媒体库里（"添加"本来就允许任意目录）时复算失败，
+            # 自动退回旧行为。
+            self._config.library_paths,
             self._api,
             self._db,
             season_mode=SEASON_MODE,
