@@ -363,6 +363,21 @@ _EP_BRACKET_PAIR_RE = re.compile(
     r"[\[【(（]\s*0*(\d+(?:\.\d+)?)\s*[_／/\-]\s*0*(\d+(?:\.\d+)?)"
     r"\s*(?:v\d+)?\s*[\]】)）]",
     re.IGNORECASE)
+# **分隔符后的集号**：`Title - 01`、`Title – 07` —— 字幕组最标准的写法之一。
+#
+# 与 `_EP_TAIL_RE` 互补：那条只管"数字在名字**末尾**"，而
+# 「... - 01 [WebRip 1080p HEVC-10bit AAC SRTx2]」里集号后面还跟着
+# 画质/编码标签，落不到尾部规则里，只能掉进 ⑥ 的"独立数字"（见那里）。
+#
+# 要求破折号**后面带空白**（`- 01`，不是 `-01`）：
+#   ① 真实写法几乎都带空格 —— 本库 1440 个文件名里，破折号后跟数字且
+#      数字后面不是字母的共 424 处，**全部**带空格；
+#   ② 不带空格的那些基本都是**发布组名**：`[UHA-WINGS＆YUI-7][Grand Blue]
+#      [01]...`（组名里的 7）、`AVC-8bit` / `HEVC-10bit`（数字后是字母）。
+#      放宽成 `-01` 会把组名里的 7、8 当集号提到 ①～⑤ 之前去 ✗。
+_EP_SEP_RE = re.compile(
+    r"[-–—]\s+0*(\d+(?:\.\d+)?)(?:v\d+)?" + _EP_END_MARK + r"(?![\w.])",
+    re.IGNORECASE)
 # 独立数字（前后都不是字母数字）：如「[01]」夹在括号中、「66END 1080p」
 _EP_MID_RE = re.compile(
     r"(?<![\w.])0*(\d+(?:\.\d+)?)(?:v\d+)?" + _EP_END_MARK + r"(?![\w.])",
@@ -524,6 +539,8 @@ def extract_ep_candidates(name: str) -> list[float]:
       ③ EP01 / E01
       ④ 数字结尾（01.mkv、- 01）
       ⑤ 纯数字括号块 [01] / [01v2] / （05）
+      ⑤′ 括号里的双集号 [01_73] / [01-73]（两个号都收，见该正则）
+      ⑤″ 分隔符后的集号（Title - 01，见 _EP_SEP_RE）
       ⑥ 其余独立数字（标题里的 86、裸写的 01 等）—— 兜底
     """
     stem = Path(name).stem
@@ -566,6 +583,20 @@ def extract_ep_candidates(name: str) -> list[float]:
             val = float(m.group(g))
             if val <= _EP_BRACKET_MAX:
                 cands.append(val)
+
+    # ⑤″ 分隔符后的集号（`Title - 01`，见 _EP_SEP_RE）。
+    #
+    # **为什么必须单独一层**：
+    #     [LoliHouse] Isekai Nonbiri Nouka 2 - 01 [WebRip 1080p ...]
+    # 标题自带的季号（`Nouka 2`）和真集号（`- 01`）都只能被 ⑥ 的
+    # "独立数字"收进来，而 ⑥ **按出现位置排序** —— 季号在前，候选是
+    # `[2.0, 1.0]`；`_pick_ep_index` 优先挑"能对上官方集数表"的，而第 2 集
+    # 当然存在 → 整季每一集都配上了第 2 集的集号与标题。
+    # `_SEASON_PREFIX_RE` 管不到它：那条只认 `Season 2` / `S2` / `第2季` /
+    # `2nd Season`，而这里是光秃秃的 `Nouka 2`。
+    # 把"跟在分隔符后的数字"提到 ⑥ 之前，`- 01` 就排在季号前面了。
+    for m in _EP_SEP_RE.finditer(stem):
+        cands.append(float(m.group(1)))
 
     # ⑥ 其余独立数字 —— 兜底，可信度最低，靠官方集数表消歧
     #

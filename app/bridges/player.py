@@ -107,6 +107,17 @@ class PlayerBridge(QObject):
     #: 转发自 ProgressMonitor.subject_completed，qml_app 连到
     #: LibraryBridge.reload() 刷新海报墙/在看页的状态标签。
     subjectCompleted = Signal(int, str)
+    #: 播放结束、监控已停止（参数：**刚看过的条目的本地 id**，0 = 未知）。
+    #:
+    #: **为什么要带上 subject_id**：在看页的"已看 N / 共 M 集"
+    #: 读的是 `max_watched_ep_index` 与 Bangumi 缓存 —— 本地观看记录变了，
+    #: 那一行就该重算。只发一个无参信号，QML 侧也能整体重取，但带上 id
+    #: 便于日志说明"刷的是哪一部"，也方便将来做"只刷这一行"的优化。
+    #:
+    #: **为什么需要这个信号**：原先播放结束后没有任何东西通知在看页，
+    #: 用户必须切到别的页再切回来（`onCurrentPageChanged` 里那次
+    #: `reloadInProgress()`）才能看到进度更新。
+    playbackStopped = Signal(int)
 
     def __init__(
         self,
@@ -128,6 +139,9 @@ class PlayerBridge(QObject):
         self._playing_subject_name = ""
         # 集号显示文本（"第 3 集" / "SP01"），同样是播放时算好缓存。
         self._playing_episode_label = ""
+        # 当前播放所属条目的**本地 id**（0 = 没在播 / 未知）。
+        # 监控停止时要用它告诉界面"刷哪一部"（见 playbackStopped）。
+        self._playing_subject_id = 0
         self._progress = 0.0
 
         #: 启动链的后台线程池（见 _LaunchWorker 的说明）。
@@ -156,6 +170,8 @@ class PlayerBridge(QObject):
         self._monitor.error.connect(self.failed)
         # 「自动完结」结果 → 状态栏提示 + 转发给 qml_app（刷状态标签）
         self._monitor.subject_completed.connect(self._on_subject_completed)
+        # 播放结束（监控停止）→ 让在看页重算进度（见 playbackStopped 的说明）
+        self._monitor.stopped.connect(self._on_monitor_stopped)
 
     def set_api(self, api: BangumiClient) -> None:
         """设置保存后重建 API 时调用。"""
@@ -291,6 +307,7 @@ class PlayerBridge(QObject):
             return
 
         self._playing_episode_id = ep.id
+        self._playing_subject_id = int(ep.subject_id or 0)
         self._playing_title = ep.title or ""
         # 动漫名与集号标签在这里**算好缓存**（状态栏要不断读它们，
         # 不能每次都查库 / 走格式化）。
@@ -309,6 +326,7 @@ class PlayerBridge(QObject):
         """停止监控（不改播放器状态，仅停止轮询）。"""
         self._monitor.stop()
         self._playing_episode_id = 0
+        self._playing_subject_id = 0
         self._playing_title = ""
         self._playing_subject_name = ""
         self._playing_episode_label = ""
@@ -419,6 +437,23 @@ class PlayerBridge(QObject):
     def _on_watched(self, episode_id: int) -> None:
         self.watched.emit(episode_id)
         self.message.emit(f"已自动标记看过：{self._playing_title}")
+
+    def _on_monitor_stopped(self) -> None:
+        """播放结束（监控停止）→ 通知界面刷新该条目的进度。
+
+        **为什么这里还要再刷一次**：`watched` 信号只在"达到阈值、自动标记"的那一刻发，
+        而那时候**进度条往往还没走到头**（用户可能看了 91% 就关掉、
+        也可能一直看到结束）。等到监控停止才发一次，覆盖的是"这次观看
+        真正结束"这个时点，界面上的"已看 N 集" 与在看页进度条才不会
+        停在旧值上、非要用户切页才更新。
+
+        `subject_id` 取 `self._playing_subject_id` —— 它在播放开始时缓存
+        （见 `_on_launch_finished`）。0 表示拿不到（罕见），界面收到 0 时
+        仍可整体重取，不影响正确性。
+        """
+        sid = int(self._playing_subject_id or 0)
+        log.info("播放结束，通知界面刷新进度（subject_id=%s）", sid or "未知")
+        self.playbackStopped.emit(sid)
 
     def _on_subject_completed(self, subject_id: int, name: str) -> None:
         """整部看完已自动标记「看过」→ 状态栏提示 + 转发信号。

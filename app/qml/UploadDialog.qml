@@ -253,6 +253,10 @@ Window {
                         objectName: "uploadDialogRow_" + modelData.episodeId
                         text: ""                      // 只取方框，文字另排（要对齐）
                         enabled: !dlg.uploading
+                        // 这里是**多选**（勾若干集一起传），用方框而不是开关：
+                        // 开关是"这一行的功能开/关"的语义，用在"挑哪几集"
+                        // 的清单上会让人误以为每行各有一个独立开关。
+                        variant: "checkbox"
 
                         // **不能写 `checked: dlg.isChecked(...)` 这种绑定** ——
                         // 组件点击时内部会 `checked = !checked` 赋值，绑定会被

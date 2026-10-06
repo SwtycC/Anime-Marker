@@ -126,6 +126,19 @@ class QmlApp:
         # 跨桥连线放这里（PlayerBridge 不该认识 LibraryBridge）。
         self.player_bridge.subjectCompleted.connect(
             lambda sid, name: self.library_bridge.reload())
+        # 播放结束（监控停止）→ 刷「在看」列表。
+        #
+        # **为什么需要**：
+        # 在看页那一行的"已看 N / 共 M 集"读的是 `max_watched_ep_index`
+        # 与 Bangumi 缓存；播放结束后本地观看记录已经变了，但原先没有任何
+        # 信号告诉这一页，用户只能切页（`onCurrentPageChanged` 里那次
+        # `reloadInProgress()`）才看到更新。
+        #
+        # 用 `reloadInProgress()` 而不是 `reload()`：前者只失效在看列表
+        # 那份缓存（一条 SQL 级别），后者还会发 `subjectsChanged` ——
+        # 那会**重建海报墙的全部卡片**（每张重新解码封面，实测卡 1~2 秒）。
+        # 播放结束是个高频动作，绝不能挂上那样的代价。
+        self.player_bridge.playbackStopped.connect(self._on_playback_stopped)
         self.match_bridge = MatchBridge(self.db, self.api)
         self.inprogress_bridge = InProgressBridge(self.db, self.config, self.api)
         # 收藏列表拉取完成后，让 QML 侧的 library.inProgress 重新取数
@@ -139,11 +152,8 @@ class QmlApp:
 
         # ---- RSS 轮询下载（F19 的第二半）----
         #
-        # **踩坑（实测反馈"我怎么确认在下载了"）**：`core/rss_service.py` 里
+        # **怎么确认在下载了**：`core/rss_service.py` 里
         # 整套下载链路（轮询 → 三层判新 → 推送 qBittorrent → 写下载记录）
-        # 早就写好了，但**从来没有被实例化过** —— 全项目搜 `RssService`
-        # 只在它自己的文件里出现。于是订阅建了、绑了，却一次都没轮询过，
-        # 下载记录永远是空的（界面上那句"轮询下载功能尚未接入"是实话）。
         #
         # 现在在启动时建好并 start()：它内部按 `rss.poll_interval` 定时触发，
         # 且 `poll_on_start` 为真时立刻跑一次。
@@ -157,7 +167,7 @@ class QmlApp:
         self.rss_service.poll_finished.connect(self.rss_bridge.onPollFinished)
         # 「从订阅源新建条目」完成 → 刷新媒体库缓存。
         #
-        # **为什么必须连**（实测"新建完条目后下载器无法马上识别"）：
+        # **为什么必须连**（新建完条目后下载器无法马上识别）：
         # `LibraryBridge.subjects` 是带 `_dirty` 的缓存，新建条目只写了
         # 数据库，不置脏的话「下载器」弹窗读到的还是旧列表 —— 刚建的条目
         # 搜不到，用户只能选错条目或选不上，`save_subject_id` 随之失效。
@@ -169,7 +179,7 @@ class QmlApp:
         self.rss_bridge.pushRequested.connect(self._on_push_requested)
         # ---- 「下载完自动扫描该条目」----
         #
-        # **为什么必须连**（实测："下载好的也会推送吗 —— 会"）：
+        # **为什么必须连**：
         # `new_only` 的两层查重是 ① 本地媒体库 ② qBittorrent 现役任务。
         # 下载完并不入库，而第②层会随着用户清理 qB 任务消失 —— 两层全空，
         # 同一集就被反复当成"新集"再推一遍。下完自动扫一次，数据真正进入
@@ -237,6 +247,25 @@ class QmlApp:
             return
         ok, msg = self.rss_service.push_pending(record_id)
         self.rss_bridge.onPushResult(record_id, ok, msg)
+
+    @Slot(int)
+    def _on_playback_stopped(self, subject_id: int) -> None:
+        """播放结束 → 让「在看」页重算进度（见 player_bridge 连线处的说明）。
+
+        **只失效在看列表，不碰海报墙**：`reloadInProgress()` 只标记
+        `_inprogress_dirty` 并发 `inProgressChanged`（QML 侧只是重取
+        Property，不重建 Repeater）—— 代价与"重排一行文字"相当。
+        换成 `reload()` 会连带 `subjectsChanged`，把海报墙全部卡片销毁
+        重建（每张都要重新解码封面），是播放结束这种高频动作不该有的开销。
+
+        `subject_id` 目前只用于日志（将来若做"只刷这一行"会用到）。
+        """
+        log.info("播放结束，刷新「在看」列表（subject_id=%s）",
+                 subject_id or "未知")
+        try:
+            self.library_bridge.reloadInProgress()
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("播放结束后刷新在看列表失败：%s", e)
 
     @Slot(int)
     def _on_scan_subject_requested(self, subject_id: int) -> None:
@@ -319,7 +348,7 @@ class QmlApp:
         而不是一条网络失败。海报墙不受影响（纯本地）。
 
         **单条目重扫也跳过**：详情页「重新扫描」只刷新一个
-        条目的元数据，与收藏列表毫无关系 —— 却要为此拉 175 条收藏 + 几十条
+        条目的元数据，与收藏列表毫无关系 —— 却要为此拉 收藏 + 
         集级记录、耗时数秒，纯属浪费（用户点"重新扫描这一部"，不该看到
         整个在看列表被重拉一遍）。单条目扫描的正确收尾只是重取该条目的
         集数，那由 QML 侧的 `onFinished` 处理。

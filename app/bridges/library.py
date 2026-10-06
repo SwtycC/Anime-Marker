@@ -256,7 +256,10 @@ class _CollectTypeWorker(QThread):
         if not isinstance(data, dict):
             # ① 未收藏（get_collection 用 None 表示"确实没有"）
             try:
-                self._db.set_subject_collect_type(self._subject_id, 0)
+                # local_change=False：这是"回查到的远端值"，不是用户改的
+                # （见 Database.set_subject_collect_type）
+                self._db.set_subject_collect_type(self._subject_id, 0,
+                                                  local_change=False)
             except Exception:
                 pass
             self.done.emit(self._subject_id, False, "", 0)
@@ -266,7 +269,9 @@ class _CollectTypeWorker(QThread):
         if ctype not in COLLECT_TYPE_NAMES:
             ctype = 0
         try:
-            self._db.set_subject_collect_type(self._subject_id, ctype)
+            # local_change=False：同上，回查结果只是抄回本地
+            self._db.set_subject_collect_type(self._subject_id, ctype,
+                                              local_change=False)
         except Exception as e:
             log.warning("写入收藏状态快照失败 subject_id=%s: %s",
                         self._subject_id, e)
@@ -492,6 +497,16 @@ class LibraryBridge(QObject):
             # 才同时兼顾两种情况，且进度只会"前进"不会"回退"
             # （回退会被用户当成 bug）。
             #
+            # **但两者必须同一口径才谈得上取 max**：
+            #     ep_status          Bangumi 收藏接口的计数 = **本季**第几集
+            #                        （1~total_eps，这里正是 17）
+            #     本地 ep_index      扫描时写入的**全系列累计序号**
+            #                        （跨季连续编号的番从 73 起，这里最大 89）
+            # 直接 max 就把 89 当成"本季第 89 集"显示了，而分母是本季的 24。
+            # 判据：本地那个数 **≤ `total_eps`** 才可能是本季口径（正片编号
+            # 不会超过本季集数）；超过就说明是另一套编号，宁可不修正 ——
+            # 退化成显示缓存的 `ep_status`，最多"慢一集"，不会显示成假的。
+            #
             # 注意这里**不改库**：只修正本次返回给界面的值。缓存该由
             # 「刷新」重建，不要在只读路径上偷偷写数据。
             #
@@ -501,9 +516,15 @@ class LibraryBridge(QObject):
             ep_status = int(it.ep_status or 0)
             if local_id:
                 try:
-                    ep_status = max(
-                        ep_status,
-                        self._db.max_watched_ep_index(local_id))
+                    local_max = self._db.max_watched_ep_index(local_id)
+                    total = int(it.total_eps or 0)
+                    if total <= 0 or local_max <= total:
+                        ep_status = max(ep_status, local_max)
+                    elif local_max > ep_status:
+                        log.debug(
+                            "本地最大集号 %s 超出本季集数 %s，判为另一套编号，"
+                            "进度仍用 Bangumi 的 %s（bgm=%s）",
+                            local_max, total, ep_status, it.bangumi_id)
                 except Exception as e:
                     log.warning("读取本地已看最大集号失败 subject_id=%s: %s",
                                 local_id, e)
@@ -638,15 +659,27 @@ class LibraryBridge(QObject):
     def _next_episode(self, subject_id: int, ep_status: int) -> tuple[int, str]:
         """「下一集」对应的本地集 ID 与**播不了时的原因**；可播时原因为空串。
 
-        **按 Bangumi 的 `ep_status`（已看到第 N 集）算，不用本地的 `watched`
-        标记** —— 实测本账号「在看」的 11 部里本地 `watched` 全是 0（那些集是
-        在 Bangumi 网页 / 别的设备上标的，本程序没有播放记录），若按本地标记
-        取"第一个未看过的"，会一律算成第 1 集 ✗。按 `ep_status` 算与页面上的
-        进度条（读的也是 `ep_status`，如「5 / 12 集」）口径一致。
+        **"看到第几集"必须用 `watched_episodes` 的集号，不能用 `ep_status`**
+        —— 这两个数走的是**两套不同的编号**：
 
-        规则：优先取 `ep_index == ep_status + 1` 的那一集（"接着看"的那集）；
+            ep_status        Bangumi 收藏接口的 `ep_status` = 该条目**本季**
+                             第几集（1~24）
+            watched_episodes 逐集记录的 `ep_index` = Bangumi 集数的 `sort`
+                             = **全系列累计序号**（73~96）
+            本地 episodes     与 `sort` 同口径（那正是扫描时写入的值）
+
+        拿 `ep_status=16` 去和本地 `ep_index`（73~93）比，永远对不上
+        （`16+1=17` 不在 73~93 里），于是退回"第一个 > 17 的" → 永远给
+        **第一集 73**。实测：明明看到第 16 集，点「下一集」还是打开第 1 集。
+
+        所以先用 `watched_episodes` 取"本地/远端已看的最大集号"（与本地同
+        口径），它比 `ep_status` 更精确（逐集记录，而 `ep_status` 只是个
+        计数器）；只有在没有任何逐集记录时才退回 `ep_status`（那时本地若
+        恰好也是 1~N 编号，两者口径一致，能对上）。
+
+        规则：优先取 `ep_index == 已看到 + 1` 的那一集（"接着看"的那集）；
         编号对不上（本地缺集/续篇从中间编号）时退回"第一集 ep_index 大于
-        ep_status 的"；都没有则返回 0，并给出一句能解释清楚的原因 ——
+        已看到的"；都没有则返回 0，并给出一句能解释清楚的原因 ——
         界面上按钮**不隐藏**，点不动时把原因报到状态栏（实测要求）。
 
         为什么要区分原因：三种"播不了"的处置完全不同 ——
@@ -665,20 +698,65 @@ class LibraryBridge(QObject):
         if not eps:
             return 0, "本地没有可播放的剧集文件"
 
-        want = float(ep_status or 0) + 1
+        # 已看到的集号（与本地 ep_index 同口径）。见方法说明：优先逐集记录。
+        seen = self._watched_max_index(subject_id)
+        source = "watched_episodes"
+        if seen <= 0:
+            # 没有任何逐集记录（没同步过 / 在别处只改了收藏状态）→ 退回
+            # `ep_status`。此时若本地是 1~N 编号，两者口径一致、能对上。
+            seen = int(ep_status or 0)
+            source = "ep_status"
+
+        want = float(seen) + 1
         for e in eps:                       # list_episodes 已按 ep_index 升序
             if abs(float(e.ep_index or 0) - want) < 1e-6:
                 return int(e.id), ""
         later = [e for e in eps if float(e.ep_index or 0) > want]
         if later:
+            nxt = float(later[0].ep_index or 0)
+            # **日志分两种情形，别一律说"缺集"**，
+            # 看着像出错，其实完全正常）。
+            #
+            # 成因不同、用户该做的事也不同：
+            #   ① **本地集号起点就不是 1**（续篇/跨篇章连续编号，如这部
+            #      的 78~81）—— `want=1` 本就不该存在，取第一个可播的是
+            #      **正确行为**，不该报警。
+            #   ② 本地**缺中间某一集**（真有 1、3 却没有 2）—— 那才是
+            #      值得记一笔的（用户可能要去补那一集）。
+            # 判据：`want` 比本地最小集号还小 → 情形 ①。
+            first = float(eps[0].ep_index or 0)
+            if want < first:
+                log.debug("「下一集」按连续编号取第一集：本地从第 %g 集起编"
+                          "（进度 %g 不在本地编号内，subject_id=%s，"
+                          "进度取自 %s）", first, want, subject_id, source)
+            else:
+                log.info("「下一集」本地缺第 %g 集，跳过后取第 %g 集"
+                         "（subject_id=%s，进度取自 %s）",
+                         want, nxt, subject_id, source)
             return int(later[0].id), ""
         # 走到这里说明本地没有任何"第 want 集及以后"的集。两种成因要分开说：
         if len({float(e.ep_index or 0) for e in eps}) == 1:
             # 所有集号一模一样 → 扫描时标题没解析出来（实测：某部 12 集全是 2.0）
             return 0, ("本地集号异常（%d 集全是第 %g 集，扫描解析可能失败），"
                        "无法判断下一集" % (len(eps), float(eps[0].ep_index or 0)))
-        return 0, ("本地没有更靠后的集了（Bangumi 进度 %d 集，本地共 %d 集）"
-                   % (int(ep_status or 0), len(eps)))
+        return 0, ("本地没有更靠后的集了（已看到第 %d 集，本地共 %d 集）"
+                   % (int(seen), len(eps)))
+
+    def _watched_max_index(self, subject_id: int) -> int:
+        """该条目**已看过的最大集号**（`sort` 口径，取本地与远端逐集记录的较大者）。
+
+        **只查逐集记录、不带 `ep_status` 兜底**（与 `max_watched_ep_index`
+        取的是同一个最大值，区别在"没有逐集数据时返回什么"）：调用方要能
+        分辨"到底有没有逐集数据"，好在没有时切换口径。
+
+        返回 0 = **一条观看记录都没有**（返回 0 是可信的，见
+        `Database.max_ep_index_from_watched`）。
+        """
+        try:
+            return int(self._db.max_ep_index_from_watched(subject_id))
+        except Exception as e:
+            log.warning("读取已看最大集号失败 subject_id=%s: %s", subject_id, e)
+            return 0
 
     # ---------- F20：集级观看记录（动态页时间线）----------
     @Property("QVariantList", notify=watchedEpsChanged)
@@ -1462,7 +1540,11 @@ class LibraryBridge(QObject):
         if cached:
             if cached != int(s.collect_type or 0):
                 try:
-                    self._db.set_subject_collect_type(int(subject_id), cached)
+                    # local_change=False：值来自**同步缓存**（服务端镜像），
+                    # 本地只是抄一遍用来秒显 —— 不是用户改的，不能盖
+                    # `local_at`（见 Database.set_subject_collect_type）
+                    self._db.set_subject_collect_type(int(subject_id), cached,
+                                                      local_change=False)
                 except Exception as e:
                     log.warning("写入收藏状态快照失败 subject_id=%s: %s",
                                 subject_id, e)

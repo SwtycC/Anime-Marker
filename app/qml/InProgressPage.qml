@@ -378,11 +378,28 @@ Item {
         return item.epStatus + " / " + item.totalEps + " 集"
     }
 
-    // 数据变化：滚动回顶部
+    // 数据变化：滚动回顶部。
+    //
+    // **但"只是进度变了"时不回顶**：播放结束会自动刷新本页
+    // （见 LibraryBridge / PlayerBridge.playbackStopped），而列表的**行数与
+    // 顺序都没变** —— 只是某一行的"已看 N 集"数字变了。这时把视图拉回
+    // 顶部会打断用户（他正翻到第 6 部，看完一集回来就被弹回第 1 部）。
+    //
+    // 判据：条目数量与 id 序列都没变 → 认为只是内容刷新，保持滚动位置。
+    // 真正的新增/删除（数量或顺序变了）才回顶 —— 那时列表结构变了，
+    // 停留在原偏移量反而会落到一行"别的番"上。
     Connections {
         target: typeof library !== "undefined" && library ? library : null
+        property string lastIds: ""
         function onInProgressChanged() {
-            flick.contentY = 0
+            var ids = []
+            for (var i = 0; i < root.items.length; i++)
+                ids.push(root.items[i].localSubjectId + ":" + root.items[i].bangumiId)
+            var sig = ids.join(",")
+            if (sig !== lastIds) {
+                lastIds = sig
+                flick.contentY = 0
+            }
         }
     }
 

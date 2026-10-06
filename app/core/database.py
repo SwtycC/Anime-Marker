@@ -28,25 +28,41 @@ SCHEMA_VERSION = 15
 #: 抽成常量避免哪天只改一处。
 #: 只覆盖"缓存里有对应行"的条目：没行 = 不知道（未收藏 / 从没同步过），
 #: 不能据此判定"未收藏"（见 cached_collect_type 的说明）。
+#:
+#: **唯一的例外：本地刚显式设置过、而缓存那份是设置之前的旧值**
+#: （踩坑，见 set_subject_collect_type）。判据是这两个时刻谁更新：
+#:     collection_updated_at  服务端那条收藏**自己**的最后修改时间
+#:     local_at               本地最后一次**显式**设置该状态的时刻
+#: 前者更早 → 服务端那份是我这次设置**之前**的（推送还没落地 / 推送
+#: 失败 / 拉到的就是旧快照），保留本地那份，不许盖回去。
+#:
+#: **别拿"本次同步的时刻"来比**：
+#: `local_at` 永远是过去的时刻、同步时刻永远是现在，比出来恒成立 ——
+#: 只有"本地写入恰好与同步落在同一个时钟秒内"才拦得住，等于形同虚设。
+#: 实测症状："本地刚标成「看过」，下一次同步又变回「在看」"。
+#: **也别拿 `updated_at` 来比**：那一列每次整表同步都被刷成"本次写入
+#: 时刻"，同样恒成立。
+#: 只有 `collection_updated_at` 是**跟着数据走**的：用户真在网页/手机上
+#: 改过，它就变新，覆盖照常发生（这正是要的效果，不能挡住）。
+#:
+#: 三种"未知"一律按旧行为**放行覆盖**（宁可覆盖，也别凭空卡住同步）：
+#:     local_at 为空              → 本地从没显式设过，缓存说了算
+#:     collection_updated_at 为空 → 老库 / 服务端没给，无从比较
+#:     两者解析不出时间            → 同上
+#: 比较用 `datetime()` 而不是字符串：两侧时区偏移可能不同（服务端固定
+#: 带 +08:00，本地是机器时区），字符串比大小在跨时区时是错的。
 _COLLECT_TYPE_BACKFILL_SQL = """
 UPDATE subjects
    SET collect_type = (
        SELECT c.collect_type FROM inprogress_cache c
         WHERE c.bangumi_id = subjects.bangumi_id)
- WHERE bangumi_id IN (SELECT bangumi_id FROM inprogress_cache)
-   -- **本地刚写过的不要被缓存覆盖**（踩坑，见 set_subject_collect_type）。
-   --
-   -- 判据是缓存行上的 `local_at`：它**只由 `set_subject_collect_type`
-   -- 写**，记"用户在本程序里最后一次显式设置该状态"的时刻；整表同步
-   -- （`replace_inprogress_cache` 的 INSERT）**不动它**（不写这一列）。
-   -- 只要它晚于本次同步的写入时刻 `?`，就说明这条是本地更新的、
-   -- 缓存那份是旧的，不能盖回去。
-   --
-   -- **不要用 `updated_at` 来判**（踩过）：那一列每次整表同步都会被
-   -- 刷成"本次写入时刻"，拿它比时间等于"缓存永远最新"，防线形同虚设。
-   AND COALESCE((
-           SELECT c.local_at FROM inprogress_cache c
-            WHERE c.bangumi_id = subjects.bangumi_id), '') < ?
+ WHERE EXISTS (
+       SELECT 1 FROM inprogress_cache c
+        WHERE c.bangumi_id = subjects.bangumi_id
+          -- 「本地显式设过 且 服务端那份比它还旧」→ 不覆盖；其余都覆盖
+          AND NOT (COALESCE(c.local_at, '') <> ''
+                   AND datetime(c.collection_updated_at) IS NOT NULL
+                   AND datetime(c.collection_updated_at) < datetime(c.local_at)))
 """
 
 #: 「本地有状态、收藏缓存里却没有它」的**已匹配**条目 → 清成"未知"。
@@ -649,11 +665,9 @@ class Database:
         # 之后由 replace_inprogress_cache 在每次同步时自动保持对齐，
         # 所以这一条只在旧库上跑一次。
         if old_version < 10:
-            # 参数传"未来时刻"：迁移场景下不存在"本地刚写过"的缓存行
-            # （那时 local_at 这一列还不存在，全是 NULL），所以
-            # `COALESCE(local_at,'') < ?` 恒成立 = 照旧全部回填。
-            cur = self._conn.execute(_COLLECT_TYPE_BACKFILL_SQL,
-                                     ("9999-12-31T23:59:59+00:00",))
+            # 迁移场景下 `local_at` 这一列还不存在（全 NULL）→ 防线的
+            # "本地显式设过"那条不成立 → 一律照旧全部回填，与改动前一致。
+            cur = self._conn.execute(_COLLECT_TYPE_BACKFILL_SQL)
             if cur.rowcount:
                 log.info("迁移：按收藏缓存回填了 %s 个条目的收藏状态",
                          cur.rowcount)
@@ -661,7 +675,7 @@ class Database:
         #
         # 用途：SP / OVA / NCOP / 特典 这类"附加内容"的序号是**字符串**语义
         # （`SP01`、`OVA01`、`NCOP3`），而 `ep_index` 是 REAL 装不下前缀。
-        # 早期把它们顺延成 13.5 / 14 这种假集号（实测截图），既与正片混淆、
+        # 早期把它们顺延成 13.5 / 14 这种假集号，既与正片混淆、
         # 也显示成"第 13.5 集"。现在用 ep_index 只负责排序，
         # ep_label 负责显示（见 scanner._fill_episodes 与 DetailPage.fmtIndex）。
         # 旧库该列为 NULL —— 老数据没有标签，QML 侧回落到数值显示，无降级问题。
@@ -678,10 +692,7 @@ class Database:
         # 下载后扫描，太频繁了"）：原先那个去重集合是 `RssBridge` 的一个
         # 内存 set，**程序一重启就清空**；而 qBittorrent 里那个已经下完的
         # 任务还在列表里（用户不一定会马上清理），于是每次启动都会重新判定
-        # 一次"它下完了" → 又扫一遍。用户看到的是"我一开软件它就在扫描"。
-        # 落库之后"这一条已经因为下完扫过了"是**跨会话**的事实，
-        # 重启也不会重扫；而用户以后下**新的一集**时那是新记录、新行，
-        # 自然又会扫一次。
+        # 一次"它下完了" → 又扫一遍。
         #
         # 旧库该列为 NULL —— 与"还没扫过"同义，首次升级时会补扫一遍
         # （一次性，之后不再重复），这是可接受的。
@@ -919,7 +930,8 @@ class Database:
         # 拿来当收藏状态会默默写错一条快照。
         return ctype if 1 <= ctype <= 5 else 0
 
-    def set_subject_collect_type(self, subject_id: int, collect_type: int) -> None:
+    def set_subject_collect_type(self, subject_id: int, collect_type: int,
+                                 local_change: bool = True) -> None:
         """写入该条目的 Bangumi 收藏状态（详情页状态选择器）。
 
         **本地只做"快照"，权威在 Bangumi**：这个值有三个来源 ——
@@ -935,6 +947,17 @@ class Database:
         这里把缓存行也同步成新值：缓存是"服务端镜像"，
         而服务端此刻已经是我们刚推上去的状态（调用方保证远端先成功），
         改它只是让镜像跟上，不会伪造远端状态。
+
+        **`local_change` 区分"这个值是谁的意思"**，只有它为真时才盖
+        `local_at`（那个时刻是回填防线的判据，见 _COLLECT_TYPE_BACKFILL_SQL）：
+            真 —— 用户显式设的：详情页点状态（模式 ①）、仅本地标记、
+                  播放器自动完结。这几处的共同点是**本地先有了这个意图**。
+            假 —— **② ③ 两条"把别处查到的值写回本地"的路**：值来自远端
+                  或缓存，本地只是抄一遍，不是"用户改过"。抄一次就盖个
+                  `local_at=现在`，会让防线误以为"本地比服务端新"，
+                  于是服务端后来真正的变更反而被这条防线挡住 —— 那不是
+                  防线该拦的东西。默认值取真（多数调用点是用户动作），
+                  抄写路径显式传假。
         """
         with self._cursor() as cur:
             cur.execute(
@@ -948,17 +971,30 @@ class Database:
             #
             # `local_at` 记"本地显式设置"的时刻，供回填 SQL 判断新旧
             # （见 _COLLECT_TYPE_BACKFILL_SQL）。**它只在这里被写** ——
-            # 整表同步刻意不碰它。
-            now = _now()
-            cur.execute(
-                """UPDATE inprogress_cache
-                      SET collect_type=?, local_at=?
-                    WHERE bangumi_id = (
-                        SELECT bangumi_id FROM subjects
-                         WHERE id=? AND bangumi_id IS NOT NULL
-                    )""",
-                (int(collect_type or 0), now, int(subject_id)),
-            )
+            # 整表同步刻意不碰它（`replace_inprogress_cache` 会先把这一列
+            # 整批留下来、重插时原样放回）。
+            if local_change:
+                cur.execute(
+                    """UPDATE inprogress_cache
+                          SET collect_type=?, local_at=?
+                        WHERE bangumi_id = (
+                            SELECT bangumi_id FROM subjects
+                             WHERE id=? AND bangumi_id IS NOT NULL
+                        )""",
+                    (int(collect_type or 0), _now(), int(subject_id)),
+                )
+            else:
+                # 抄写路径：值本身照样让镜像跟上，但**不许盖 `local_at`**
+                # （那会让防线把一次抄写当成"用户改过"，见 docstring）。
+                cur.execute(
+                    """UPDATE inprogress_cache
+                          SET collect_type=?
+                        WHERE bangumi_id = (
+                            SELECT bangumi_id FROM subjects
+                             WHERE id=? AND bangumi_id IS NOT NULL
+                        )""",
+                    (int(collect_type or 0), int(subject_id)),
+                )
 
     # ---------- 条目别名 ----------
     #
@@ -1485,44 +1521,96 @@ class Database:
             except (TypeError, ValueError):
                 return 0
 
-    def subject_watch_progress(self, subject_id: int) -> int:
-        """综合「看到第几集」：**本地**与 **Bangumi 集级记录**取最大。
+    def subject_watched_ep_count(self, subject_id: int) -> int:
+        """已看过的**正片集数**（本地与 Bangumi 两路按集号去重后数个数）。
 
-        **为什么要两路取最大**（口径与在看页一致，见 library._load_inprogress）：
-          - 本地 `episodes.watched`：在这台电脑上看的集（换设备/在网页上看的
-            不在这里）；
-          - `watched_episodes`：从 Bangumi 拉回来的集级标记（网页上点的
-            「看过 ep.5」会进这张表）。
-        只看本地会漏"在别处看完"的情形；只看远端会漏"没同步"的 —— 取 max。
+        两路合并的理由与 `max_watched_ep_index` + `watched_episodes`
+        那套一致（只看本地会漏"在别处看的"，只看远端会漏"还没同步的"），
+        但这里**必须去重**：
+        同一集本地标过、又从 Bangumi 拉回来一次，相加会把它算两遍，
+        凑够 `total_eps` 就误判 —— 所以用 `UNION` 而不是 `UNION ALL`。
 
-        只统计正片口径：`ep_index > 0`（附加内容在本地表里是
-        `main_max + 1000 + n` 的排序值，进来的话会给出上千的假进度；
-        远端表的 SP 行通常没有正片序号，一并排除）。
+        只数正片：本地按 `ep_label` 为空（附加内容的 `ep_index` 是
+        `main_max + 1000 + n` 的排序值，算进来会凭空多出几百集），
+        远端按 `ep_index > 0`（SP 行通常没有正片序号）。
         """
-        local = self.max_watched_ep_index(subject_id)
         with self._cursor() as cur:
             cur.execute(
-                "SELECT MAX(ep_index) AS m FROM watched_episodes"
-                " WHERE subject_id=? AND ep_index IS NOT NULL AND ep_index>0",
-                (subject_id,),
+                """
+                SELECT COUNT(*) AS n FROM (
+                    SELECT CAST(ep_index AS REAL) AS idx FROM episodes
+                     WHERE subject_id=? AND watched=1
+                       AND ep_index IS NOT NULL
+                       AND (ep_label IS NULL OR ep_label='')
+                    UNION
+                    SELECT CAST(ep_index AS REAL) FROM watched_episodes
+                     WHERE subject_id=? AND ep_index IS NOT NULL
+                       AND ep_index>0
+                )
+                """,
+                (int(subject_id), int(subject_id)),
             )
-            row = cur.fetchone()
-            remote = 0
-            if row and row["m"] is not None:
-                try:
+            return int(cur.fetchone()["n"])
+
+    def max_ep_index_from_watched(self, subject_id: int) -> int:
+        """已看过的**最大集号**（与本地 `episodes.ep_index` 同口径），
+        没有**任何**观看记录时返回 0。
+
+        **返回 0 是可信的**：本方法**只查观看记录**（本地 `watched=1` 的集
+        + 远端 `watched_episodes`），返回 0 就明确表示"确实一条记录都没有"
+        —— 调用方据此才能判断"该不该换个口径"（如退回 Bangumi 收藏接口的
+        `ep_status`）。带 `ep_status` 兜底的口径做不到这一点：它返回 0 时
+        "一条都没看过"与"没有逐集数据"分不开。
+
+        用途：`LibraryBridge._next_episode` 判断"下一集从哪算"。
+        它必须先知道有没有逐集数据 —— 有的话用这个（`sort` 口径，
+        与本地 `ep_index` 一致）；一条都没有才退回 Bangumi 收藏接口的
+        `ep_status`（那是 `ep` 口径，只在本地恰好也是 1~N 编号时才等价）。
+        见那里对"73 还是 89"这段踩坑的说明。
+
+        只统计正片（`ep_index > 0`）：附加内容的排序值是
+        `main_max + 1000 + n`，算进去会得到上千的假集号。
+        """
+        local = self.max_watched_ep_index(subject_id)
+        remote = 0
+        try:
+            with self._cursor() as cur:
+                cur.execute(
+                    "SELECT MAX(ep_index) AS m FROM watched_episodes"
+                    " WHERE subject_id=? AND ep_index IS NOT NULL"
+                    " AND ep_index>0",
+                    (subject_id,),
+                )
+                row = cur.fetchone()
+                if row and row["m"] is not None:
                     remote = int(float(row["m"]))
-                except (TypeError, ValueError):
-                    remote = 0
+        except (TypeError, ValueError):
+            remote = 0
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("读取远端已看最大集号失败 subject_id=%s: %s",
+                        subject_id, e)
+            return local
         return max(local, remote)
 
     def subject_all_watched(self, subject_id: int) -> bool:
-        """是否**每一集**都看过：观看进度 ≥ 官方正片数（`total_eps`）。
+        """是否**每一集**都看过：已看过集数 ≥ 官方正片数（`total_eps`）。
 
-        **为什么不用"本地 episodes 全部 watched"来判**（关键取舍）：
-        本地 `episodes` 只有**扫描到的文件** —— 本地只有 5 个文件、番有 12 集
-        时，"本地 5 集全看过"显然不等于"整部看完"，会误判。
-        用"看到第 N 集 ≥ 官方集数"（`subject_watch_progress >= total_eps`）
-        才是"追完了"的语义，也与在看页的进度口径一致。
+        **判据是"集数 vs 集数"，不能拿集号去比**（踩坑，实测："在看页没有
+        史莱姆第四季了"）：
+            史莱姆第四季是跨季连续编号 —— 本地文件 `[S4][01_73]`…`[21_93]`、
+            Bangumi 集列表同样是 73~96，而 `total_eps` 是**本季 24 集**。
+            用户看到第 89 集（= 本季第 17 集）时，旧判据"最大集号 ≥
+            total_eps"就是 `89 >= 24` → 误判
+            "整部看完" → 本地与 Bangumi 双双被标成「看过」，条目从在看页
+            消失 ✗。只有集号恰好从 1 开始的番，这两个数才同量纲 ——
+            旧判据是靠这个巧合成立的。
+        改用"看过几集 vs 一共几集"（见 `subject_watched_ep_count`），
+        与编号从几开始无关。
+
+        这同时保住了原来那个取舍 —— **不按"本地文件全看过"判**：
+        本地 `episodes` 只有**扫描到的文件**，只扫到 5 个文件、番有 12 集
+        时，"本地 5 集全看过"不等于"整部看完"，会误判；而"看过集数 5 < 12"
+        仍然不判完结。
 
         `total_eps` 缺失（未匹配 Bangumi / 数据没有）时**不判** ——
         没有官方集数就没有"每集"的基准，宁可漏判不可误判。
@@ -1533,7 +1621,7 @@ class Database:
         total = int(subj.total_eps or 0)
         if total <= 0:
             return False
-        return self.subject_watch_progress(subject_id) >= total
+        return self.subject_watched_ep_count(subject_id) >= total
 
     def list_local_ep_indices(self, subject_id: int) -> set[float]:
         """本地已有集数序号集合（F19 三层查重第一层）。"""
@@ -1560,11 +1648,13 @@ class Database:
         也会写它）。不在这里对齐的话，用户改过收藏后本地会一直显示旧状态，
         且因为"有值就不再回查"而**永远不会自愈**。
 
-        **但"这批新数据"不一定比本地新**：收藏同步可能是
-        几小时甚至几十小时前拉的，而本地刚因"自动完结"写过一次状态 ——
-        无条件搬运就会把刚写的值盖回旧的。所以搬运带一个
-        `local_at` 判据（见 _COLLECT_TYPE_BACKFILL_SQL），本地更新过的那几条
-        跳过；同时上面那段 `local_marks` 保住该列不被整表重建抹掉。
+        **但"这批新数据"不一定比本地新**：这次拉取本身是刚发生的，可它
+        反映的是**服务端那条收藏当前的状态** —— 而本地可能刚刚因"自动
+        完结"显式写过一次，那一次还没推到服务端（推送是后台线程，可能
+        还没落地 / 失败）。无条件搬运就会把刚写的值盖回旧的。所以搬运带
+        一个"谁更新"的判据（见 _COLLECT_TYPE_BACKFILL_SQL）：本地显式
+        设过、且服务端那条收藏比它旧的，跳过；同时上面那段 `local_marks`
+        保住 `local_at` 不被整表重建抹掉（抹掉就等于判据失效）。
 
         `truncated=True` 表示这次拉取触顶截断（见 `iter_user_collections`
         的 max_items）：此时**不会**把"名单外的条目"当成"已取消收藏"，
@@ -1613,9 +1703,10 @@ class Database:
             # 也用于 v10 迁移）。只覆盖"缓存里有行"的条目：名单外的条目
             # 保持原快照，不会被清成"未知"。
             #
-            # 参数 `now`：用来判"缓存里的这一行是不是本地刚写过的"
+            # 不带参数：例外判据靠缓存行自己的 `collection_updated_at` 与
+            # `local_at` 两个时刻，与"本次同步是什么时候跑的"无关
             # （见 _COLLECT_TYPE_BACKFILL_SQL）。
-            cur.execute(_COLLECT_TYPE_BACKFILL_SQL, (now,))
+            cur.execute(_COLLECT_TYPE_BACKFILL_SQL)
             # ② 这次拉取是全量的（除触顶截断），所以**名单里没有的已匹配条目
             # = 服务端已不在收藏里** → 本地快照清成 0（"未知"）。
             #

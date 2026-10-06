@@ -10,15 +10,22 @@ import QtQuick
 // **为什么不用 QML 的 Switch**：QtQuick Controls 的 Switch 自带平台风格的
 // 阴影与高光，与界面的"1px 线性"观感不搭；且它的尺寸/圆角不好压到这么小。
 // 自绘能精确控制成"轨道 36×20、滑块 14、内边距 3"这套与字号匹配的比例。
-//
-// 与旧版（方形 + Canvas 打勾）的差别：**只保留开关形态**。
-// 那个方框打勾在设置页里与"多选"的语义撞车（读者会以为可以多选），
-// 而这里全部是"开/关"型配置，用开关更准确。
+
 Item {
     id: root
 
     property string text: ""
     property bool checked: false
+
+    /// 形态："switch"（默认，胶囊开关）/ "checkbox"（方形勾选框）。
+    ///
+    /// 为什么不做成两个组件：两者的**文字排版、禁用态、flash 高亮、
+    /// toggled 信号**完全一样，只有"那个方块长什么样"不同 ——
+    /// 拆成两个文件会让上面这几样各留一份、迟早漂移。
+    property string variant: "switch"
+
+    /// 是否方框形态（内部派生，别在外部写）。
+    readonly property bool isCheckbox: variant === "checkbox"
 
     // 禁用态：整体降透明度 + 不再响应鼠标。
     //
@@ -91,17 +98,109 @@ Item {
     }
 
     // ---- 尺寸（与 Theme.fontMd 的 14px 正文视觉重量匹配）----
-    readonly property int trackW: 36
-    readonly property int trackH: 20
+    //
+    // `switch` 形态：36×20 胶囊 + 14 滑块 + 3 内边距（原有尺寸，不动）。
+    // `checkbox` 形态：18×18 方框（与正文 14px 的字高相称 —— 跟开关的
+    //   高度接近，两种形态在列表里并排时基线一致，不会一高一矮）。
+    readonly property int trackW: isCheckbox ? 18 : 36
+    readonly property int trackH: isCheckbox ? 18 : 20
     readonly property int thumbSize: 14
     readonly property int thumbPad: 3
+    //: 方框圆角（对应 CSS 的 --checkbox-border-radius: 5px，按尺寸缩放成 4）
+    readonly property int boxRadius: 4
 
     implicitWidth: trackW + (text === "" ? 0 : Theme.spacingMd + label.implicitWidth)
     implicitHeight: Math.max(trackH, label.implicitHeight)
 
+    // ---- 方框形态（variant === "checkbox"）----
+    //
+    // 造型移植自 uiverse.io 的 `.ui-checkbox`（Galahhad）：白底细边框的方框，
+    // 勾选时填主题色 + 打勾**带一点回弹**地缩放出现（原 CSS 的
+    // `cubic-bezier(0.12, 0.4, 0.29, 1.46)` 就是这种"过冲"曲线，QML 里
+    // 对应 `Easing.OutBack`）。
+    //
+    // 同一时刻只显示这一套或下面那套开关（`visible` 互斥）——
+    // 比"用属性把尺寸/圆角在两种形态间切来切去"稳：后者容易出现
+    // 中间态（动画途中改圆角/尺寸会看到形变）。
+    Item {
+        id: box
+        anchors.verticalCenter: parent.verticalCenter
+        visible: root.isCheckbox
+        width: root.trackW
+        height: root.trackH
+
+        Rectangle {
+            id: boxBg
+            anchors.fill: parent
+            radius: root.boxRadius
+            // 未选中：白底（跟随面板底色，深色主题下自动变深）
+            // 悬停：描边先变主题色（对应 CSS 的 :hover）
+            // 选中：**整体填主题色**（对应 CSS 的 :checked）
+            color: root.checked ? Theme.accent : Theme.surfaceBg
+            border.width: Theme.lineThin
+            border.color: root.checked ? Theme.accent
+                        : (trackMouse.containsMouse ? Theme.accent
+                                                    : Theme.border)
+
+            Behavior on color { ColorAnimation { duration: Theme.durFast } }
+            Behavior on border.color { ColorAnimation { duration: Theme.durFast } }
+        }
+
+        // 勾：两段线组成的 "✓"，勾选时从 0 缩放出现。
+        //
+        // **用 Canvas 而不是旋转的 Rectangle**（改过一版）：两条 Rectangle
+        // 各自 `rotation` 再拼，拐点处要靠调 x/y 手对齐 —— 换个字号/尺寸
+        // 就容易错位（第一版渲染出来勾偏左、两笔没接上）。
+        // Canvas 直接按比例画两段折线，`lineCap: round` 天然有圆头，
+        // 几何只跟画布尺寸相关、不依赖手工凑坐标。
+        Canvas {
+            id: checkMark
+            anchors.centerIn: parent
+            width: 12
+            height: 12
+            // 中心缩放（默认原点在左上角，会像"从角落长出来"）
+            transformOrigin: Item.Center
+            scale: root.checked ? 1.0 : 0.0
+            opacity: root.checked ? 1.0 : 0.0
+
+            // 颜色随主题变（浅色主题色 → 深勾，深色 → 白勾）
+            onPaint: {
+                var ctx = getContext("2d")
+                ctx.reset()
+                ctx.strokeStyle = Theme.accentText
+                ctx.lineWidth = 2
+                ctx.lineCap = "round"
+                ctx.lineJoin = "round"
+                // 折线：左侧起笔 → 底部拐点 → 右上收笔（按画布比例）
+                ctx.beginPath()
+                ctx.moveTo(width * 0.22, height * 0.52)
+                ctx.lineTo(width * 0.43, height * 0.73)
+                ctx.lineTo(width * 0.80, height * 0.30)
+                ctx.stroke()
+            }
+            // 主题色变了要重画（否则换了主题仍是旧勾色）
+            Connections {
+                target: Theme
+                function onAccentTextChanged() { checkMark.requestPaint() }
+            }
+
+            // OutBack = CSS 那条带过冲的 cubic-bezier（"蹦"一下出现）
+            Behavior on scale {
+                NumberAnimation {
+                    duration: Theme.durNormal
+                    easing.type: Easing.OutBack
+                    easing.overshoot: 2.0
+                }
+            }
+            Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
+        }
+    }
+
+    // ---- 开关形态（variant === "switch"，默认）----
     Rectangle {
         id: track
         anchors.verticalCenter: parent.verticalCenter
+        visible: !root.isCheckbox
         width: root.trackW
         height: root.trackH
         radius: height / 2                    // 胶囊

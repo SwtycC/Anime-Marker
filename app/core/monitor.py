@@ -171,6 +171,8 @@ class ProgressMonitor(QObject):
     #: 整部看完 → 自动标记「看过」成功（本地已改）。参数 (subject_id, 名称)。
     #: PlayerBridge 转发给 qml_app，用于刷新海报墙/在看页的状态标签。
     subject_completed = Signal(int, str)
+    #: 监控停止（播放结束）。界面据此刷新"在看"进度等依赖本地观看记录的视图。
+    stopped = Signal()
 
     # 连续多少次读不到进度才提示一次（按默认 3s 轮询 ≈ 15 秒）
     MISS_HINT_AFTER = 5
@@ -262,9 +264,24 @@ class ProgressMonitor(QObject):
         log.info("开始监控 episode_id=%s file=%s", episode.id, episode.file_path)
 
     def stop(self) -> None:
+        """停止监控；**确实停止过才发 `stopped`**。
+
+        **为什么要有这个信号**：
+        播放结束（用户关掉播放器）是"这一集看完了"的**最终确认点** ——
+        阈值触发只是"进度过了 90%"，而停止才意味着这次观看真正结束。
+        界面据此刷新在看页的进度条，用户就不必手动切页触发重取。
+
+        **只在真的在监控时才发**（`self._episode is not None`）：
+        `stop()` 在多个地方被调用（播放器窗口消失、启动失败、退出程序），
+        重复发信号会让界面无谓地刷几次。退出时那一次也会发，但那时
+        界面正在关闭，代价可忽略。
+        """
+        was_monitoring = self._episode is not None
         self._timer.stop()
         self._episode = None
         log.info("停止监控")
+        if was_monitoring:
+            self.stopped.emit()
 
     def wait_pending_sync(self, ms: int = 3000) -> None:
         """等待后台同步线程结束（退出时调用）。
@@ -381,9 +398,12 @@ class ProgressMonitor(QObject):
           ② `PlayerBridge.markWatched` —— 详情页手动勾。
         两个入口都走这里，保证"无论怎么标，最后一集标完就完结"。
 
-        **判定**用 `db.subject_all_watched`（进度 ≥ 官方正片数），不是
-        "本地文件全看过" —— 本地往往缺集（只扫到 5 个文件、番有 12 集），
-        按文件判会把"追到一半"误判成"看完了"。
+        **判定**用 `db.subject_all_watched`（**看过集数** ≥ 官方正片数），
+        不是"本地文件全看过" —— 本地往往缺集（只扫到 5 个文件、番有 12 集），
+        按文件判会把"追到一半"误判成"看完了"；也不是"最大集号 ≥ 官方集数"
+        —— 跨季连续编号的番集号和集数不同量纲（史莱姆第四季从 73 起编号，
+        看到第 89 集 = 本季第 17 集，拿 89 ≥ 24 判就会误标完结）。
+        两个口径的取舍见 `Database.subject_all_watched`。
 
         **顺序：本地先写，远端异步** —— 与 `_CollectTypeWorker`（用户手动
         改状态，远端成功才落本地）**相反**，原因：
