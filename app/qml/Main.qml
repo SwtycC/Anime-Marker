@@ -288,6 +288,34 @@ ApplicationWindow {
             if (detailPage.subjectId === subjectId)
                 detailPage.reloadTagRows()
         }
+        // 集数列表变了（扫描 / 下载完自动扫描写进了新集）→ 详情页重取一次。
+        //
+        // **为什么需要这个连接**：`library.episodes(sid)`
+        // 是普通 Slot、没有可追踪依赖，只有 `DetailPage.load()` 会主动调它。
+        // 所以扫描完成后，**已经打开的详情页一直显示旧集数**，必须退出去
+        // 再进来才算"刷新"。这里把 `episodesChanged` 接上，扫描一结束就
+        // 让当前详情页重取（`refreshEpisodes()` 只重取集数与统计，
+        // **不回滚滚动位置、不清编辑态**，见 DetailPage 里的说明）。
+        function onEpisodesChanged() {
+            if (detailPage.subjectId > 0)
+                detailPage.refreshEpisodes()
+        }
+        // 收藏状态被**别处**改了 → 详情页那排选择器要跟上。
+        //
+        // **为什么不能只靠 `collectTypeChanged` 那条**：那条信号只在详情页自己的
+        // 流程里发（`_CollectTypeWorker` / `setCollectType`）。而**自动完结**
+        // 走的是另一条链 —— `ProgressMonitor` 直接写库，然后
+        // `player.subjectCompleted` → `library.reload()`，而 `reload()`
+        // 发的是 `subjectsChanged`，**不发 `collectTypeChanged`**。
+        // 于是自动标完之后，选择器一直停在旧状态，非得退出去再进来才对。
+        //
+        // `reload()` 也发 `subjectsChanged`，所以挂在这里能覆盖两条来源；
+        // 值没变时 `refreshCollectType()` 内部直接返回，开销只是一次
+        // `library.subject()` 查缓存字典。
+        function onSubjectsChanged() {
+            if (detailPage.subjectId > 0)
+                detailPage.refreshCollectType()
+        }
         // 收藏状态可能变了（用户点了那排状态按钮，或进入详情页时补齐）→
         // 解锁 `collectBusy`、清掉乐观更新的待确认值，**值确实变了才 reload**。
         //
@@ -313,11 +341,11 @@ ApplicationWindow {
         function onCollectTypeChanged(subjectId) {
             if (detailPage.subjectId !== subjectId)
                 return
-            detailPage.collectBusy = false
-            detailPage.collectPending = 0
-            if ((library.subject(subjectId).collectType || 0)
-                    !== (detailPage.subject.collectType || 0))
-                detailPage.load(subjectId)
+            // 走与 `onSubjectsChanged` 同一条轻量路径（只换 collectType 字段，
+            // 不重取整条、不滚回顶部）。早期这里调的是 `load(subjectId)` ——
+            // 那会把用户的滚动位置冲掉、并重发一次 `requestCollectType`，
+            // 而实际要改的只是一个状态值。
+            detailPage.refreshCollectType()
         }
         function onStatusMessage(text) {
             banner.show(text)
@@ -510,10 +538,35 @@ ApplicationWindow {
         }
 
         function onProgressChanged(episodeId, progress) {
-            // 播放中：把进度显示在状态栏，替代旧的进度条语义
-            if (progress > 0)
-                statusBar.setMessage(
-                    "播放中 " + Math.round(progress * 100) + "%")
+            // 播放中：把**动漫名 + 集号 + 集名 + 进度**显示在状态栏。
+            //
+            // 三个字段都来自 PlayerBridge（它们在 playEpisode 时就算好
+            // 缓存了 —— 这里每 3 秒被调一次，不能现查库）：
+            //   playingSubjectName  动漫名（subjects.name_cn 优先）
+            //   playingEpisodeLabel 集号（"第 3 集" / "SP01"）
+            //   playingTitle        集名（episodes.title）
+            //
+            // 用 `·` 分隔而不是空格：集名里常有空格，分隔符要能一眼分辨
+            // 出"哪一段是集号、哪一段是标题"。缺失的段自动跳过（拼装后
+            // 再 trim），所以未匹配条目（没有集名）也不会显示成
+            // "· ·" 这种空壳。
+            if (progress <= 0)
+                return
+            var parts = []
+            if (typeof player !== "undefined" && player) {
+                if (player.playingSubjectName !== "")
+                    parts.push(player.playingSubjectName)
+                if (player.playingEpisodeLabel !== "")
+                    parts.push(player.playingEpisodeLabel)
+                if (player.playingTitle !== ""
+                        && player.playingTitle !== player.playingSubjectName)
+                    parts.push(player.playingTitle)
+            }
+            var head = parts.join(" · ")
+            statusBar.setMessage(
+                head === ""
+                    ? ("播放中 " + Math.round(progress * 100) + "%")
+                    : (head + " — " + Math.round(progress * 100) + "%"))
         }
     }
 
@@ -596,7 +649,7 @@ ApplicationWindow {
     //   顶部提示条 —— 所有**结论性**消息（扫描完成 / 联网失败 / 已删除…），
     //                 并带颜色分级（主题色=正常、琥珀=需注意）
     //
-    // **为什么这么分**（踩坑）：原先这里和下面那个 banner 的 Connections
+    // **为什么这么分**：原先这里和下面那个 banner 的 Connections
     // 是**各接一遍同一个 scanner**，于是同一次事件被两个通道各报一次 ——
     // 用户看到"两条都在说超时"（其实一条来自状态栏、一条来自顶部提示条），
     // 而且措辞还不一样（状态栏写"匹配 N 个"、提示条写"已匹配/未匹配"）。
@@ -867,7 +920,7 @@ ApplicationWindow {
 
     // ============ 顶部提示条（**可叠加多层**）============
     //
-    // 为什么要做成"列表"而不是单个浮层（实测反馈）：
+    // 为什么要做成"列表"而不是单个浮层：
     // 「添加动漫」网络失败时会**连发两条**消息 ——
     //   ① 琥珀："联网匹配失败：连接超时…… —— 条目已加入待确认"（说明原因）
     //   ② 主题色："扫描完成：未匹配"（说明结果）
@@ -875,7 +928,7 @@ ApplicationWindow {
     // （实测："在软件里没看到为什么超时的黄色提示框"）。
     // 现在按顺序**从上往下堆叠**：原因在上、结果在下，两条同时可见。
     //
-    // **注意与状态栏的分工**（方案 ）：顶部提示条只放**结论**；
+    // **注意与状态栏的分工**：顶部提示条只放**结论**；
     // 过程日志（"共发现 N 个条目"、"✓ 已匹配…"）归状态栏，不要在这里
     // 再弹一遍 —— 否则同一次事件会出现两条措辞不同的提示。
     Item {
@@ -1041,7 +1094,7 @@ ApplicationWindow {
 
         // **每条各自倒计时**（不再"统一到点删最旧的"）。
         //
-        // 为什么要这样（踩坑思路）：早期实现是"定时器每 3 秒删最旧那条"，
+        // 为什么要这样：早期实现是"定时器每 3 秒删最旧那条"，
         // 于是「网络失败原因」（琥珀，先出现）会在结果提示出现后没多久
         // **先被删掉** —— 用户正想读原因，它却先没了，反而把不重要的
         // "扫描完成"留着。现在每条带自己的 `life`，到点各自退场
@@ -1084,7 +1137,7 @@ ApplicationWindow {
                 banner.show("开始扫描…")
         }
 
-        // **过程日志不再进顶部提示条**（方案 A 分工）。
+        // **过程日志不再进顶部提示条**。
         //
         // 理由：过程日志是"滚动的流水"（"共发现 N 个条目"、"✓ 已匹配 X"、
         // "⚠ 联网匹配失败…"），它们属于**状态栏**（细条、常驻、可以一直刷新，
@@ -1104,7 +1157,7 @@ ApplicationWindow {
 
         // 扫描结果的统一播报（**只在这里播一次**）。
         //
-        // 措辞分两种（用户要求）：
+        // 措辞分两种：
         //   单个目录（「添加动漫」/ 详情页重扫）：
         //       只报**一个**结论 —— "扫描完成：已匹配" 或 "扫描完成：未匹配"。
         //       **不带原因**：失败原因由那条黄色提示负责说明，这里复述

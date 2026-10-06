@@ -152,7 +152,7 @@ class PollWorker(QThread):
             if result.subject_id:
                 tags.append(f"bgm:{result.subject_id}")
 
-            # **取下载链接必须走 `entry`**（踩坑，实测报错）：
+            # **取下载链接必须走 `entry`**：
             # `download_url` 是 `FeedEntry` 上的属性，`JudgeResult` 没有 ——
             # 原先三处都写成 `result.download_url`，于是**每次轮询都在
             # 第一条新集上抛 AttributeError**：
@@ -196,7 +196,7 @@ class PollWorker(QThread):
 
             # ---- 下发前确保 qBittorrent 在跑（v14）----
             #
-            # 实测诉求："在其退出但需要时打开"。qBittorrent 的 GUI 与
+            # 需求："在其退出但需要时打开"。qBittorrent 的 GUI 与
             # Web UI 是同一个进程，用户从托盘退出后 Web UI 一起没了，
             # 这里连不上就会把新集全落成「待确认」（虽然不丢，但要手动点）。
             #
@@ -212,8 +212,17 @@ class PollWorker(QThread):
                     log.warning("按需启动 qBittorrent 异常：%s", e)
                 self._qb_ready = True       # 一轮只探测/启动一次
                 if note:
+                    # **只记日志，不放进 `errors`**
+                    #
+                    # `ensure_running()` 的说明文字描述的是**当前状态**，
+                    # 成功时也会返回非空串（如"qBittorrent 已在运行（v5.1.4）"）——
+                    # 早期这里无差别地塞进 `errors`，于是每次成功启动都让
+                    # `_on_finished` 打出一行"轮询失败原因汇总"，把一条正常
+                    # 信息报成了失败。用户看到"失败"两个字只会去查不存在的问题。
+                    #
+                    # 真正需要用户知道的（自动启动失败/没配路径）由
+                    # `ensure_running` 内部区分，这里不再猜。
                     log.info("qBittorrent 状态：%s", note)
-                    summary.errors.append(note)
 
             record_id = self.db.add_download_record(
                 source_id=src.id,
@@ -315,8 +324,8 @@ class RssService(QObject):
     def start(self) -> None:
         """按配置启动定时轮询（设置页「自动轮询」开关控制）。
 
-        **开关同时管"启动时查一次"与"之后定时查"**（实测要求把这个做成
-        开关）。原先它对应 `poll_on_start`，只管前者：关掉后启动时安静了，
+        **开关同时管"启动时查一次"与"之后定时查"**。
+        原先它对应 `poll_on_start`，只管前者：关掉后启动时安静了，
         但 30 分钟后定时器照常触发 —— 用户看到"我明明关了自动，它自己
         下起来了"，与预期相反。所以这里把定时器的启动也纳入同一个开关。
 
@@ -366,8 +375,7 @@ class RssService(QObject):
     def stop(self) -> None:
         """停掉定时器，并**等待所有在跑的轮询线程结束**（退出时调用）。
 
-        **为什么要遍历 `_live_workers` 而不只看 `_worker`**（踩坑，实测
-        退出时报 `QThread: Destroyed while thread '' is still running`）：
+        **为什么要遍历 `_live_workers` 而不只看 `_worker`**：
         `_worker` 在 `finished` 信号里就被置 None 了，可那时对象还没被
         Qt 真正销毁、线程也可能仍在收尾 —— 只看它就会**漏掉**这个正在
         结束的线程，于是 `wait()` 没做，程序退出时 Qt 析构该线程并报警告。
@@ -394,8 +402,7 @@ class RssService(QObject):
     def is_running(self) -> bool:
         """是否有轮询在跑。
 
-        **为什么要 try/except**（关键，实测报
-        `Internal C++ object (PollWorker) already deleted`）：
+        **为什么要 try/except**：
         `deleteLater` 销毁的是 **C++ 对象**，而 Python 侧的包装对象
         还在（`self._worker` 未及时置空时）。此时访问它的任何方法
         都会抛 `RuntimeError`，于是「立即检查」点了没反应、日志刷满

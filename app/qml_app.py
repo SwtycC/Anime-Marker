@@ -167,6 +167,21 @@ class QmlApp:
         self.rss_bridge.pollRequested.connect(self._on_poll_requested)
         # 桥接层的「下发」→ 服务层推送
         self.rss_bridge.pushRequested.connect(self._on_push_requested)
+        # ---- 「下载完自动扫描该条目」----
+        #
+        # **为什么必须连**（实测："下载好的也会推送吗 —— 会"）：
+        # `new_only` 的两层查重是 ① 本地媒体库 ② qBittorrent 现役任务。
+        # 下载完并不入库，而第②层会随着用户清理 qB 任务消失 —— 两层全空，
+        # 同一集就被反复当成"新集"再推一遍。下完自动扫一次，数据真正进入
+        # `episodes`，第①层从此稳定命中。
+        #
+        # 跨桥连线放这里：`RssBridge` 只负责"发现下完了"，它不该认识
+        # `ScannerBridge`（两者职责不同，直接互相引用会让桥接层缠成一团）。
+        self.rss_bridge.scanRequested.connect(self._on_scan_subject_requested)
+        # 「现在能不能扫」的判据由 ScannerBridge 提供：RssBridge 不引用它，
+        # 只拿一个回调（见 RssBridge.set_scan_busy_hook 的说明）。
+        self.rss_bridge.set_scan_busy_hook(
+            lambda: bool(self.scanner_bridge.running))
 
         # 配置保存后重建依赖配置的服务
         self.settings_bridge.saved.connect(self._rebuild_services)
@@ -222,6 +237,28 @@ class QmlApp:
             return
         ok, msg = self.rss_service.push_pending(record_id)
         self.rss_bridge.onPushResult(record_id, ok, msg)
+
+    @Slot(int)
+    def _on_scan_subject_requested(self, subject_id: int) -> None:
+        """下载完成后扫描该条目，把新集写进媒体库。
+
+        **扫描正在跑时直接放弃**（不排队）：`ScannerBridge.startSubject`
+        内部也有同样的拒绝逻辑，但这里提前判一次能留一条说得清的日志。
+        放弃是安全的 —— `RssBridge` 只在**真正发起了扫描**之后才把那条
+        记录标记为"已触发"，被拒的这一条会在 30 秒后的下一次轮询里重来。
+        """
+        if subject_id <= 0:
+            return
+        if self.scanner_bridge.running:
+            log.info("扫描进行中，推迟「下载完自动扫描」subject_id=%s", subject_id)
+            return
+        subj = self.db.get_subject(int(subject_id))
+        if subj is None:
+            log.info("「下载完自动扫描」：条目 #%s 已不存在，跳过", subject_id)
+            return
+        log.info("开始「下载完自动扫描」：%s（subject_id=%s）",
+                 subj.name_cn or subj.name or "", subject_id)
+        self.scanner_bridge.startSubject(int(subject_id))
 
     # ---------- 配置变更 ----------
     def _rebuild_services(self) -> None:
@@ -281,7 +318,7 @@ class QmlApp:
         留下一条看不懂的报错 —— 用户此时该看到的是"去设置里填 Token"，
         而不是一条网络失败。海报墙不受影响（纯本地）。
 
-        **单条目重扫也跳过**（实测反馈）：详情页「重新扫描」只刷新一个
+        **单条目重扫也跳过**：详情页「重新扫描」只刷新一个
         条目的元数据，与收藏列表毫无关系 —— 却要为此拉 175 条收藏 + 几十条
         集级记录、耗时数秒，纯属浪费（用户点"重新扫描这一部"，不该看到
         整个在看列表被重拉一遍）。单条目扫描的正确收尾只是重取该条目的
@@ -438,6 +475,12 @@ class QmlApp:
         # `poll_on_start` 为真时 RssService.start() 内部会立即跑一次。
         self.rss_service.start()
 
+        # ---- 「下载完自动扫描」后台轮询----
+        # 同样放在界面加载之后：它的信号会触发一次扫描，而扫描要往
+        # 详情页/海报墙写状态 —— 界面没起来时做这些没有意义，
+        # 还可能和首帧渲染抢资源（用户会看到窗口"卡一下才出来"）。
+        self.rss_bridge.startScanWatch()
+
         return app.exec()
 
     # ---------- 窗口尺寸 ----------
@@ -567,6 +610,11 @@ class QmlApp:
             self.library_bridge.waitCollectWorkers()
         except Exception as e:  # pragma: no cover - 防御性
             log.warning("等待收藏状态写入结束失败：%s", e)
+        # 「下载完自动扫描」的后台轮询：先停掉，免得关闭过程中又发起一次扫描
+        try:
+            self.rss_bridge.stopScanWatch()
+        except Exception as e:  # pragma: no cover - 防御性
+            log.warning("停止「下载完自动扫描」失败：%s", e)
         # 订阅相关线程（抓 RSS 推断名称 / 从订阅源新建条目）
         try:
             self.rss_bridge.waitWorkers()

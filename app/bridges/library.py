@@ -27,7 +27,8 @@ from PySide6.QtGui import QDesktopServices, QImage
 from PySide6.QtWidgets import QFileDialog
 
 from app.core.bangumi_api import (
-    COLLECT_TYPE_DOING, COLLECT_TYPE_NAMES, BangumiNotFound, is_studio_name,
+    COLLECT_TYPE_DOING, COLLECT_TYPE_NAMES, BangumiClient, BangumiNotFound,
+    is_studio_name,
 )
 from app.core.database import Database, Episode, Subject
 # 同系列排序用：把「第X季 / S1 / II」统一解析成季数（见 series_siblings）
@@ -56,8 +57,7 @@ def _air_date_key(tags: list[str]) -> Optional[int]:
     返回 None 表示这些 tag 里没有日期信息。
 
     **为什么要单独抽出来**：日期 tag 混在题材/公司等一堆 tag 里，位置不定
-    （实测 OVERLORD 第一季的「2015年7月」排在第 5 位、第四季排在第 2 位），
-    必须逐个匹配而不是只看某个固定位置。
+    ，必须逐个匹配而不是只看某个固定位置。
 
     只取**最早**的那个：个别条目会同时带「2022年7月」与「2022年」这类
     年月不全的 tag，取最小月份组合最稳（年份相同、月份小的更接近真实首播）。
@@ -339,7 +339,7 @@ class LibraryBridge(QObject):
 
     # 注：**曾经**在启动时做过一次"清掉缓存里没有的条目"的对齐，已删除。
     # 它用"最近一次同步的收藏缓存"当权威，而那个缓存可能比本地值更旧：
-    # 实测（用户反馈）"在网站上标了看过 → 详情页回查写进本地 2 →
+    # 实测"在网站上标了看过 → 详情页回查写进本地 2 →
     # 重启后被启动对齐清成 0 → 又回到「未标记」 → 再进详情页才恢复"。
     # 缓存只能当"秒显"的加速，不能当**删数据**的依据 —— 现在真值一律
     # 由详情页回查网络得到（见 requestCollectType），同步时那次清理
@@ -367,6 +367,13 @@ class LibraryBridge(QObject):
         # 扫描 / 手动匹配都会写 tag（scanner.py、match.py），海报墙的筛选
         # 目录要跟着变 —— 否则"新增了动漫却筛不出来"。
         self.tagsBySubjectChanged.emit()
+        # **集数列表也要通知**
+        #
+        # `episodes(subject_id)` 是一个普通 Slot，不是 Property —— 它没有
+        # 任何可追踪依赖，QML 只在 `DetailPage.load()` 里主动调一次。于是
+        # 扫描（尤其新的"下载完自动扫描"）把新集写进库之后，**已经打开的
+        # 详情页仍然显示旧列表**，非要退出去再进来才会重新 load。
+        self.episodesChanged.emit()
 
     @Slot()
     def reloadInProgress(self) -> None:
@@ -462,7 +469,7 @@ class LibraryBridge(QObject):
                 except Exception:
                     pass
 
-            # 没有本地缓存就**不回落在线 URL**（踩坑，见下方说明）。
+            # 没有本地缓存就**不回落在线 URL**。
             #
             # 早期写的是 `local_cover or it.cover_url`：本地未入库 / 封面还没
             # 下载的条目，会把 `https://lain.bgm.tv/...` 直接交给 QML 的
@@ -621,9 +628,6 @@ class LibraryBridge(QObject):
     @Slot(result=int)
     def blockedUploadCount(self) -> int:
         """本地看过但**没有 Bangumi 集号**、无法补传的集数（小窗里提示用）。
-
-        实测本机 1446 集里有 455 集属于这种情况（扫描时没拿到集数元数据）——
-        它们必须被**明确告知**，不能静默 ✗。
         """
         try:
             return sum(self._db.blocked_upload_counts().values())
@@ -844,8 +848,7 @@ class LibraryBridge(QObject):
         ① 每次进详情页都会异步补拉该条目的 tag（见 requestTagFetch），
         ② 手动匹配、重新扫描也会重写 tag。
         若塞进 `subjects`，上面每件事都得发 subjectsChanged，而 Repeater 的
-        model 一变就会**销毁重建全部卡片**（每张都要重新解码封面，见
-        PosterWallPage.qml 里"每敲一个字卡一次"的踩坑）。单独一个 Property
+        model 一变就会**销毁重建全部卡片**。单独一个 Property
         让筛选目录刷新时海报卡片毫发无损，也让新增 tag 能实时出现在面板里。
         """
         if self._tags_dirty:
@@ -927,17 +930,9 @@ class LibraryBridge(QObject):
     def series_siblings(self, subject_id: int) -> list[dict]:
         """同系列的其他季（详情页「同系列」切换用），按**放送时间**升序。
 
-        **排序演进（两次实测反馈）**：
-          ① 最初直接返回 `list_subjects()` 的顺序（`ORDER BY name_cn, name`
-             的字典序），而季数标记是中文数字 ——「第三季」「第二季」「第四季」
-             排出来就是三、二、四这种乱序。
-          ② 改为按 `extract_season(标题)` 排序后，带季数的正常了，但**第一季
-             仍排在最后** —— 因为它的标题就叫「OVERLORD」、没有任何季数标记，
-             提取不出数字，只能垫底。
-
-        最终方案：**以 tag 里的放送日期为主键**。
-        Bangumi 会给每个条目打一个形如「2015年7月」的 tag（实测 100% 存在，
-        且格式统一），它是"第几季"的**客观依据** —— 第一季的日期一定最早，
+        **以 tag 里的放送日期为主键**。
+        Bangumi 会给每个条目打一个形如「2015年7月」的 tag，
+        它是"第几季"的**客观依据** —— 第一季的日期一定最早，
         不依赖标题里有没有写季数。取不到日期时才回退到季数，再兜底字典序。
 
         排序键 = (有无日期, 日期, 有无季数, 季数, 标题)，逐级兜底：
@@ -1423,16 +1418,10 @@ class LibraryBridge(QObject):
         **本地快照一律不参与判断**：CLANNAD 那次就是"本地有值就信任"
         让一个早已取消收藏的「在看」一直错下去。
 
-        （曾经在这里只做"缓存有就用、没有才回查"，还不够：缓存里有的那些
-        永远得不到核实；也曾经按缓存**清过**本地值，结果把用户刚在网站上
-        标的、详情页刚写进来的新值清掉了 —— 缓存能拿来"先用"，不能拿来
-        "删"。）
-
         未匹配 Bangumi 的条目直接返回（没有条目 ID 可查，状态只由用户
         手动标记，见 setCollectType 的模式 ②）。
 
-        **`_collect_queried` 这道闸门是必需的，不是优化**（2026-10-03 实测
-        踩坑：一个条目刷出上百次 404）。原先只有"本地值非 0 才跳过"一条
+        **`_collect_queried` 这道闸门是必需的，不是优化**。原先只有"本地值非 0 才跳过"一条
         判据，于是**回查结果为 0 的条目（就是没收藏的）永远满足"该回查"**，
         而回查完成会发 `collectTypeChanged` → 详情页 reload → reload 又调
         本函数 → 再回查 …… 每个 404 都能自激出一个新请求，日志被同一行
@@ -1463,8 +1452,7 @@ class LibraryBridge(QObject):
         # 展示图出现的时间一样快"）。走网络的话要等几百毫秒，
         # 用户看到的是"海报早就在了、状态还在转"。
         #
-        # **这一步不看本地快照**：快照可能是错的（实测：CLANNAD 早已取消
-        # 收藏，本地还留着「在看」）。缓存里有答案时以它为准，
+        # **这一步不看本地快照**：快照可能是错的。缓存里有答案时以它为准，
         # 值没变就什么都不做（不写库、不发信号，QML 本来就显示对了）。
         cached = 0
         try:
@@ -1511,7 +1499,7 @@ class LibraryBridge(QObject):
           ② **要么没配 Token、要么条目没匹配到 Bangumi** → 只写本地，
              并在状态栏说明"仅本地、不会同步到 Bangumi"。
 
-        ② 是必须有的（用户实测要求："如果没 token 的用户，也能使用状态栏，
+        ② 是必须有的（"如果没 token 的用户，也能使用状态栏，
         可以手动选择在看，然后在「在看」页看到该动漫"）。这些用户压根没有
         远端可写，若照旧拒绝，选择器就是个永远点不动的摆设；
         写本地之后「在看」页会把他们标过的番列出来（见 `_load_inprogress`

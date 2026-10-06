@@ -57,7 +57,13 @@ class PlayerBridge(QObject):
         self._api = api
 
         self._playing_episode_id = 0
+        # 集名（episodes.title）。**不是动漫名** —— 那个见 _playing_subject_name。
         self._playing_title = ""
+        # 动漫名（subjects.name_cn / name）。播放时查一次并缓存，
+        # 供状态栏显示；状态栏每次进度变化都读它，不能每次查库。
+        self._playing_subject_name = ""
+        # 集号显示文本（"第 3 集" / "SP01"），同样是播放时算好缓存。
+        self._playing_episode_label = ""
         self._progress = 0.0
 
         self._monitor = ProgressMonitor(
@@ -110,7 +116,37 @@ class PlayerBridge(QObject):
 
     @Property(str, notify=playingChanged)
     def playingTitle(self) -> str:
+        """当前播放的**集名**（如「思考的芦苇」）。
+
+        注：这是**集**的标题，不是动漫名 —— 动漫名见 `playingSubjectName`。
+        """
         return self._playing_title
+
+    @Property(str, notify=playingChanged)
+    def playingSubjectName(self) -> str:
+        """当前播放所属的**动漫名**（优先中文名）。
+
+        **为什么单独一个属性**（"状态写清楚什么动漫播放中"）：
+        状态栏原来只有 `播放中 93%`，看不出是哪部；而 `playingTitle`
+        存的其实是**集名**（`episodes.title`），拿它当动漫名是错的。
+        动漫名只能由 `episodes.subject_id → subjects` 查出来，
+        在 `playEpisode` 时取一次缓存住（状态栏每次进度变化都要读它，
+        不能每次都查库 —— 见那里的说明）。
+        """
+        return self._playing_subject_name
+
+    @Property(str, notify=playingChanged)
+    def playingEpisodeLabel(self) -> str:
+        """当前播放集的**集号显示文本**：正片是「第 N 集」，附加内容是 `SP01` 等。
+
+        规则与详情页左列一致（见 library._episode_to_dict 的 `label`）：
+        附加内容用 `ep_label`（`SP01`/`OVA02`/`NCOP3`…），正片用集号；
+        集号是整数时去掉小数点（`3.0` → `第 3 集`），带小数（`12.5`）
+        原样显示 —— 那些是未识别为附加内容、被顺延编号的文件。
+        """
+        if not self._playing_episode_label:
+            return ""
+        return self._playing_episode_label
 
     @Property(bool, notify=playingChanged)
     def playing(self) -> bool:
@@ -152,10 +188,16 @@ class PlayerBridge(QObject):
 
         self._playing_episode_id = ep.id
         self._playing_title = ep.title or ""
+        # 动漫名与集号标签在这里**算好缓存**（状态栏要不断读它们，
+        # 不能每次都查库 / 走格式化）。
+        self._playing_subject_name = self._resolve_subject_name(ep.subject_id)
+        self._playing_episode_label = self._format_episode_label(ep)
         self._progress = 0.0
         self.playingChanged.emit()
         self._monitor.start(ep)
-        self.message.emit(f"正在监控：{ep.title}")
+        self.message.emit(
+            f"正在播放：{self._playing_subject_name} "
+            f"{self._playing_episode_label} {self._playing_title}".strip())
         log.info("开始播放 episode_id=%s file=%s", ep.id, ep.file_path)
         return True
 
@@ -165,6 +207,8 @@ class PlayerBridge(QObject):
         self._monitor.stop()
         self._playing_episode_id = 0
         self._playing_title = ""
+        self._playing_subject_name = ""
+        self._playing_episode_label = ""
         self.playingChanged.emit()
 
     def wait_pending_sync(self, ms: int = 3000) -> None:
@@ -195,6 +239,43 @@ class PlayerBridge(QObject):
             self._monitor.maybe_complete_subject(ep.subject_id)
 
     # ---------- 内部 ----------
+    def _resolve_subject_name(self, subject_id: int) -> str:
+        """查该集所属动漫的显示名（中文名优先，退回原名）。
+
+        查不到（条目刚被删等）返回空串 —— 状态栏会退化成只显示集信息，
+        不该因此报错或显示 "None"。
+        """
+        try:
+            s = self._db.get_subject(int(subject_id))
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("读取条目名失败 subject_id=%s: %s", subject_id, e)
+            return ""
+        if s is None:
+            return ""
+        return (s.name_cn or s.name or "").strip()
+
+    @staticmethod
+    def _format_episode_label(ep: Episode) -> str:
+        """集号显示文本：附加内容用 `ep_label`，正片用「第 N 集」。
+
+        与详情页左列的规则保持一致（同一个文件在两处不该显示成不同的编号）。
+        集号去掉无意义的小数点（`3.0` → `第 3 集`），带小数的原样保留
+        （`12.5` 这种是"没识别成附加内容、被顺延编号"的文件）。
+        """
+        label = (getattr(ep, "ep_label", "") or "").strip()
+        if label:
+            return label
+        idx = ep.ep_index
+        if idx is None:
+            return ""
+        try:
+            f = float(idx)
+        except (TypeError, ValueError):
+            return ""
+        if f <= 0:
+            return ""
+        return "第 %s 集" % (int(f) if f == int(f) else f)
+
     def _find_episode(self, episode_id: int) -> Optional[Episode]:
         """按 episode_id 反查集数记录。
 

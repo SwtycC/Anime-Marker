@@ -135,6 +135,55 @@ Item {
             root.tagRows = []
     }
 
+    /// 只重取**集数列表与统计**（扫描写库后由 `episodesChanged` 触发）。
+    ///
+    /// **为什么不直接调 `load()`**：
+    ///   - `load()` 结尾会把 `epFlick.contentY = 0` —— 用户正在翻看第 8 集
+    ///     时后台扫完一遍，列表会被**弹回顶部**，是很明显的干扰；
+    ///   - 它还会走一遍 `resetTagState()`（退出 tag 编辑态）、重发
+    ///     `requestCollectType`、重取同系列 —— 这些与"集数变了"无关，
+    ///     平白多一次请求与状态重置。
+    /// 所以这里只做真正需要的事：重取 episodes。
+    ///
+    /// 页面上"已看 / 总数"这类数字都是从 `root.episodes` 现算的
+    /// （不再单独取 `library.stats()` —— 那会多一次查库，且两条数据源
+    /// 可能短暂不一致）。
+    function refreshEpisodes() {
+        if (root.subjectId <= 0 || typeof library === "undefined" || !library)
+            return
+        root.episodes = library.episodes(root.subjectId)
+    }
+
+    /// 只重取**收藏状态**（整部看完自动标「看过」后由 `subjectsChanged` 触发）。
+    ///
+    /// **为什么不调 `load()`**：`load()` 会滚回集数列表顶部、退出 tag 编辑态、
+    /// 重发 `requestCollectType`、重取同系列 —— 而这里要改的只是
+    /// `subject.collectType` 一个字段。播放器自动完结是**后台**动作
+    /// （用户可能正在详情页翻集数），用最轻的方式更新才不会打断他。
+    ///
+    /// 返回是否真的发生了更新（值没变时返回 false，调用方可据此不打日志）。
+    function refreshCollectType() {
+        if (root.subjectId <= 0 || typeof library === "undefined" || !library)
+            return false
+        var fresh = library.subject(root.subjectId)
+        var now = (fresh && fresh.collectType) || 0
+        if (now === (root.subject.collectType || 0))
+            return false
+        // **只换这一个字段**：`root.subject` 是个 property var 字典，
+        // 直接改 `root.subject.collectType = now` 是**原地修改**，
+        // 不会触发绑定重算（与 editApi.push 同一个坑，见文件下方说明）。
+        // 必须整体重新赋值：复制一份 → 改字段 → 赋回去。
+        var copy = {}
+        for (var k in root.subject)
+            copy[k] = root.subject[k]
+        copy.collectType = now
+        root.subject = copy
+        // 解锁选择器（与 Main.qml 的 onCollectTypeChanged 同一套收尾）
+        root.collectBusy = false
+        root.collectPending = 0
+        return true
+    }
+
     /// 重取 tag **并退出编辑态**（打开页面 / 点 × 退出时调用）
     function resetTagState() {
         root.reloadTagRows()

@@ -22,7 +22,7 @@ import logging
 import re
 from typing import Optional
 
-from PySide6.QtCore import QObject, Property, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Property, QThread, QTimer, Signal, Slot
 
 from app.core.config import Config
 from app.core.database import Database, RssSource
@@ -170,7 +170,7 @@ class _FeedTitleWorker(QThread):
 class _CreateSubjectWorker(QThread):
     """从订阅源新建本地条目（可带 Bangumi 匹配）。
 
-    需求（用户原话）："条目名先从订阅源中获取，自动填入文本框，然后支持
+    需求："条目名先从订阅源中获取，自动填入文本框，然后支持
     手动修改。需要匹配，没填 token 则跳过。一个订阅源一个条目。"
 
     所以这个 worker 做两件事，取决于有没有 Token：
@@ -416,12 +416,6 @@ _EP_SUFFIX_BAD_RE = re.compile(r"(?i)^(?:[pP]\b|bit|fps|k\b|[xX]\d)")
 def _ep_of(text: str) -> int:
     """从标题里取集号（拿不到返回 0）。
 
-    实测样本：
-        `...[年龄限制版] - 12 (Baha 1920x1080 AVC AAC MP4)`      → 12
-        `...[年齡限制版] - 06 (...)[887F6688].mp4`              → 6  ★
-        `[BeanSub][...S4][23_95][CHS][1080P][x264_AAC].mp4`      → 95
-        `[hyakuhuyu&LoliHouse] Re Zero ... - 82 [WebRip 1080p]`  → 82
-
     规则：从右往左找第一个"像集号"的数字 ——
       - 1 ~ _EP_MAX（挡掉 `[887F6688]` 哈希与 `1080` 分辨率）；
       - 前后紧邻字符不是字母数字（避免从 `S4`、`x264` 里切出数字）；
@@ -462,7 +456,7 @@ def _title_similar(a: str, b: str) -> float:
 def _match_torrent(rec_title: str, torrents: dict) -> Optional[dict]:
     """把一条下载记录匹配到 qBittorrent 里的任务（拿不到返回 None）。
 
-    **为什么要这么麻烦**（踩坑，实测"看不到进度条"）：
+    **为什么要这么麻烦**（实测"看不到进度条"）：
       ① `torrent_hash` 拿不到 —— `torrents_add` 只返回 "Ok."，
          不回传 hash，所以库里那列一直是 NULL；
       ② 按标题**精确匹配**也不行 —— 实测同一条内容：
@@ -515,7 +509,7 @@ class RssBridge(QObject):
     titleSuggested = Signal(int, str)
     #: 「从订阅源新建条目」完成（参数：新条目本地 id, 名称）。
     #:
-    #: 为什么需要（实测"新建完条目后下载器无法马上识别"）：媒体库桥接的
+    #: 为什么需要（"新建完条目后下载器无法马上识别"）：媒体库桥接的
     #: `subjects` 是缓存，新建后必须让 QML 侧知道"条目变了" —— 既要刷新
     #: 下载器弹窗的保存位置列表，也要让订阅卡片上的绑定标签立刻出现。
     #: QmlApp 接到后调用 `library_bridge.reload()`（跨桥连线在 qml_app）。
@@ -535,6 +529,19 @@ class RssBridge(QObject):
     pollStateChanged = Signal()
     #: 下载器预览结果变化（列表 / 汇总文案 / 是否加载中）
     previewChanged = Signal()
+    #: 某个下载任务**下完了**，请求扫描对应条目（参数：本地 subjects.id）。
+    #:
+    #: **为什么需要这个信号**（"下载好的也会推送吗 —— 会，而且是重复推"）：
+    #: `new_only` 只剩两层查重 —— ① 本地媒体库（`episodes` 表里有这一集）
+    #: ② qBittorrent 里的同名任务。第②层只在**任务还在 qB 里**时有效：
+    #: 用户下完就删种子 / 清理列表，那一层就空了；而第①层要求"先扫描入库" ——
+    #: 下载完并不会自动扫描，于是 `episodes` 里始终没有这些集。
+    #: 两层全落空 → 下一轮轮询又把同一集当成"新集"推一遍。
+    #:
+    #: 修法是**下载完就自动扫这一部**：让数据真正进入
+    #: 媒体库，查重第①层从此稳定命中。扫描复用详情页「重新扫描」那套
+    #: （`RssBridge` 不该认识 `ScannerBridge`，跨桥连线放在 qml_app）。
+    scanRequested = Signal(int)
 
     def __init__(self, db: Database, config: Optional[Config] = None,
                  api=None, parent: Optional[QObject] = None) -> None:
@@ -568,6 +575,38 @@ class RssBridge(QObject):
         self._preview_running = False
         self._preview_hint = ""
         self._preview_worker: Optional[_PreviewWorker] = None
+        # ---- 「下载完自动扫描」（方案 A）----
+        #
+        # 记"已经因为下完而请求过扫描"的 download_history.id（**不是**
+        # hash：hash 我们拿不到，见 _match_torrent 的说明）。
+        #
+        # **为什么用 record.id 做键**：一条记录 = 订阅里的一集，它在
+        # qBittorrent 里对应且只对应一个任务。下完扫过一次就记下，
+        # 之后每 5 秒的轮询不会再重复触发；而用户以后下了**新的一集**，
+        # 那是一条新记录、新 id，自然会再扫一次。
+        self._scan_triggered: set[int] = set()
+        #: 后台定时器：哪怕订阅页没打开，也要能发现"下完了"。
+        #:
+        #: **为什么不能只靠 QML 那个 5 秒定时器**：它绑的是
+        #: `showDownloads && visible`（见 SubscriptionPage 的 progressTimer），
+        #: 语义是"用户正盯着下载面板"。而"下完 → 扫描入库"是个**后台**
+        #: 动作：用户很可能下完就切去看番了，这时 QML 的定时器是停的，
+        #: 我们永远不知道任务已经完成 —— 于是新集照旧不入库、照旧被重复推送。
+        #: 频率取 30 秒：扫描是"匹配 + 写库 + 联网"的重操作，判"下完没有"
+        #: 晚半分钟没有任何影响（而且真正下完那一刻用户通常也不在等）。
+        self._scan_timer = QTimer(self)
+        self._scan_timer.setInterval(30 * 1000)
+        self._scan_timer.timeout.connect(self.refreshTorrents)
+        #: "扫描是否正在进行"的查询回调（QmlApp 注入 `scanner_bridge.running`）。
+        #:
+        #: 本桥接不认识 ScannerBridge（见 scanRequested 的说明），但"要不要
+        #: 现在发起扫描"必须提前知道 —— 被拒绝时不能标记为已扫过，否则
+        #: 那一条就永远漏扫了（见 _scan_subject_ok）。没注入时按"不忙"处理。
+        self._scan_busy = None
+
+    def set_scan_busy_hook(self, hook) -> None:
+        """注入「扫描是否正在进行」的查询函数（QmlApp 调用）。"""
+        self._scan_busy = hook
 
     def set_api(self, api) -> None:
         """注入 Bangumi 客户端（QmlApp 在配置重建时调用）。"""
@@ -581,6 +620,24 @@ class RssBridge(QObject):
         地址、下发用新地址、查进度还在问旧地址"的错位。
         """
         self._qb = qb
+
+    def startScanWatch(self) -> None:
+        """启动"下完自动扫描"的后台轮询（QmlApp 在界面加载完成后调用）。
+
+        没配 qBittorrent 时不启动：`refreshTorrents` 会每 30 秒白跑一次
+        "读不到任务"（qb=None → `_TorrentStatusWorker` 直接回空），
+        不仅没意义，还会在日志里留下噪声。
+        """
+        if self._qb is None:
+            log.info("未配置 qBittorrent，跳过「下载完自动扫描」的后台轮询")
+            return
+        self._scan_timer.start()
+        log.info("「下载完自动扫描」已启动（每 %s 秒检查一次）",
+                 self._scan_timer.interval() // 1000)
+
+    def stopScanWatch(self) -> None:
+        """停止后台轮询（退出时调用）。"""
+        self._scan_timer.stop()
 
     def _subject_label(self, subject_id) -> str:
         """本地条目 id → 展示名（取不到返回空串）。"""
@@ -908,7 +965,7 @@ class RssBridge(QObject):
                  sid or "默认")
         self.reload()
 
-        # ---- 保存后**立即启动下载**（实测反馈"下载器保存后没开始下载"）----
+        # ---- 保存后**立即启动下载**（"下载器保存后没开始下载"）----
         #
         # 原因：下载本来是**定时轮询**触发的（默认 30 分钟一次），保存
         # 设置只是改了数据库 —— 用户当然会觉得"点了保存却什么都没发生"。
@@ -1025,13 +1082,9 @@ class RssBridge(QObject):
     def linkSubject(self, source_id: int, subject_id: int) -> None:
         """把订阅绑定到本地条目（`subject_id` 是**本地 subjects.id**）。
 
-        绑定后「三层判新」才能知道该订阅对应哪部动漫、本地已有哪些集。
+        绑定后「两层判新」才能知道该订阅对应哪部动漫、本地已有哪些集。
         `subject_id=0` 表示解除绑定。
 
-        **不再要求条目已匹配 Bangumi**（踩坑，实测反馈）：早期这里有一道
-        `if not subj.bangumi_id: 拒绝`，于是"没填 Token"或"匹配没成功"的
-        条目**永远绑不上** —— 而「全部下载 + 从订阅源新建条目」这条链路上
-        建出来的恰恰都是这种本地条目（新建成功了却报"无法绑定"）。
         现在权威标识是 `local_subject_id`，`bangumi_id` 改为顺带冗余存一份
         （有就存，没有就留空），两种条目一视同仁。
         """
@@ -1155,7 +1208,7 @@ class RssBridge(QObject):
                 "stateLabel": state_label,
                 # 能不能点「下发」：**待确认** 且 qBittorrent 里**还没有**该任务。
                 #
-                # **为什么必须加 `info is None`**（实测 bug）：原先只看
+                # **为什么必须加 `info is None`**（bug）：原先只看
                 # 数据库的 `status == "pending"`，而数据库状态会滞后 ——
                 # 记录先以 pending 入库、推送成功后才改成 pushed，中间
                 # 有个窗口；更常见的是**旧版本留下的 pending 记录**
@@ -1163,13 +1216,11 @@ class RssBridge(QObject):
                 # 此时 qBittorrent 里其实已经在下甚至下完了，界面会因为
                 # `info` 匹配到真实进度而显示「已完成 100%」，可
                 # `canPush` 仍为 true → 已完成的行上挂着一个「下发」按钮
-                # （实测截图正是这样）。再点一次会**重复添加同一任务**。
+                # 。再点一次会**重复添加同一任务**。
                 # 判据加上"qB 里没有"之后，这类行就不会再出现按钮。
                 "canPush": (status == "pending"
                             and int(r.ep_index or 0) >= 0
                             and info is None),
-                # 失败原因（v11 落库）。**失败记录必须能说清为什么** ——
-                # 实测反馈"下载失败了，可以增加日志判断为什么失败吗"：
                 # 原先只有「失败 10」这个计数，用户完全无从下手。
                 "lastError": r.last_error or "",
                 "createdAt": r.created_at or "",
@@ -1236,10 +1287,109 @@ class RssBridge(QObject):
                     changed = True
                     break
         self._torrents = new
+        # ---- 下完就扫描（方案 A，见 scanRequested 的说明）----
+        #
+        # 放在"是否有变化"的判断**之前**：上面那套判断是为了"少重建列表"，
+        # 而扫描判定只关心"有没有任务达到 100%"，两者目的不同。而且这个
+        # 方法每 5 秒被调一次，重复触发由 `_scan_triggered` 兜住。
+        self._maybe_scan_completed(new)
         if not changed:
             return
         self._downloads_dirty = True
         self.downloadsChanged.emit()
+
+    def _maybe_scan_completed(self, torrents: dict) -> None:
+        """发现"下完了"的任务 → 请 QmlApp 扫描它对应的条目。
+
+        **为什么在这里做**（而不是在 `RssService` 里）：这里是唯一能拿到
+        qBittorrent **真实进度**的地方 —— `download_history.status` 停在
+        `pushed`（我们只是把种子交给了 qB，"下完没有"它并不知道，见
+        `_load_downloads` 里那段"有真实进度时以它为准"）。
+
+        **流程**：qB 任务（progress ≥ 1）→ 反查 download_history 记录
+        （`_match_torrent` 那套"集号 + 标题重合度"）→ 拿到 `subject_id`
+        → `scanRequested`。
+
+        **去重依据是库里的 `scanned_at`，不是内存集合**：内存集合一重启就没了，
+        而已下完的 qB 任务还在，于是每次启动都重扫一遍。见迁移 v14。
+
+        **匹配失败是正常的**（用户手动删过记录、或标题差异太大）：静默
+        跳过即可 —— 退化成"这一集下次还会被当成新集"，与修这个 bug
+        之前的行为一样，不会更糟。
+        """
+        if not torrents:
+            return
+        try:
+            records = self._db.list_downloads()
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("读取下载记录失败（跳过自动扫描）：%s", e)
+            return
+        if not records:
+            return
+
+        for rec in records:
+            # 已扫过（跨会话）→ 不再重复；内存里那个集合是**本会话的**
+            # 补充闸门：`scanned_at` 写库是异步排队生效的，同一秒内的
+            # 多次轮询（QML 5 秒定时器 + 后台 30 秒定时器可能重叠）
+            # 会看到同一份旧数据，靠它挡住。
+            if rec.scanned_at or rec.id in self._scan_triggered:
+                continue
+            info = _match_torrent(rec.torrent_title or "", torrents)
+            if info is None:
+                continue
+            try:
+                progress = float(info.get("progress") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            # 1.0 是 qBittorrent 的"下载本身完成"，但**文件可能还在移动**
+            # （state=moving）—— 那期间扫描会读到不完整的目录。
+            # 移动态直接跳过，等下一次轮询再看。
+            if progress < 1.0:
+                continue
+            if str(info.get("state") or "").lower() == "moving":
+                continue
+
+            sid = int(rec.subject_id or 0)
+            if not sid:
+                # 记录没绑条目（未匹配到本地番）：扫也扫不出对应关系。
+                # **同样标记为已处理**，否则每次轮询都要重新匹配一遍标题。
+                self._scan_triggered.add(int(rec.id))
+                self._mark_scanned(int(rec.id))
+                continue
+            if not self._scan_subject_ok(sid):
+                # 条目已不存在 / 当前正在扫描 —— 这次不发，也不标记，
+                # 留到下一轮重试（见 _mark_scanned 的时序说明）
+                continue
+            self._scan_triggered.add(int(rec.id))
+            log.info("下载已完成，请求扫描条目以入媒体库：记录 #%s → subject_id=%s（%s）",
+                     rec.id, sid, (rec.torrent_title or "")[:60])
+            self.scanRequested.emit(sid)
+            self._mark_scanned(int(rec.id))
+
+    def _scan_subject_ok(self, subject_id: int) -> bool:
+        """这次能不能真的发起扫描该条目（不能则留待下次重试）。
+
+        **为什么要在这里判、而不是交给 QmlApp**：标记"已扫过"的时机必须
+        与"扫描真的发起了"一致 —— 若先把 `scanned_at` 写上、再发现扫描被
+        拒绝，那一条就**永远不会再被扫**，新集直接漏掉（比不修还糟）。
+        这里先判一次，通过之后 QmlApp 那边不会再被拒（它同一套判据）。
+        """
+        if self._scan_busy is not None and self._scan_busy():
+            return False
+        try:
+            return self._db.get_subject(int(subject_id)) is not None
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("读取条目 %s 失败（跳过自动扫描）：%s", subject_id, e)
+            return False
+
+    def _mark_scanned(self, record_id: int) -> None:
+        """把"已扫过"写进下载记录（失败只记日志，不影响扫描本身）。"""
+        try:
+            self._db.mark_download_scanned(int(record_id))
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("标记下载记录 #%s 已扫描失败：%s", record_id, e)
+
+
 
     @Slot(int, int, result="QVariantMap")
     def savePathPreview(self, source_id: int, subject_id: int) -> dict:
@@ -1248,7 +1398,7 @@ class RssBridge(QObject):
         返回 `{"path": 完整路径, "note": 界面显示的两行文案, "exists": 是否存在}`；
         `path` 为空表示"不干预，用 qBittorrent 自己的保存路径"。
 
-        **为什么由后端算而不是 QML 拼**（实测需求："在这段文字的下一行
+        **为什么由后端算而不是 QML 拼**（"在这段文字的下一行
         写清楚目录在哪"）：QML 若自己拼一遍，就出现了**第二套路径规则** ——
         界面显示 `F:\动漫\青之芦苇\第二季`、文件却可能因为后端规则稍有
         不同而落到别处。用户最不能接受的就是"看到的和实际的不一致"。

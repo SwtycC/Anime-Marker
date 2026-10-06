@@ -11,7 +11,7 @@ import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dc_fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -20,7 +20,7 @@ from app.utils.paths import database_path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 15
 
 #: 「把收藏缓存里已知的状态写回 `subjects.collect_type`」的那条 SQL。
 #:
@@ -34,6 +34,19 @@ UPDATE subjects
        SELECT c.collect_type FROM inprogress_cache c
         WHERE c.bangumi_id = subjects.bangumi_id)
  WHERE bangumi_id IN (SELECT bangumi_id FROM inprogress_cache)
+   -- **本地刚写过的不要被缓存覆盖**（踩坑，见 set_subject_collect_type）。
+   --
+   -- 判据是缓存行上的 `local_at`：它**只由 `set_subject_collect_type`
+   -- 写**，记"用户在本程序里最后一次显式设置该状态"的时刻；整表同步
+   -- （`replace_inprogress_cache` 的 INSERT）**不动它**（不写这一列）。
+   -- 只要它晚于本次同步的写入时刻 `?`，就说明这条是本地更新的、
+   -- 缓存那份是旧的，不能盖回去。
+   --
+   -- **不要用 `updated_at` 来判**（踩过）：那一列每次整表同步都会被
+   -- 刷成"本次写入时刻"，拿它比时间等于"缓存永远最新"，防线形同虚设。
+   AND COALESCE((
+           SELECT c.local_at FROM inprogress_cache c
+            WHERE c.bangumi_id = subjects.bangumi_id), '') < ?
 """
 
 #: 「本地有状态、收藏缓存里却没有它」的**已匹配**条目 → 清成"未知"。
@@ -111,8 +124,12 @@ CREATE TABLE IF NOT EXISTS inprogress_cache (
     total_eps    INTEGER,
     collect_type INTEGER,
     updated_at   TEXT,   -- **缓存写入时间**（本次拉取的时刻），用于判断缓存新鲜度
-    collection_updated_at TEXT  -- **Bangumi 的收藏最后修改时间**（用户何时看完），
+    collection_updated_at TEXT, -- **Bangumi 的收藏最后修改时间**（用户何时看完），
                                 -- 用于「最近 N 部」排序，见 §5.12.11.5
+    local_at     TEXT    -- **本地显式设置该状态**的时刻（v15，见下）
+                                -- 只由 set_subject_collect_type 写，整表同步**不动它**。
+                                -- 回填时用它判"本地是不是更新"（见 _COLLECT_TYPE_BACKFILL_SQL）；
+                                -- NULL = 从没在本程序里改过这个状态。
 );
 
 -- F20：Bangumi 集级观看记录（「动态」页的时间线数据源）
@@ -235,6 +252,7 @@ CREATE TABLE IF NOT EXISTS download_history (
     torrent_hash  TEXT,
     status        TEXT DEFAULT 'pending',
     last_error    TEXT,                      -- 失败原因（成功时为空串）
+    scanned_at    TEXT,                      -- 下完自动扫描的时刻（NULL=还没扫；见迁移 v14）
     created_at    TEXT,
     updated_at    TEXT
 );
@@ -338,6 +356,10 @@ class InProgressItem:
     # 「最近 N 部」按它排序才有意义，见 bridges/inprogress.py。
     # 老库迁移后为 NULL，下次拉取补齐。
     collection_updated_at: Optional[str] = None
+    #: 本地**显式设置**该状态（详情页选择器 / 自动完结）的时刻（v15）。
+    #: 只有"谁更新"的判定用它（见 _COLLECT_TYPE_BACKFILL_SQL）；
+    #: 本数据类只是照单全收，界面不关心它。
+    local_at: Optional[str] = None
     # 运行时填充（不落库）
     local_subject_id: Optional[int] = None
 
@@ -406,8 +428,11 @@ class DownloadRecord:
     magnet: str
     torrent_hash: str
     status: str
-    created_at: str
-    updated_at: str
+    #: 该条**因下载完成而触发过自动扫描**的时刻（NULL/空 = 还没扫过）。
+    #: 用来跨会话去重，避免每次启动都重扫一遍已下完的任务（见迁移 v14 的说明）。
+    scanned_at: Optional[str] = None
+    created_at: str = ""
+    updated_at: str = ""
     last_error: str = ""
 
 
@@ -624,7 +649,11 @@ class Database:
         # 之后由 replace_inprogress_cache 在每次同步时自动保持对齐，
         # 所以这一条只在旧库上跑一次。
         if old_version < 10:
-            cur = self._conn.execute(_COLLECT_TYPE_BACKFILL_SQL)
+            # 参数传"未来时刻"：迁移场景下不存在"本地刚写过"的缓存行
+            # （那时 local_at 这一列还不存在，全是 NULL），所以
+            # `COALESCE(local_at,'') < ?` 恒成立 = 照旧全部回填。
+            cur = self._conn.execute(_COLLECT_TYPE_BACKFILL_SQL,
+                                     ("9999-12-31T23:59:59+00:00",))
             if cur.rowcount:
                 log.info("迁移：按收藏缓存回填了 %s 个条目的收藏状态",
                          cur.rowcount)
@@ -642,6 +671,52 @@ class Database:
         if "ep_label" not in ep_cols:
             log.info("迁移：episodes 增加 ep_label 列")
             self._conn.execute("ALTER TABLE episodes ADD COLUMN ep_label TEXT")
+
+        # v14：download_history 新增 scanned_at（"下载完自动扫描"的已处理标记）。
+        #
+        # **为什么必须落库、不能只放内存**（"每次打开都在进行
+        # 下载后扫描，太频繁了"）：原先那个去重集合是 `RssBridge` 的一个
+        # 内存 set，**程序一重启就清空**；而 qBittorrent 里那个已经下完的
+        # 任务还在列表里（用户不一定会马上清理），于是每次启动都会重新判定
+        # 一次"它下完了" → 又扫一遍。用户看到的是"我一开软件它就在扫描"。
+        # 落库之后"这一条已经因为下完扫过了"是**跨会话**的事实，
+        # 重启也不会重扫；而用户以后下**新的一集**时那是新记录、新行，
+        # 自然又会扫一次。
+        #
+        # 旧库该列为 NULL —— 与"还没扫过"同义，首次升级时会补扫一遍
+        # （一次性，之后不再重复），这是可接受的。
+        dl_cols = {
+            r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(download_history)")
+        }
+        if "scanned_at" not in dl_cols:
+            log.info("迁移：download_history 增加 scanned_at 列")
+            self._conn.execute(
+                "ALTER TABLE download_history ADD COLUMN scanned_at TEXT")
+
+        # v15：inprogress_cache 新增 local_at（"本地显式设置状态"的时刻）。
+        #
+        # **为什么需要**（"日志写了已同步「看过」到 Bangumi，
+        # 详情页仍显示「在看」"）：
+        #   ① 播放器自动完结把 subjects.collect_type 写成 2（看过）；
+        #   ② 下一次收藏同步执行 `_COLLECT_TYPE_BACKFILL_SQL`，拿
+        #      **37 小时前**的缓存（collect_type=3）把它盖回「在看」。
+        # 旧版的回填没有任何"谁更新"的判据，因为 `updated_at` 每次同步
+        # 都被刷成本次时刻、比不出新旧。加一个**只由本地写入**的
+        # `local_at` 才能判：它晚于本次同步 → 本地更新，不许覆盖。
+        #
+        # 旧库该列为 NULL —— 回填时 `COALESCE(...,'') < ?` 成立，
+        # 行为与改动前一致（缓存可以覆盖），不会因为升级而改变既有结果。
+        cache_cols = {
+            r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(inprogress_cache)")
+        }
+        if "local_at" not in cache_cols:
+            log.info("迁移：inprogress_cache 增加 local_at 列")
+            self._conn.execute(
+                "ALTER TABLE inprogress_cache ADD COLUMN local_at TEXT")
+
+
 
     def close(self) -> None:
         with self._lock:
@@ -664,8 +739,8 @@ class Database:
     def upsert_subject(self, **fields: Any) -> int:
         """写入/更新一条**已匹配**条目，返回本地主键。
 
-        **同目录已有一条"未匹配占位行"时就地升级，而不是另插一行**（踩坑，
-        实测）：bangumi_id 为 NULL 的条目有两个来源 —— 扫描没匹配上的
+        **同目录已有一条"未匹配占位行"时就地升级，而不是另插一行**
+        ：bangumi_id 为 NULL 的条目有两个来源 —— 扫描没匹配上的
         `pending` 占位，以及「添加动漫」未填 Token 时建的纯本地条目
         （`upsert_local_subject`）。它们**后来匹配成功**时（重扫 / 详情页
         重新扫描），若只按 `bangumi_id` 做 ON CONFLICT，会因"库里那行没有
@@ -728,7 +803,7 @@ class Database:
     def update_rss_subject_folder(self, subject_id: int, folder_path: str) -> None:
         """把 RSS 下载时算出的目录**补记到条目上**（`folder_path`）。
 
-        **为什么需要**（实测：详情页「重新扫描」报"该条目没有记录目录路径"）：
+        **为什么需要**（详情页「重新扫描」报"该条目没有记录目录路径"）：
         "从订阅源新建"的条目 `folder_path` 是空的（它不指向任何已存在的
         目录），而 `ScannerBridge.startSubject` 的入口判据正是这个字段 ——
         不补记的话，用户下载完想扫一遍看看集数，会被直接拒绝，
@@ -856,11 +931,33 @@ class Database:
         不更新 `updated_at`：那一列语义是"条目元数据最后变更时间"
         （名称/封面/集数），收藏状态是另一维度，混在一起会让
         "最近更新"这类排序失去意义。
+
+        这里把缓存行也同步成新值：缓存是"服务端镜像"，
+        而服务端此刻已经是我们刚推上去的状态（调用方保证远端先成功），
+        改它只是让镜像跟上，不会伪造远端状态。
         """
         with self._cursor() as cur:
             cur.execute(
                 "UPDATE subjects SET collect_type=? WHERE id=?",
                 (int(collect_type or 0), subject_id),
+            )
+            # 同步收藏缓存（如果这张表里有该条目）。
+            #
+            # 用**本地 id 反查 bangumi_id**：本方法的入参是本地主键，
+            # 而缓存表的主键是 bangumi_id。
+            #
+            # `local_at` 记"本地显式设置"的时刻，供回填 SQL 判断新旧
+            # （见 _COLLECT_TYPE_BACKFILL_SQL）。**它只在这里被写** ——
+            # 整表同步刻意不碰它。
+            now = _now()
+            cur.execute(
+                """UPDATE inprogress_cache
+                      SET collect_type=?, local_at=?
+                    WHERE bangumi_id = (
+                        SELECT bangumi_id FROM subjects
+                         WHERE id=? AND bangumi_id IS NOT NULL
+                    )""",
+                (int(collect_type or 0), now, int(subject_id)),
             )
 
     # ---------- 条目别名 ----------
@@ -1185,7 +1282,7 @@ class Database:
                （`upsert_local_subject`，bangumi_id 为 NULL）
         ②并没有"用户指定的匹配结果"可保护：若把它一并当成手动匹配跳过，
         用户之后填好 Token 点「重新扫描」只会得到"跳过：该目录已有手动匹配"，
-        非得删掉重加才能拿到数据（实测反馈）。判据用 bangumi_id 才准确 ——
+        非得删掉重加才能拿到数据。判据用 bangumi_id 才准确 ——
         有它是"用户的匹配决定"，没有它只是个还没匹配上的本地条目。
         """
         with self._cursor() as cur:
@@ -1242,8 +1339,8 @@ class Database:
     ) -> int:
         """写入/复用「本地条目」——**没有 bangumi_id** 的漫画。
 
-        用途：「添加动漫」在**未填 Token** 时的路径（用户明确要求"没填
-        Token 就不匹配"）。此时不联网，把目录里的视频直接作为本地条目入库。
+        用途：「添加动漫」在**未填 Token** 时的路径。
+        此时不联网，把目录里的视频直接作为本地条目入库。
 
         与 `upsert_pending_subject` 的区别只在 `match_state`：
             pending —— "匹配过、结果需人工确认"（详情页会弹「⚠ 匹配待确认」）
@@ -1251,7 +1348,7 @@ class Database:
         用户是**主动选择不匹配**的，并没有失败的匹配要他处理，套用 pending
         会凭空多出一条待办提示，所以这里用 manual。
 
-        **为什么不能用 `upsert_subject(bangumi_id=0)`**（踩坑）：subjects 表的
+        **为什么不能用 `upsert_subject(bangumi_id=0)`**：subjects 表的
         `bangumi_id` 有 UNIQUE 约束，而 0 只能存在一行 —— 第二条未匹配番会
         把第一条**覆盖**掉。未匹配必须写 NULL（SQLite 的 UNIQUE 允许多个
         NULL 共存），并按 `folder_path` 手工判重（同 pending 的做法）。
@@ -1320,7 +1417,7 @@ class Database:
     def delete_subject(self, subject_id: int) -> None:
         """删除条目及其**全部关联数据**。
 
-        **不要只删 subjects 主表**（踩坑）：`episodes` 建表时写了
+        **不要只删 subjects 主表**：`episodes` 建表时写了
         `ON DELETE CASCADE`，但 SQLite **默认不开外键约束**（需要
         `PRAGMA foreign_keys=ON`，本项目未开），级联不会生效 —— 只删主表
         会留下孤儿集数行；`subject_tags` 更是完全没有级联。
@@ -1462,8 +1559,12 @@ class Database:
         而它可能来自"上次同步"甚至更早（`cached_collect_type` 那条快路径
         也会写它）。不在这里对齐的话，用户改过收藏后本地会一直显示旧状态，
         且因为"有值就不再回查"而**永远不会自愈**。
-        搬这一列是安全的：收藏同步拉的就是服务端全量状态，
-        至少和任何本地快照一样新。
+
+        **但"这批新数据"不一定比本地新**：收藏同步可能是
+        几小时甚至几十小时前拉的，而本地刚因"自动完结"写过一次状态 ——
+        无条件搬运就会把刚写的值盖回旧的。所以搬运带一个
+        `local_at` 判据（见 _COLLECT_TYPE_BACKFILL_SQL），本地更新过的那几条
+        跳过；同时上面那段 `local_marks` 保住该列不被整表重建抹掉。
 
         `truncated=True` 表示这次拉取触顶截断（见 `iter_user_collections`
         的 max_items）：此时**不会**把"名单外的条目"当成"已取消收藏"，
@@ -1471,14 +1572,25 @@ class Database:
         """
         now = _now()
         with self._cursor() as cur:
+            # **先把 `local_at` 留下来**：下面的 `DELETE` + 重插会把它
+            # 一起清掉（INSERT 语句里没有这一列 → 新行该列为 NULL），
+            # 而它的语义是"本地什么时候显式设过状态"，**与"这一批缓存
+            # 什么时候拉的"无关**，不该被整表同步抹掉 ——
+            # 抹掉就等于回填防线失效，本地刚写的状态又会被旧缓存盖回去。
+            local_marks = {
+                int(r["bangumi_id"]): r["local_at"]
+                for r in cur.execute(
+                    "SELECT bangumi_id, local_at FROM inprogress_cache"
+                    " WHERE local_at IS NOT NULL AND local_at != ''")
+            }
             cur.execute("DELETE FROM inprogress_cache")
             cur.executemany(
                 """
                 INSERT OR REPLACE INTO inprogress_cache
                     (bangumi_id, name, name_cn, cover_url,
                      ep_status, total_eps, collect_type, updated_at,
-                     collection_updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                     collection_updated_at, local_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
@@ -1491,6 +1603,7 @@ class Database:
                         int(it.get("collect_type") or 3),
                         now,
                         it.get("collection_updated_at") or "",
+                        local_marks.get(int(it.get("bangumi_id") or 0)) or "",
                     )
                     for it in items
                     if it.get("bangumi_id")
@@ -1499,7 +1612,10 @@ class Database:
             # ① 把**这次拉到的**状态写回 subjects.collect_type（同一条 SQL
             # 也用于 v10 迁移）。只覆盖"缓存里有行"的条目：名单外的条目
             # 保持原快照，不会被清成"未知"。
-            cur.execute(_COLLECT_TYPE_BACKFILL_SQL)
+            #
+            # 参数 `now`：用来判"缓存里的这一行是不是本地刚写过的"
+            # （见 _COLLECT_TYPE_BACKFILL_SQL）。
+            cur.execute(_COLLECT_TYPE_BACKFILL_SQL, (now,))
             # ② 这次拉取是全量的（除触顶截断），所以**名单里没有的已匹配条目
             # = 服务端已不在收藏里** → 本地快照清成 0（"未知"）。
             #
@@ -1507,8 +1623,7 @@ class Database:
             # 「在看」页会把它当"本地标记的条目"继续列出来（见 LibraryBridge
             # 的合并段），而缓存里早已没有它 —— 一部已经取消收藏的番永远挂着。
             # 用整库的判据（而不是"与上一轮缓存比差集"）：后者漏掉
-            # "更早以前就消失、当时没清干净"的遗留（实测：CLANNAD 一直显示
-            # 在看在）。
+            # "更早以前就消失、当时没清干净"的遗留
             #
             # **截断时跳过**（`truncated`）：拉取触顶（MAX_ITEMS）时，
             # 名单外的条目不代表"已取消收藏"，只是没拉到 —— 此时宁可留着
@@ -1548,7 +1663,20 @@ class Database:
                 """,
                 params,
             )
-            return [InProgressItem(**dict(r)) for r in cur.fetchall()]
+            # **只取数据类认识的列**。
+            #
+            # 原先直接 `InProgressItem(**dict(r))`，而这里是 `SELECT *` ——
+            # 一旦表里加了新列（v15 加了 `local_at`）而数据类还没跟上，
+            # 构造就会抛 `TypeError: unexpected keyword argument 'local_at'`，
+            # 整个在看列表变成空、界面显示"暂无在看条目" ✗。
+            # 这种"加一列就炸"的耦合没必要：按数据类字段过滤一遍，
+            # 多出来的列直接忽略，以后加列不会再把它炸掉。
+            fields = {f.name for f in dc_fields(InProgressItem)}
+            return [
+                InProgressItem(**{k: v for k, v in dict(r).items()
+                                  if k in fields})
+                for r in cur.fetchall()
+            ]
 
     def inprogress_cache_age(self) -> Optional[float]:
         """缓存距今秒数；无缓存返回 None。"""
@@ -1740,7 +1868,7 @@ class Database:
 
         为什么需要它：补传成功后，本地 `watched_episodes` 里还没有这一集 ——
         动态页那一行要等**下一次集级同步**才会多出 `bgm` 标记 ✗。
-        用户刚点完「上传」却看不到任何变化，会以为没生效（实测反馈的同类问题）。
+        用户刚点完「上传」却看不到任何变化，会以为没生效。
         这里直接按 `bangumi_ep_id` upsert：不必等同步，界面立刻就是对的 ✓
         （下一次同步会拉到同一集并覆盖，值一致 ✓）。
 
@@ -1978,6 +2106,23 @@ class Database:
             cur.execute(
                 f"UPDATE download_history SET {','.join(sets)} WHERE id=?",
                 args,
+            )
+
+    def mark_download_scanned(self, record_id: int) -> None:
+        """标记该下载记录**已因"下载完成"触发过自动扫描**（v14）。
+
+        **为什么要落库**：
+        见迁移 v14 的说明 —— 内存集合一重启就没了，而已下完的 qB 任务还在，
+        于是每次启动都重扫一遍。这一列让它成为**跨会话**的事实。
+
+        **只在"扫描真的发起了"之后调**（见 RssBridge._maybe_scan_completed）：
+        如果扫描被"正在扫描中"拒绝，就不该标记 —— 否则那一条永远不会再被扫，
+        新集就漏了。调用方负责这个时序。
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE download_history SET scanned_at=?, updated_at=? WHERE id=?",
+                (_now(), _now(), int(record_id)),
             )
 
     def list_downloads(self, source_id: Optional[int] = None) -> list[DownloadRecord]:
