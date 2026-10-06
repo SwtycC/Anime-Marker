@@ -26,6 +26,12 @@
 | `plus.svg` | 16×16 | 描边 2.4 | `NavIcon.kind="plus"` — 「添加动漫」悬浮按钮 |
 | `refresh.svg` | 16×16 | 描边 1.5 | `AddButton.qml`（扫描转圈）、详情页「重新扫描」按钮 |
 | `close-small.svg` | 16×16 | 填充 | 备用（当前无引用）|
+| `more.svg` | 16×16 | 填充 | `NavIcon.kind="more"` — 状态栏最右侧「更多」按钮 |
+| `update.svg` | 16×16 | 描边 1.6 | `NavIcon.kind="update"` — 「更多」菜单 · 检查更新 |
+| `folder.svg` | 16×16 | 填充 | `NavIcon.kind="folder"` — 「更多」菜单 · 打开日志目录 |
+| `help.svg` | 16×16 | 描边 1.5 | `NavIcon.kind="help"` — 「更多」菜单 · 帮助 |
+| `info.svg` | 16×16 | 描边 1.5 + 填充 | `NavIcon.kind="info"` — 「更多」菜单 · 关于 |
+| `feedback.svg` | 16×16 | 填充 | `NavIcon.kind="feedback"` — 「更多」菜单 · 反馈问题 |
 
 > 本目录只放 **SVG**。程序图标（`.ico`）与封面占位图（`.png`）不在
 > 这里 —— 封面圆角遮罩在 `resources/poster_mask.png`。

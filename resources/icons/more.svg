@@ -1,0 +1,5 @@
+<!-- fill 必须为白色：MultiEffect 的 colorization 按「源亮度」相乘，黑色永远染不出颜色（见本目录 README） -->
+<!-- 「更多」图标：三条水平线（汉堡 / more），状态栏最右侧那个按钮用它。
+     填充式（三个圆角矩形），与本目录多数图标一致；不要再画描边式，
+     16px 下 1.5 的描边在这个尺寸会显得比相邻图标细一档。 -->
+<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><rect x="2" y="3.4" width="12" height="1.6" rx="0.8" fill="#FFFFFF"/><rect x="2" y="7.2" width="12" height="1.6" rx="0.8" fill="#FFFFFF"/><rect x="2" y="11" width="12" height="1.6" rx="0.8" fill="#FFFFFF"/></svg>

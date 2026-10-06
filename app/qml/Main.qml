@@ -187,6 +187,10 @@ ApplicationWindow {
             Layout.fillWidth: true
             version: appVersion
             message: "就绪"
+            // 有新版本时「更多」按钮上点个小圆点（见 AppMenuBridge 的说明）
+            moreHasUpdate: typeof appMenu !== "undefined" && appMenu
+                           ? appMenu.hasUpdate : false
+            onMoreClicked: moreMenu.open()
         }
     }
 
@@ -513,6 +517,55 @@ ApplicationWindow {
         onVisibleChanged: {
             if (!visible && detailPage.subjectId === subjectId && subjectId > 0)
                 detailPage.load(subjectId)
+        }
+    }
+
+    // ============ 状态栏「更多」菜单 ============
+    //
+    // **必须铺满整窗**：面板自己贴右下角往上弹，而"点面板以外就关闭"
+    // 需要一个覆盖全窗的 MouseArea —— 两者必须在同一个组件里（否则
+    // 遮罩会盖住面板）。所以这里 `anchors.fill: parent`，见 MoreMenu.qml。
+    MoreMenu {
+        id: moreMenu
+        objectName: "moreMenu"
+        anchors.fill: parent
+        z: 90
+        // 面板下沿落在状态栏**之上**：状态栏高度 + 一点间隙
+        bottomOffset: statusBar.height + Theme.spacingMd
+        // 三个状态都来自后端（红点 / 版本号 / 检查中）
+        hasUpdate: typeof appMenu !== "undefined" && appMenu
+                   ? appMenu.hasUpdate : false
+        latestTag: typeof appMenu !== "undefined" && appMenu
+                   ? appMenu.latestTag : ""
+        checking: typeof appMenu !== "undefined" && appMenu
+                  ? appMenu.checking : false
+
+        onTriggered: function (action) {
+            // 上下文属性在组件预览 / 静态检查时不存在，统一兜一层
+            if (typeof appMenu === "undefined" || !appMenu) return
+            if (action === "update")      appMenu.checkUpdate()
+            else if (action === "logs")   appMenu.openLogsDir()
+            else if (action === "help")   appMenu.openHelp()
+            else if (action === "about")  aboutDialog.open()
+            else if (action === "issues") appMenu.openIssues()
+        }
+    }
+
+    AboutDialog {
+        id: aboutDialog
+        objectName: "aboutDialog"
+        version: appVersion
+    }
+
+    // 检查更新的结果 → 状态栏。
+    //
+    // **只有"手动"那次会来消息**（自动那次静默，见 AppMenuBridge）——
+    // 所以这里不需要再判断来源，收到就播。
+    Connections {
+        target: typeof appMenu !== "undefined" && appMenu ? appMenu : null
+
+        function onStatusMessage(text) {
+            statusBar.setMessage(text, 6000)
         }
     }
 

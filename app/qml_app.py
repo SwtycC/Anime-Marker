@@ -24,8 +24,8 @@ from PySide6.QtWidgets import QApplication
 
 from app import USER_AGENT, __version__
 from app.bridges import (
-    InProgressBridge, LibraryBridge, MatchBridge, PlayerBridge, RssBridge,
-    ScannerBridge, SettingsBridge,
+    AppMenuBridge, InProgressBridge, LibraryBridge, MatchBridge, PlayerBridge,
+    RssBridge, ScannerBridge, SettingsBridge,
 )
 # 季数识别 / 多季展示已写死（界面移除，见 scanner 里常量的说明）
 from app.bridges.scanner import SEASON_DISPLAY
@@ -149,6 +149,8 @@ class QmlApp:
         # 订阅桥接也需要 config（抓 RSS 的代理/UA）与 api（「从订阅源新建条目」
         # 时匹配 Bangumi）—— 早期只传 db，因为当时只做订阅源管理。
         self.rss_bridge = RssBridge(self.db, self.config, self.api)
+        # 状态栏「更多」菜单（检查更新 / 打开日志目录 / 帮助 / 关于 / 反馈）
+        self.app_menu_bridge = AppMenuBridge()
 
         # ---- RSS 轮询下载（F19 的第二半）----
         #
@@ -477,6 +479,7 @@ class QmlApp:
         ctx.setContextProperty("matcher", self.match_bridge)
         ctx.setContextProperty("inprogress", self.inprogress_bridge)
         ctx.setContextProperty("rss", self.rss_bridge)
+        ctx.setContextProperty("appMenu", self.app_menu_bridge)
 
         # ---- 加载主界面 ----
         main_qml = qml_root / "Main.qml"
@@ -509,6 +512,12 @@ class QmlApp:
         # 详情页/海报墙写状态 —— 界面没起来时做这些没有意义，
         # 还可能和首帧渲染抢资源（用户会看到窗口"卡一下才出来"）。
         self.rss_bridge.startScanWatch()
+
+        # ---- 检查更新（启动后延迟一次，静默）----
+        # 同样要等界面起来：它启动的是定时器（不是立刻发请求，见
+        # AppMenuBridge.INITIAL_DELAY_MS），这里只是把定时器挂上。
+        # 结果只用来点亮状态栏「更多」菜单里的小红点，不弹窗、不动状态栏。
+        self.app_menu_bridge.startInitialCheck()
 
         return app.exec()
 
@@ -644,6 +653,12 @@ class QmlApp:
             self.rss_bridge.stopScanWatch()
         except Exception as e:  # pragma: no cover - 防御性
             log.warning("停止「下载完自动扫描」失败：%s", e)
+        # 检查更新的线程：停掉定时器并等它跑完 —— QThread 还在跑时
+        # 对象被销毁会直接崩（"Destroyed while thread is still running"）
+        try:
+            self.app_menu_bridge.waitWorker()
+        except Exception as e:  # pragma: no cover - 防御性
+            log.warning("等待检查更新线程结束失败：%s", e)
         # 订阅相关线程（抓 RSS 推断名称 / 从订阅源新建条目）
         try:
             self.rss_bridge.waitWorkers()

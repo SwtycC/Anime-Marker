@@ -887,51 +887,32 @@ Item {
         return parts.join(" · ")
     }
 
-    // 数据变化时刷新：library.subjects 变化会自动触发 Repeater 重建，
-    // 这里负责**把滚动位置保住**。
+    // 数据变化时**有意什么都不做**（见下）。
     //
-    // **不要在这里写 `flick.contentY = 0`**：
+    // 这里原先写的是 `flick.contentY = 0`（"数据变化时刷新，滚动位置回到
+    // 顶部"），而那是个 bug（实测反馈："在动漫详情页单条目重新扫描后，
+    // 回退到海报墙会回到顶部"）：
     // `subjectsChanged` 不只是"列表内容真的变了"，它也是**单条目重扫的
     // 收尾** —— QmlApp._on_scan_finished 第一件事就是 `library.reload()`。
     // 用户点「重新扫描」时人在详情页，海报墙在后台被这条信号顶回顶部，
     // 返回时看到的就是"跳到了顶上"。
     // 而重扫只改集数，卡片**顺序和数量都没变**，没有任何理由移动视口。
     //
-    // 重建期间 Flow 的 implicitHeight 会跟着变（contentHeight 随之变），
-    // Flickable 可能把越界的 contentY 夹掉，所以：
-    //   ① 收到信号时先把当前位置记下来；
-    //   ② 高度变化后再贴回去（夹进新的可视范围）。
-    // 只在重建那一小段时间内生效（`keepScroll` 计时器），窗口一过就作废
-    // —— 否则用户之后自己滚动，会被这条"记忆"反复拉回旧位置。
+    // **不需要"先记住位置、重建后再贴回去"那一套**（A/B 对照实测过：
+    // 把那套机制关掉，位置照样保住）：Repeater 重建时 Flickable 的
+    // contentY 本来就会原样保留 —— 位置丢失**完全**来自上面那句显式归零。
+    // 内容真的变短时（删掉条目），Flickable 自己会把越界的 contentY 夹进
+    // 合法范围，那也是对的。
+    //
+    // 真正需要主动归零的只有**筛选变化**（见下面的 onQueryChanged /
+    // onTagSelectionChanged / onStateFilterChanged）—— 那是用户明确要求
+    // "看最前面几部"。
     Connections {
         target: typeof library !== "undefined" && library ? library : null
         function onSubjectsChanged() {
-            if (flick.contentY > 1) {
-                root._pendingY = flick.contentY
-                keepScroll.restart()
-            }
-        }
-    }
-
-    /// 数据重建期间要保住的滚动位置（-1 = 没有待保位置）
-    property real _pendingY: -1
-
-    /// 重建窗口：这段时间内的 contentHeight 变化都会把 `_pendingY` 贴回去
-    Timer {
-        id: keepScroll
-        interval: 400
-        onTriggered: root._pendingY = -1
-    }
-
-    // Flickable 没有自己的 `contentHeightChanged` 处理槽可用（root 是
-    // 普通 Item，没有 contentHeight 属性），故用 Connections 监听。
-    Connections {
-        target: flick
-        function onContentHeightChanged() {
-            // 回顶动画正在跑时别插手（那是用户明确要求的"去顶部"）
-            if (root._pendingY < 0 || scrollTopAnim.running)
-                return
-            flick.contentY = Math.max(0, Math.min(root._pendingY, root.scrollMax))
+            // 有意留空：理由见上。留一个空实现是为了让"这里接过
+            // subjectsChanged、但故意不做事"在代码里可见，
+            // 免得以后有人以为漏了而把 `contentY = 0` 补回来。
         }
     }
 }

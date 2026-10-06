@@ -11,6 +11,7 @@
 | `match.py`    | 手动匹配（搜索候选 + 打分排序 + 应用） |
 | `inprogress.py` | 在看列表（Bangumi 拉取 + 离线缓存降级） |
 | `rss.py`      | RSS 订阅源管理 + 下载记录查询 |
+| `app_menu.py` | 状态栏「更多」菜单（检查更新 / 打开日志目录 / 帮助 / 反馈） |
 
 约定：
 - 对外只用 `@Slot` / `@Property` / `Signal`，不暴露 ORM 对象
@@ -18,6 +19,7 @@
 - 耗时操作走 QThread，用 Signal 回主线程
 """
 
+from app.bridges.app_menu import AppMenuBridge
 from app.bridges.inprogress import InProgressBridge
 from app.bridges.library import LibraryBridge, as_file_url
 from app.bridges.match import MatchBridge
@@ -34,5 +36,6 @@ __all__ = [
     "MatchBridge",
     "InProgressBridge",
     "RssBridge",
+    "AppMenuBridge",
     "as_file_url",
 ]

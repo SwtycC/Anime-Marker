@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Anime Marker 使用帮助</title>
+<!--
+  随程序一起发布的**离线**帮助页（由状态栏「更多 → 帮助」用系统浏览器打开）。
+
+  为什么不是指向线上文档：线上文档会实时更新，旧版程序点开会看到新版的
+  说明，对不上。这一份跟程序同一个版本发布，看到的一定是对得上的。
+
+  为什么是 HTML 而不是 README.md：README 里有表格和截图，应用内渲染不了
+  （Qt 的 Markdown 支持不含表格/图片）；而直接打开 .md 取决于系统关联，
+  多半会被编辑器打开。手写 HTML 只挑用户真正需要的那几节，样式也自洽。
+-->
+<style>
+  :root {
+    --accent: #FB7299;
+    --bg: #F6F7F9; --card: #FFFFFF;
+    --text: #1A1D23; --text2: #5A6472; --text3: #8E97A4;
+    --border: #E4E7EC;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px 20px 64px;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  .sub { color: var(--text3); font-size: 13px; margin: 0 0 32px; }
+  h2 {
+    font-size: 19px; margin: 36px 0 12px; padding-left: 11px;
+    border-left: 4px solid var(--accent); line-height: 1.3;
+  }
+  h3 { font-size: 15px; margin: 20px 0 6px; color: var(--text2); }
+  section { background: var(--card); border: 1px solid var(--border);
+            border-radius: 10px; padding: 20px 24px; margin-bottom: 18px; }
+  p { margin: 8px 0; }
+  ul, ol { margin: 8px 0; padding-left: 22px; }
+  li { margin: 5px 0; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--text3); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  code {
+    background: #F2F4F7; border: 1px solid var(--border); border-radius: 4px;
+    padding: 1px 5px; font-size: 13px;
+    font-family: Consolas, "Cascadia Mono", monospace;
+  }
+  a { color: var(--accent); }
+  .note {
+    border-left: 3px solid var(--accent); background: #FFF7FA;
+    padding: 10px 14px; border-radius: 0 6px 6px 0; color: var(--text2);
+    font-size: 14px; margin: 12px 0;
+  }
+  .optional { color: var(--text3); }
+</style>
+</head>
+<body>
+<main>
+
+  <h1>Anime Marker 使用帮助</h1>
+  <p class="sub">本地动漫媒体库管理工具 · 本页随程序发布，对应你当前使用的版本</p>
+
+  <section>
+    <h2>环境要求</h2>
+    <table>
+      <tr><th>项</th><th>说明</th></tr>
+      <tr><td>系统</td><td>Windows 10 / 11</td></tr>
+      <tr><td>PotPlayer</td><td>播放功能需要</td></tr>
+      <tr><td>Lossless Scaling <span class="optional">（可选）</span></td>
+          <td>播放前自动开插帧</td></tr>
+      <tr><td>qBittorrent <span class="optional">（可选）</span></td>
+          <td>RSS 下载需要，且要开启 <b>Web UI</b></td></tr>
+      <tr><td>Bangumi Token <span class="optional">（可选）</span></td>
+          <td>收藏同步 / 动态页 / 自动上传需要</td></tr>
+    </table>
+    <p class="note">除 PotPlayer 外的几项都不是必需的：没配 Token 时程序照常
+       工作，只是不跟 Bangumi 同步。</p>
+  </section>
+
+  <section>
+    <h2>首次配置</h2>
+    <p>打开「设置」页，按下面的顺序填一遍即可。</p>
+
+    <h3>1. Bangumi Token</h3>
+    <ul>
+      <li>到 <a href="https://next.bgm.tv/demo/access-token">next.bgm.tv/demo/access-token</a>
+          申请一个，<b>记得勾选「读取收藏」权限</b>（不勾的话收藏同步会失败）。</li>
+      <li>填写后会校验一次；通过后收藏列表、动态页才会开始工作。</li>
+    </ul>
+
+    <h3>2. 媒体库根目录</h3>
+    <ul>
+      <li>填动漫所在的那个目录（例如 <code>F:\动漫</code>）。</li>
+      <li>多个目录用英文分号 <code>;</code> 分隔。</li>
+      <li>扫描按「目录 = 一部动漫」来切分，所以每部番最好各自一个目录。</li>
+    </ul>
+
+    <h3>3. PotPlayer 路径</h3>
+    <ul>
+      <li>指向 <code>PotPlayerMini64.exe</code>，播放按钮要用。</li>
+    </ul>
+    <p class="note"><b>不需要任何 PotPlayer 设置</b> —— 程序通过 PotPlayer 的原生接口
+      （<code>WM_USER</code> 消息）直接读播放位置，毫秒级精确。
+      老教程里那条「<code>F5 → 基本 → 消息 → 在屏幕上显示播放信息</code>」<b>不用开</b>：
+      它只控制画面上的 OSD，跟播放位置无关。<br>
+      唯一还需要动 PotPlayer 设置的是<b>用插帧的时候</b>：视频渲染器要选
+      D3D11 那一类（<code>F5 → 视频 → 视频渲染器</code>），否则小黄鸭起来了也不补帧。
+      那是小黄鸭的要求，跟本程序读进度无关。</p>
+
+    <h3>4. qBittorrent <span class="optional">（用 RSS 下载才需要）</span></h3>
+    <ul>
+      <li>填 Web UI 的地址、端口、用户名、密码。</li>
+      <li>可以另外填 qBittorrent 的<b>程序路径</b>：它连不上时程序会按需帮你
+          把它拉起来（qBittorrent 的托盘「退出」会连 Web UI 一起关掉）。</li>
+    </ul>
+
+    <h3>5. 代理 <span class="optional">（可选）</span></h3>
+    <ul>
+      <li>国内网络访问 <code>api.bgm.tv</code> 不稳定时可以填，
+          格式形如 <code>http://127.0.0.1:7890</code>。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>看完自动标记</h2>
+    <p>播放到一定进度就自动把那一集标成看过，并同步到 Bangumi。</p>
+    <ul>
+      <li><b>判定阈值</b>默认为 90%（「触发阈值」）—— 看到九成就算看完。
+          片尾曲比较长的番可以调小一点。</li>
+      <li><b>顺序是「先本地、后远端」</b>：本地观看记录先落袋，再在后台
+          POST 到 Bangumi。同步失败只提示，不会把本地记录也丢掉 ——
+          事后可以用「动态」页的「上传」补传。</li>
+      <li><b>「看完立即同步」</b>关掉后只写本地，什么时候上传由你自己决定。</li>
+      <li><b>「自动完结」</b>：一部动漫的每一集都看完后，自动把它整条标成
+          「看过」。注意判定用的是「看过的集数 ≥ 官方集数」，所以跨季连续
+          编号的番（比如从第 73 集开始编号的第四季）也会按本季集数算。</li>
+    </ul>
+    <p class="note">没填 Token 时这些开关一样有效 —— 本地记录照写，
+       只是不往 Bangumi 传。之后补上 Token，可以在「动态 → 上传」里一次补齐。</p>
+  </section>
+
+  <section>
+    <h2>RSS 订阅怎么用</h2>
+    <ol>
+      <li>在 qBittorrent 里开启 <b>Web UI</b>（设置 → Web UI），
+          并在本程序「设置」页填好地址与账号。</li>
+      <li>到「订阅」页新增一条订阅源：填 RSS 链接、选择保存路径。</li>
+      <li>规则选 <b>「仅新条目」</b>：只推送订阅之后新出现的条目，
+          不会把历史剧集一次性全下一遍。</li>
+      <li>qBittorrent 里下载完成后，程序会自动扫描该条目并把新集入库，
+          所以在看页的进度会自己跟上。</li>
+    </ol>
+    <h3>轮询</h3>
+    <ul>
+      <li>「自动轮询」开着（默认）：启动时检查一次，之后每 30 分钟一次。</li>
+      <li>关掉后不再自动请求，只在点「立即检查」时抓一次 ——
+          不想让它自己下东西就用这个。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>遇到问题</h2>
+    <ul>
+      <li><b>先看日志</b>：状态栏最右侧「更多」→ <b>打开日志目录</b>，
+          里面是运行记录，多数问题都能看出原因。</li>
+      <li><b>要反馈的话</b>：「更多」→ <b>反馈问题</b>，
+          会自动带上版本号与系统信息，你只要写清楚现象和复现步骤。</li>
+      <li><b>检查更新</b>：同一个菜单里，有新版本时那一行右边会点一个小红点。</li>
+    </ul>
+  </section>
+
+</main>
+</body>
+</html>

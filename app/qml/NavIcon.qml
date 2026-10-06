@@ -27,7 +27,9 @@ Item {
     id: root
 
     /// 图标种类：grid（海报墙）/ play（在看）/ clock（动态）/ rss（订阅）/ gear（设置）/
-    /// search（搜索）/ chevron（展开箭头，非选中时朝下，展开后由调用方旋转 180°）
+    /// search（搜索）/ chevron（展开箭头，非选中时朝下，展开后由调用方旋转 180°）/
+    /// more（三条水平线，状态栏的「更多」按钮）/
+    /// update / folder / help / info / feedback（「更多」菜单里那五项的行首图标）
     property string kind: "grid"
     /// 图标颜色（由 NavBar 按选中 / 悬停 / 常态传入）
     property color color: Theme.textSecondary
@@ -66,6 +68,16 @@ Item {
                                     : kind === "plus"   ? "plus"
                                     // trash：删除（垃圾桶）
                                     : kind === "trash"  ? "trash"
+                                    // more：三条水平线。状态栏最右侧
+                                    // 「更多」按钮用它（见 StatusBar.qml）
+                                    : kind === "more"   ? "more"
+                                    // 下面五个是「更多」菜单里那五项的行首图标
+                                    // （见 MoreMenu.qml 的 items）
+                                    : kind === "update"   ? "update"
+                                    : kind === "folder"   ? "folder"
+                                    : kind === "help"     ? "help"
+                                    : kind === "info"     ? "info"
+                                    : kind === "feedback" ? "feedback"
                                     : ""
     readonly property string svgUrl: svgName !== "" && iconsBase !== ""
                                      ? iconsBase + svgName + ".svg" : ""

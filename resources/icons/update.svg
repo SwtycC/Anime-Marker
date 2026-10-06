@@ -1,0 +1,5 @@
+<!-- fill/stroke 必须为白色：MultiEffect 的 colorization 按「源亮度」相乘（见本目录 README） -->
+<!-- 「检查更新」图标：向下箭头 + 底线 = 取回新版本。
+     与 refresh.svg 区分开 —— 那个是「重新扫描」，语义是"再来一遍"；
+     这个要表达"把新版本拿下来"，所以用下载形而不是循环形。 -->
+<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M8 1.9v7.2" fill="none" stroke="#FFFFFF" stroke-width="1.6" stroke-linecap="round"/><path d="M4.7 6.2 8 9.6l3.3-3.4" fill="none" stroke="#FFFFFF" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M2.8 12.6h10.4" fill="none" stroke="#FFFFFF" stroke-width="1.6" stroke-linecap="round"/></svg>
