@@ -633,6 +633,12 @@ class QmlApp:
             self.player_bridge.wait_pending_sync()
         except Exception as e:  # pragma: no cover - 防御性
             log.warning("等待后台同步结束失败：%s", e)
+        # 正在跑的「启动播放器」线程同理（见 PlayerBridge.wait_launch_workers）：
+        # 它的收尾会查数据库，不等就 close 会撞上"连接已关闭"
+        try:
+            self.player_bridge.wait_launch_workers()
+        except Exception as e:  # pragma: no cover - 防御性
+            log.warning("等待启动线程结束失败：%s", e)
         try:
             self.db.close()
         except Exception as e:  # pragma: no cover - 防御性

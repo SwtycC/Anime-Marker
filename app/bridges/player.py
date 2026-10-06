@@ -6,9 +6,10 @@
 3. 进度达阈值时自动标记 Bangumi「看过」，并通知 QML 刷新
 
 **QML 不能直接持有 QTimer / win32gui 资源**，因此这里做一层包装：
-- `playEpisode()` 是同步 Slot（启动进程很快，不阻塞）
+- `playEpisode()` 是**异步** Slot（真正的启动链在后台线程，见 `_LaunchWorker`）
 - 进度通过 `progressChanged` 信号回传，QML 绑定进度条
 - `watchedChanged` 通知详情页重绘集数列表
+
 
 与旧版 `main_window._play_episode` 的行为保持一致：
 找不到集数 → 发 failed；启动器失败 → 发 failed；成功则启动 monitor。
@@ -19,7 +20,8 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from PySide6.QtCore import QObject, Property, Signal, Slot
+from PySide6.QtCore import (Q_ARG, QMetaObject, QObject, Property, QRunnable,
+                            Qt, QThreadPool, Signal, Slot)
 
 from app.core.bangumi_api import BangumiClient
 from app.core.config import Config
@@ -28,6 +30,68 @@ from app.core.launcher import LauncherError, PlayerLauncher
 from app.core.monitor import ProgressMonitor
 
 log = logging.getLogger(__name__)
+
+
+class _LaunchWorker(QRunnable):
+    """后台跑「起 LS → 起播放器 → 置前 → 全屏 → 发插帧键」这条启动链。
+
+    **为什么必须放到后台线程**：
+
+    `PlayerLauncher.play()` 看着只是 `Popen`（很快），但它**内部串了一串
+    等待**，累计最坏十几秒：
+
+        _start_ls           → time.sleep(ls_start_delay)      默认 5.0s
+        play                → time.sleep(player_start_delay)  默认 1.0s
+        _ensure_fullscreen  → 轮询等全屏                      最多 3.0s
+        fullscreen_settle   → time.sleep(...)                 默认 3.0s
+
+    而 `playEpisode` 是 QML 直接调的 Slot，**跑在 UI 线程上** —— 这段时间
+    窗口完全冻结。用户此时去关掉小黄鸭（正是实测的操作），点击落在冻结的
+    界面上，Windows 立刻判"未响应"。
+
+    原注释写的"启动进程很快，不阻塞"只对第一个 `Popen` 成立，忽略了后面
+    那串等待 —— 现按实际行为改正。
+
+    **跨线程边界**：worker 里**只做启动与发键**（都是系统调用，不碰 Qt 对象、
+    不碰数据库）；结果经 `QMetaObject.invokeMethod` 交回主线程的
+    `_on_launch_finished` 处理（与 monitor 的 `_SyncRunnable` 同一套约定）。
+    """
+
+    def __init__(self, bridge: "PlayerBridge", episode_id: int,
+                 file_path: str, launcher) -> None:
+        super().__init__()
+        self._bridge = bridge
+        self._episode_id = int(episode_id)
+        self._file_path = file_path
+        self._launcher = launcher
+
+    @Slot()
+    def run(self) -> None:
+        err = ""
+        try:
+            self._launcher.play(self._file_path)
+        except LauncherError as e:
+            err = str(e)
+        except Exception as e:          # pragma: no cover - 防御性
+            log.exception("启动播放器异常 episode_id=%s", self._episode_id)
+            err = str(e)
+        # 回主线程收尾（写状态 + 开监控 + 发信号）。
+        #
+        # **必须防 `RuntimeError`**：启动链可能跑十几秒，
+        # 用户完全可能在这期间就退出程序 —— 那时 `PlayerBridge` 的 C++
+        # 对象已经销毁，`invokeMethod` 会抛
+        #     RuntimeError: Internal C++ object (PlayerBridge) already deleted
+        # 而这是在子线程里，异常没人接、直接刷一屏堆栈（Qt 会打印
+        # "Error calling Python override of QRunnable::run()"）。
+        # 此时本来就什么都不该做了（程序都要退了），静默返回即可。
+        try:
+            QMetaObject.invokeMethod(
+                self._bridge, "_on_launch_finished", Qt.QueuedConnection,
+                Q_ARG(int, self._episode_id),
+                Q_ARG(str, err))
+        except RuntimeError:
+            log.info("启动线程收尾时程序已退出，忽略（episode_id=%s）",
+                     self._episode_id)
 
 
 class PlayerBridge(QObject):
@@ -65,6 +129,16 @@ class PlayerBridge(QObject):
         # 集号显示文本（"第 3 集" / "SP01"），同样是播放时算好缓存。
         self._playing_episode_label = ""
         self._progress = 0.0
+
+        #: 启动链的后台线程池（见 _LaunchWorker 的说明）。
+        #:
+        #: `maxThreadCount=1`：播放是**互斥**动作 —— 用户连点两集时，
+        #: 两条启动链同时跑会各发一次全屏键/插帧键，互相打架
+        #: （表现为窗口在全屏/窗口之间乱切）。串行执行让第二次排队等第一次
+        #: 跑完，行为可预期（与 monitor 那个"限流防撞 Bangumi"的池同理，
+        #: 只是这里限到 1）。
+        self._launch_pool = QThreadPool(self)
+        self._launch_pool.setMaxThreadCount(1)
 
         self._monitor = ProgressMonitor(
             db=db,
@@ -160,7 +234,19 @@ class PlayerBridge(QObject):
     # ---------- 动作 ----------
     @Slot(int, result=bool)
     def playEpisode(self, episode_id: int) -> bool:
-        """播放指定集数。返回是否成功启动。"""
+        """开始播放指定集数（**异步**）。返回是否**已受理**（不是"已播上"）。
+
+        **返回值语义变了**（原本是"启动成功"）：现在启动链在后台跑，
+        这个过程本来就无法同步给出结论。返回 False 只表示"这一集找不到"
+        这类**立即**失败；真正的启动结果由 `_on_launch_finished` 回传
+        （失败发 `failed`，成功发 `message`）。
+
+        QML 侧不需要知道这个差别 —— 它只把 `false` 当"点了没反应"，
+        而"找不到该集"正好属于这种；其余情况它会收到状态栏提示。
+
+        **为什么必须异步**：见 `_LaunchWorker` 的说明 ——
+        启动链里串着十几秒 `time.sleep`，跑在 UI 线程上会把界面冻住。
+        """
         ep = self._find_episode(episode_id)
         if ep is None:
             self.failed.emit("未找到该集")
@@ -179,12 +265,30 @@ class PlayerBridge(QObject):
             player_start_delay=self._config.getfloat(
                 "launcher", "player_start_delay", 1.0),
         )
-        try:
-            launcher.play(ep.file_path)
-        except LauncherError as e:
-            log.warning("播放失败 episode_id=%s: %s", episode_id, e)
-            self.failed.emit(str(e))
-            return False
+        # 立即给一次反馈：启动链要十几秒，界面上"什么都没发生"会被当成没点中
+        self.message.emit("正在启动播放器…")
+        self._launch_pool.start(_LaunchWorker(self, ep.id, ep.file_path, launcher))
+        return True
+
+    @Slot(int, str)
+    def _on_launch_finished(self, episode_id: int, error: str) -> None:
+        """启动链的收尾（**在主线程执行**，见 _LaunchWorker 的说明）。
+
+        只有真正开始播放之后才更新 `playing*` 状态、才开进度监控 ——
+        把这几步放在这里（而不是 `playEpisode` 里）才能保证"启动失败"的
+        情况下界面不会显示成"正在播放"。
+        """
+        if error:
+            log.warning("播放失败 episode_id=%s: %s", episode_id, error)
+            self.failed.emit(error)
+            return
+        ep = self._db.get_episode(int(episode_id))
+        if ep is None:
+            # 启动期间该条被删/重扫换了 id：机器已经起来了，但没记录可跟
+            log.warning("播放已启动，但 episode_id=%s 已不存在，无法跟踪进度",
+                        episode_id)
+            self.message.emit("播放器已启动（该集记录已失效，无法跟踪进度）")
+            return
 
         self._playing_episode_id = ep.id
         self._playing_title = ep.title or ""
@@ -199,7 +303,6 @@ class PlayerBridge(QObject):
             f"正在播放：{self._playing_subject_name} "
             f"{self._playing_episode_label} {self._playing_title}".strip())
         log.info("开始播放 episode_id=%s file=%s", ep.id, ep.file_path)
-        return True
 
     @Slot()
     def stop(self) -> None:
@@ -214,6 +317,23 @@ class PlayerBridge(QObject):
     def wait_pending_sync(self, ms: int = 3000) -> None:
         """退出时等待后台的 Bangumi 同步线程（见 ProgressMonitor 同名方法）。"""
         self._monitor.wait_pending_sync(ms)
+
+    def wait_launch_workers(self, ms: int = 3000) -> None:
+        """退出时等待进行中的**启动链**线程（QmlApp.shutdown 调用）。
+
+        **为什么必须等**：启动链里有 `subprocess.Popen` 与一串等待 ——
+        不等它就 close 数据库，随后 `_on_launch_finished`（主线程）会拿一个
+        已关闭的连接去查集数记录、刷一堆异常。而它的等待是有上限的
+        （最多十几秒），所以给一个上限、超时放弃即可。
+        """
+        try:
+            if self._launch_pool is not None and \
+                    self._launch_pool.activeThreadCount() > 0:
+                log.info("等待 %s 个启动线程结束…",
+                         self._launch_pool.activeThreadCount())
+                self._launch_pool.waitForDone(ms)
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("等待启动线程失败：%s", e)
 
     @Slot(int)
     def markWatched(self, episode_id: int) -> None:
