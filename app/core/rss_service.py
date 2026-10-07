@@ -138,7 +138,7 @@ class PollWorker(QThread):
                 # 只记前几条明细：一个订阅被过滤 200 条时刷 200 行日志没意义
                 if summary.filtered <= 5:
                     log.info("按规则过滤：《%s》—— %s",
-                             (entry.title or "")[:60], filtered)
+                             _short_title(entry.title or ""), filtered)
                 continue
 
             result = matcher.judge(entry, src)
@@ -213,12 +213,6 @@ class PollWorker(QThread):
                 self._qb_ready = True       # 一轮只探测/启动一次
                 if note:
                     # **只记日志，不放进 `errors`**
-                    #
-                    # `ensure_running()` 的说明文字描述的是**当前状态**，
-                    # 成功时也会返回非空串（如"qBittorrent 已在运行（v5.1.4）"）——
-                    # 早期这里无差别地塞进 `errors`，于是每次成功启动都让
-                    # `_on_finished` 打出一行"轮询失败原因汇总"，把一条正常
-                    # 信息报成了失败。用户看到"失败"两个字只会去查不存在的问题。
                     #
                     # 真正需要用户知道的（自动启动失败/没配路径）由
                     # `ensure_running` 内部区分，这里不再猜。
@@ -309,8 +303,7 @@ class RssService(QObject):
         self._worker: Optional[PollWorker] = None
         #: 所有"已 start()、但线程尚未真正结束"的 worker。
         #:
-        #: **为什么除了 `_worker` 还要这个集合**（踩坑，实测退出时报
-        #: `QThread: Destroyed while thread '' is still running`）：
+        #: **为什么除了 `_worker` 还要这个集合**：
         #: `_worker` 是"当前这一个"的引用，而它会在 `finished` 信号里
         #: 被置 None（那是为了不误判"还在跑"）。可是 `finished` 发出的
         #: 时机**早于**对象真正销毁（`deleteLater` 是排队投递的），
@@ -499,7 +492,7 @@ class RssService(QObject):
             summary.pending, summary.skipped, summary.filtered,
             summary.failed,
         )
-        # **失败原因汇总进日志**（实测需求："增加日志判断为什么失败"）。
+        # **失败原因汇总进日志**。
         # 逐条 WARNING 已经打过（见 _poll_one），这里再给一句总览，
         # 便于直接搜 "轮询失败原因" 定位。
         if summary.errors:
@@ -518,6 +511,30 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def _short_title(title: str, head: int = 24, tail: int = 38) -> str:
+    """日志里用的标题摘要：**首 + 尾**，保证"能区分同一部的不同集"。
+
+    **为什么不能只截前 N 字**：
+    comicat 这类源的标题把**集数放在中后段**，而番名很长：
+
+        【XXXXX】【XX: XXXXXXXXXX_XX꞉ XXXX XXXX XXXXXXXX
+         XXXXXX XXXXXXXX】[85][WebRip 1080p AVC AAC][简体]
+         └──────── 前 60 字全被番名占满，[85] 被截掉了 ────────┘
+
+    于是 85/84/83/82/81 这几条的日志**长得一模一样**，看起来像"同一集
+    被反复过滤" ✗。
+
+    **尾部长度要够**：实测 `tail=26` 仍截不到 `[85]`（它前面有
+    `...XXXXXX XXXXXXXX】` 一长串），调到 38 才能把它包含进来。
+    取尾部而不是取中间，是因为"AAC][简体]"这类固定后缀连着集数一起出现，
+    整体保留最省事、也最容易用眼睛扫。
+    """
+    s = (title or "").strip()
+    if len(s) <= head + tail + 3:
+        return s
+    return f"{s[:head]} … {s[-tail:]}"
+
+
 def _explain_qb_error(exc: Exception, magnet: str = "",
                       torrent_url: str = "") -> str:
     """把 qBittorrent 的异常翻译成**能照着做**的一句话。
@@ -529,8 +546,6 @@ def _explain_qb_error(exc: Exception, magnet: str = "",
     low = text.lower()
 
     # ① 没有可下发的链接：这是**数据问题**，不是连接问题。
-    #    实测 comicat 这类站点的 RSS 有时只有页面链接（既没磁力也没
-    #    .torrent），判定为"新集"却无从下发。
     if "没有可用的磁力链或种子链接" in text:
         return ("该条目既没有磁力链也没有种子链接（RSS 里只有网页链接），"
                 "无法自动下载，请手动打开订阅页查看")

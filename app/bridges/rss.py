@@ -29,7 +29,7 @@ from app.core.database import Database, RssSource
 from app.core.matcher import SubjectMatcher
 from app.core.rss_feed import RssError, fetch_and_parse
 from app.core.rss_matcher import RssMatcher
-from app.utils.title_parser import clean_anime_title
+from app.utils.title_parser import guess_anime_name
 
 log = logging.getLogger(__name__)
 
@@ -55,7 +55,6 @@ def _with_save_subject(src: RssSource, subject_id: int) -> RssSource:
 # 两者的**语义差别**（详见 rss_matcher.judge 里那段说明）：
 #   new_only —— 本地媒体库**已经有这一集**就跳过（"新"= 我还没有的）
 #   all      —— 不看本地有什么，只要没下载过就下（补齐全集用）
-# 早期两者在代码里没有分支差异、效果完全相同，是名不副实的两个选项。
 RULE_NEW_ONLY = "new_only"
 RULE_ALL = "all"
 RULES = (RULE_NEW_ONLY, RULE_ALL)
@@ -70,7 +69,7 @@ RULE_LABELS = {
 #
 # 键取自 `rss_service.STATUS_*`（那是**我们下发流程**的状态）。
 # 注意里面有 `done` 而不是 `completed` —— 早期这里写的是
-# "completed"，于是"已完成"的记录会显示成英文 `done`（踩坑）。
+# "completed"，于是"已完成"的记录会显示成英文 `done`。
 # 两个键都留着：历史库里可能两种值都存在。
 STATUS_LABELS = {
     "pending": "待确认",
@@ -119,17 +118,24 @@ class _FeedTitleWorker(QThread):
     **为什么是"推断"而不是"取第一条标题"**：RSS 的条目标题是**资源标题**，
     形如 `[Nekomoe kissaten&LoliHouse] 碧蓝之海 第三季 [09][WebRip 1080p]` ——
     带字幕组、集数、画质参数。直接拿去搜 Bangumi 基本搜不到，必须先清洗
-    （`clean_anime_title` 会去掉方括号块、集数、画质词）。
+    （`guess_anime_name` 会去掉方括号块、集数、画质词）。
 
-    推断策略（按可信度）：
-      ① `feed` 的 channel title —— 有些站点的频道名就是番名；
-      ② 最近几条 item 标题各自清洗后，**取最长的一条** —— 最长的那条
+    推断策略：
+      ① 最近几条 item 标题各自清洗后，**取最长的一条** —— 最长的那条
          通常信息最全（最短的可能是"第 10 集"这种只有集号的）；
-      ③ 全失败 → 返回空串，让用户手填。
+         清洗用 `guess_anime_name`：标题通篇是括号时（`【组名】【番名】
+         [01][1080p]`，comicat 等站点整源如此），它会回头从括号里挑番名，
+         否则这一步会全军覆没；
+      ② 全失败 → 返回空串，让用户手填。
     """
 
-    #: (来源 id, 推断出的名字, 错误信息) —— 名字为空且无错误 = 没推断出来
-    done = Signal(int, str, str)
+    #: (来源 id, 推断出的名字, 错误信息, **请求用的地址**)
+    #:
+    #: **地址要原样带回来**：这一步的 `source_id` 恒为 0（订阅还没入库），
+    #: 拿不到 id 就无从反查地址 —— 不给地址的话，日志与提示里只能说
+    #: "没能推断出名称"，用户不知道是哪个订阅、更不知道是网络问题还是
+    #: 地址填错了。
+    done = Signal(int, str, str, str)
 
     def __init__(self, source_id: int, url: str, proxy: str = "",
                  user_agent: str = "AnimeMarker/1.0",
@@ -141,30 +147,53 @@ class _FeedTitleWorker(QThread):
         self._ua = user_agent
 
     def run(self) -> None:
+        # 开工先记一行：把**实际要抓的地址**、代理写下来。
+        # 排查"获取失败"时第一件要确认的就是"到底请求了哪个地址"。
+        log.info("「获取名称」开始抓取订阅源：%s（代理=%s）",
+                 self._url, self._proxy or "无")
         try:
             entries = fetch_and_parse(self._url, proxy=self._proxy,
                                       user_agent=self._ua)
         except RssError as e:
-            log.warning("抓取订阅源失败 %s: %s", self._url, e)
-            self.done.emit(self._source_id, "", str(e))
+            log.warning("「获取名称」抓取订阅源失败：%s —— %s", self._url, e)
+            self.done.emit(self._source_id, "", str(e), self._url)
             return
         except Exception as e:              # pragma: no cover - 防御性
-            log.exception("抓取订阅源异常 %s", self._url)
-            self.done.emit(self._source_id, "", f"抓取失败：{e}")
+            log.exception("「获取名称」抓取订阅源异常：%s", self._url)
+            self.done.emit(self._source_id, "", f"抓取失败：{e}", self._url)
             return
 
         if not entries:
-            self.done.emit(self._source_id, "", "该订阅源没有条目")
+            log.warning("「获取名称」订阅源没有条目：%s", self._url)
+            self.done.emit(self._source_id, "", "该订阅源没有条目", self._url)
             return
 
         # 最近若干条（新的通常在前）清洗后比长度，取最长的那条作番名。
         # 只取前 10 条：更早的多半是同一部番的历史集，长度不提供新信息。
+        #
+        # 用 `guess_anime_name` 而不是 `clean_anime_title`：后者对
+        # 「【组名】【番名】[85][1080p]」这种通篇括号的标题会清成一个字都不剩
+        # ，前者会回头从括号里挑出番名。
         best = ""
+        best_raw = ""
         for e in entries[:10]:
-            cleaned = clean_anime_title(e.title or "")
+            raw = (e.title or "").strip()
+            cleaned = guess_anime_name(raw)
             if len(cleaned) > len(best):
-                best = cleaned
-        self.done.emit(self._source_id, best, "")
+                best, best_raw = cleaned, raw
+        # 采样与结果都记下来：清洗结果为空时，光看"没推断出来"无从判断
+        # 是标题格式变了、还是这个源本身没有可用标题。
+        # **认不出时必须把原样标题写进日志**：早期这里只记"取自标题 ''"，
+        # 于是日志看不出源长什么样、还得再联网抓一次才知道是括号的问题。
+        if best:
+            log.info("「获取名称」抓取成功：%s（共 %d 条）；取名 %r（取自标题 %r）",
+                     self._url, len(entries), best, best_raw[:80])
+        else:
+            log.warning("「获取名称」抓取成功：%s（共 %d 条）但推不出名字；"
+                        "前几条标题原样：%s",
+                        self._url, len(entries),
+                        [e.title for e in entries[:3]])
+        self.done.emit(self._source_id, best, "", self._url)
 
 
 class _CreateSubjectWorker(QThread):
@@ -283,7 +312,7 @@ class _CreateSubjectWorker(QThread):
 class _PreviewWorker(QThread):
     """「下载器」里的预览：抓一次订阅源，跑完整判新，列出**会下载哪些集**。
 
-    **为什么必须真抓 RSS 而不是只过滤词**（与用户确认过）：预览的意义就是
+    **为什么必须真抓 RSS 而不是只过滤词**：预览的意义就是
     "现在保存的话，会下什么" —— 只看过滤词的话，那些"本地已经有了 /
     已经下过"的集也会被列进来，预览就成了假的。所以这里跑的是与真正
     轮询**同一套** `judge` 逻辑。
@@ -456,14 +485,10 @@ def _title_similar(a: str, b: str) -> float:
 def _match_torrent(rec_title: str, torrents: dict) -> Optional[dict]:
     """把一条下载记录匹配到 qBittorrent 里的任务（拿不到返回 None）。
 
-    **为什么要这么麻烦**（实测"看不到进度条"）：
+    **为什么要这么麻烦**：
       ① `torrent_hash` 拿不到 —— `torrents_add` 只返回 "Ok."，
          不回传 hash，所以库里那列一直是 NULL；
-      ② 按标题**精确匹配**也不行 —— 实测同一条内容：
-             我们记录：[黒ネズミたち] 从后面来的神威先生 [年龄限制版]...
-             qB 任务名：[Dynamis One] 從後面來的神威先生 [年齡限制版]...
-         发布组不同（黑ネズミたち vs Dynamis One）、简繁也不同
-         （qB 用的是**种子内的原始名**，而我们用的是 RSS 标题）。
+      ② 按标题**精确匹配**也不行 （qB 用的是**种子内的原始名**，而我们用的是 RSS 标题）。
 
     所以改用**两级判定**（宁可少匹配，也不要把进度显示到错的集上）：
         第一级：集号相同 **且** 标题字符重合度 ≥ 0.5 → 直接采纳
@@ -509,8 +534,7 @@ class RssBridge(QObject):
     titleSuggested = Signal(int, str)
     #: 「从订阅源新建条目」完成（参数：新条目本地 id, 名称）。
     #:
-    #: 为什么需要（"新建完条目后下载器无法马上识别"）：媒体库桥接的
-    #: `subjects` 是缓存，新建后必须让 QML 侧知道"条目变了" —— 既要刷新
+    #: 媒体库桥接的`subjects` 是缓存，新建后必须让 QML 侧知道"条目变了" —— 既要刷新
     #: 下载器弹窗的保存位置列表，也要让订阅卡片上的绑定标签立刻出现。
     #: QmlApp 接到后调用 `library_bridge.reload()`（跨桥连线在 qml_app）。
     subjectCreated = Signal(int, str)
@@ -575,7 +599,7 @@ class RssBridge(QObject):
         self._preview_running = False
         self._preview_hint = ""
         self._preview_worker: Optional[_PreviewWorker] = None
-        # ---- 「下载完自动扫描」（方案 A）----
+        # ---- 「下载完自动扫描」----
         #
         # 记"已经因为下完而请求过扫描"的 download_history.id（**不是**
         # hash：hash 我们拿不到，见 _match_torrent 的说明）。
@@ -965,15 +989,7 @@ class RssBridge(QObject):
                  sid or "默认")
         self.reload()
 
-        # ---- 保存后**立即启动下载**（"下载器保存后没开始下载"）----
-        #
-        # 原因：下载本来是**定时轮询**触发的（默认 30 分钟一次），保存
-        # 设置只是改了数据库 —— 用户当然会觉得"点了保存却什么都没发生"。
-        # 而"点保存"在语义上就是**启用**（v13 的闸门），启用后理应马上
-        # 生效。这里只触发**该订阅**的检查，不重跑全部。
-        #
-        # 正在检查时**不排队**：`poll()` 内部对重入是"跳过本次"，此处
-        # 提前告知用户，免得他以为按钮没反应。等当前这轮结束再点一次即可。
+        # ---- 保存后**立即启动下载**----
         if self._poll_running:
             self.message.emit("下载器设置已保存；当前正在检查，稍后自动生效")
         else:
@@ -982,6 +998,49 @@ class RssBridge(QObject):
         return True
 
     # ---------- 下载器预览 ----------
+    @Slot(int)
+    def logDownloaderOpened(self, source_id: int) -> None:
+        """「下载器」弹窗打开时记一行日志（订阅 + 绑定条目 + 已存设置）。
+
+        记三件事：订阅（id + 名称）、绑定的条目（若有）、当前的过滤词 ——
+        过滤词直接解释了后面那批"按规则过滤"的日志从哪来。
+        """
+        try:
+            src = next((s for s in self._db.list_rss_sources()
+                        if s.id == int(source_id)), None)
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("记录下载器打开日志失败（读订阅 #%s）：%s",
+                        source_id, e)
+            return
+        if src is None:
+            log.warning("打开下载器：订阅 #%s 不存在", source_id)
+            return
+
+        bound = int(getattr(src, "local_subject_id", 0) or 0)
+        try:
+            subj = self._db.get_subject(bound) if bound else None
+        except Exception:               # pragma: no cover - 防御性
+            subj = None
+        bound_desc = ((subj.name_cn or subj.name or "") if subj else "") or "未绑定"
+
+        save_id = int(getattr(src, "save_subject_id", 0) or 0)
+        save_desc = "未指定（用 qBittorrent 全局路径）"
+        if save_id:
+            try:
+                s2 = self._db.get_subject(save_id)
+                save_desc = (s2.name_cn or s2.name or "") if s2 else f"#{save_id}（已不存在）"
+            except Exception:           # pragma: no cover - 防御性
+                save_desc = f"#{save_id}"
+
+        log.info(
+            "打开「下载器」：订阅 #%s %s（%s）｜绑定条目：%s｜保存位置：%s"
+            "｜必须包含=%r 必须不包含=%r",
+            src.id, src.name or "(无名)", src.url or "(无地址)",
+            bound_desc, save_desc,
+            getattr(src, "must_include", "") or "",
+            getattr(src, "must_exclude", "") or "",
+        )
+
     @Property("QVariantList", notify=previewChanged)
     def previewItems(self) -> list[dict]:
         """预览结果（「下载器」右侧列表）。"""
@@ -1155,7 +1214,7 @@ class RssBridge(QObject):
             # 的键**不完全一致**：`rss_service` 写入的是
             # pending/pushed/downloading/done/failed/skipped，而
             # STATUS_LABELS 里写的是 completed 而不是 done。
-            # 两者都对不上时会让"已完成"显示成英文 done（踩坑），
+            # 两者都对不上时会让"已完成"显示成英文 done，
             # 这里补一条 done → 已完成 的映射兜住。
             label = STATUS_LABELS.get(status, "")
             if not label:
@@ -1163,7 +1222,7 @@ class RssBridge(QObject):
 
             # 叠加 qBittorrent 的真实进度。
             #
-            # **匹配方式：先 hash、再按标题**（踩坑，实测"看不到进度条"）。
+            # **匹配方式：先 hash、再按标题**。
             #
             # `torrent_hash` 是 qBittorrent 按种子**内容**算出来的，我们
             # 下发时拿不到（`torrents_add` 只返回 "Ok."，不回传 hash），
@@ -1206,18 +1265,6 @@ class RssBridge(QObject):
                 # 真实下载进度 0~1（-1 = 拿不到，QML 侧据此不画进度条）
                 "progress": progress if info is not None else -1.0,
                 "stateLabel": state_label,
-                # 能不能点「下发」：**待确认** 且 qBittorrent 里**还没有**该任务。
-                #
-                # **为什么必须加 `info is None`**（bug）：原先只看
-                # 数据库的 `status == "pending"`，而数据库状态会滞后 ——
-                # 记录先以 pending 入库、推送成功后才改成 pushed，中间
-                # 有个窗口；更常见的是**旧版本留下的 pending 记录**
-                # （当时的 setDownloader 不触发检查，记录一直挂在待确认）。
-                # 此时 qBittorrent 里其实已经在下甚至下完了，界面会因为
-                # `info` 匹配到真实进度而显示「已完成 100%」，可
-                # `canPush` 仍为 true → 已完成的行上挂着一个「下发」按钮
-                # 。再点一次会**重复添加同一任务**。
-                # 判据加上"qB 里没有"之后，这类行就不会再出现按钮。
                 "canPush": (status == "pending"
                             and int(r.ep_index or 0) >= 0
                             and info is None),
@@ -1287,7 +1334,7 @@ class RssBridge(QObject):
                     changed = True
                     break
         self._torrents = new
-        # ---- 下完就扫描（方案 A，见 scanRequested 的说明）----
+        # ---- 下完就扫描----
         #
         # 放在"是否有变化"的判断**之前**：上面那套判断是为了"少重建列表"，
         # 而扫描判定只关心"有没有任务达到 100%"，两者目的不同。而且这个
@@ -1314,8 +1361,7 @@ class RssBridge(QObject):
         而已下完的 qB 任务还在，于是每次启动都重扫一遍。见迁移 v14。
 
         **匹配失败是正常的**（用户手动删过记录、或标题差异太大）：静默
-        跳过即可 —— 退化成"这一集下次还会被当成新集"，与修这个 bug
-        之前的行为一样，不会更糟。
+        跳过即可 —— 退化成"这一集下次还会被当成新集"。
         """
         if not torrents:
             return
@@ -1400,7 +1446,7 @@ class RssBridge(QObject):
 
         **为什么由后端算而不是 QML 拼**（"在这段文字的下一行
         写清楚目录在哪"）：QML 若自己拼一遍，就出现了**第二套路径规则** ——
-        界面显示 `F:\动漫\青之芦苇\第二季`、文件却可能因为后端规则稍有
+        界面显示 `F:\XX\XXXX\第二季`、文件却可能因为后端规则稍有
         不同而落到别处。用户最不能接受的就是"看到的和实际的不一致"。
         所以复用一个 `RssMatcher.plan_save_path`（纯推算、无副作用）。
 
@@ -1454,19 +1500,28 @@ class RssBridge(QObject):
         """
         url = (url or "").strip()
         if not url:
+            log.warning("「获取名称」失败：订阅地址为空")
             self.failed.emit("请先填写订阅地址")
             return False
         if not (url.startswith("http://") or url.startswith("https://")):
-            self.failed.emit("订阅地址需以 http:// 或 https:// 开头")
+            # **这条路径必须有日志**。
+            hint = ""
+            if "%" in url and "://" not in url:
+                hint = "（看起来是地址被截断了：只有百分号编码部分、缺 https:// 开头）"
+            log.warning("「获取名称」失败：地址不以 http(s):// 开头 —— %s%s",
+                        url[:120], hint)
+            self.failed.emit("订阅地址需以 http:// 或 https:// 开头" + hint)
             return False
         w = self._title_worker
         if w is not None and w.isRunning():
+            log.info("「获取名称」忽略本次请求（上一次仍在抓取）：%s", url)
             self.message.emit("正在获取，请稍候…")
             return False
 
         proxy = self._config.get("bangumi", "proxy", "") if self._config else ""
         ua = self._config.get("bangumi", "user_agent",
                               "AnimeMarker/1.0") if self._config else "AnimeMarker/1.0"
+        log.info("「获取名称」开始：%s", url)
         # source_id 传 0：这一步还没入库，不需要 id
         self._title_worker = _FeedTitleWorker(0, url, proxy=proxy, user_agent=ua)
         self._title_worker.done.connect(self._on_title_suggested)
@@ -1475,15 +1530,26 @@ class RssBridge(QObject):
         self.message.emit("正在获取订阅源标题…")
         return True
 
-    def _on_title_suggested(self, source_id: int, name: str, error: str) -> None:
+    def _on_title_suggested(self, source_id: int, name: str, error: str,
+                            url: str = "") -> None:
+        """「获取名称」收尾。`url` 是本次**实际抓取的地址**（见信号定义）。
+
+        每一步都写日志 —— 这个方法有三条出口（失败 / 推断为空 / 成功），
+        以前**一条日志都没有**，用户只能看到状态栏一句话。
+        """
         self._title_worker = None
         if error:
+            log.warning("「获取名称」失败：%s —— %s", url or "(未知地址)", error)
             self.failed.emit(error)
             return
         if not name:
-            # 抓到了但清洗后为空（标题全是噪声）：不算错误，让用户手填
+            # 抓到了但清洗后为空（标题全是噪声）：不算错误，让用户手填。
+            # **但必须记日志**：否则和"根本没抓到"在日志里长得一模一样。
+            log.warning("「获取名称」抓取成功但未能推断出名字"
+                        "（标题清洗后为空）：%s", url or "(未知地址)")
             self.message.emit("没能从订阅源推断出名称，请手动填写")
             return
+        log.info("「获取名称」成功：%s → %r", url or "(未知地址)", name)
         self.titleSuggested.emit(int(source_id), name)
         self.message.emit(f"已获取名称：{name}")
 

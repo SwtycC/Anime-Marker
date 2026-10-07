@@ -150,7 +150,9 @@ class QmlApp:
         # 时匹配 Bangumi）—— 早期只传 db，因为当时只做订阅源管理。
         self.rss_bridge = RssBridge(self.db, self.config, self.api)
         # 状态栏「更多」菜单（检查更新 / 打开日志目录 / 帮助 / 关于 / 反馈）
-        self.app_menu_bridge = AppMenuBridge()
+        # 需要 config：自动那次检查"一天只做一次"，日期记账写在配置里
+        # （见 update_check.auto_check_due）。
+        self.app_menu_bridge = AppMenuBridge(self.config)
 
         # ---- RSS 轮询下载（F19 的第二半）----
         #
@@ -260,7 +262,11 @@ class QmlApp:
         换成 `reload()` 会连带 `subjectsChanged`，把海报墙全部卡片销毁
         重建（每张都要重新解码封面），是播放结束这种高频动作不该有的开销。
 
-        `subject_id` 目前只用于日志（将来若做"只刷这一行"会用到）。
+        **只重算本地数据是不够的**：跨篇章编号的番
+        （官方 `sort` 是 73~96、收藏进度却是 1~24）本地根本算不出进度，
+        必须回查 Bangumi；缓存太旧时页头也一直在喊「建议刷新」。所以满足
+        `needsRemoteRefresh` 时顺带拉一次 —— 那是个后台线程，不卡界面，
+        拉完 `done_hook` 会自己让这一页重取数。
         """
         log.info("播放结束，刷新「在看」列表（subject_id=%s）",
                  subject_id or "未知")
@@ -268,6 +274,17 @@ class QmlApp:
             self.library_bridge.reloadInProgress()
         except Exception as e:          # pragma: no cover - 防御性
             log.warning("播放结束后刷新在看列表失败：%s", e)
+            return
+
+        # 联网那次要放在本地重算**之后**：本地是免费的、立刻生效；
+        # 网络那次可能要几秒，不该拖着"进度条先动"这件事
+        try:
+            if self.library_bridge.needsRemoteRefresh(subject_id):
+                log.info("播放结束，自动回查 Bangumi 收藏数据"
+                         "（缓存较旧，或该条目编号跨篇章、本地推不出进度）")
+                self.inprogress_bridge.refresh()
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("播放结束后自动回查收藏数据失败：%s", e)
 
     @Slot(int)
     def _on_scan_subject_requested(self, subject_id: int) -> None:
@@ -326,6 +343,11 @@ class QmlApp:
         # ProgressMonitor 是长生命周期对象、参数在构造时读入，
         # 不重新下发的话要重启程序才生效（见 PlayerBridge.apply_config）
         self.player_bridge.apply_config()
+        # 界面设置（主题 + **海报宽度**）也走这里重新下发 —— 设置页那句
+        # "点「保存」后立即重排"靠的就是这一次调用。主题其实在切换当下
+        # 就已经即时生效（见 SettingsPage 的 themeModePicked/accentPicked），
+        # 这里主要保证**海报宽度**跟上（它没有即时通道，只能靠保存）。
+        self._apply_saved_theme()
         log.info("配置已应用，服务已重建")
 
     def _on_scan_finished(self) -> None:
@@ -446,7 +468,12 @@ class QmlApp:
         # Theme.qml 的默认色（蓝 #2F6FEB）画出来、下一帧才跳成配置色 ——
         # 肉眼就是"打开软件的一瞬间搜索按钮是蓝的，然后才变主题色"（实测反馈）。
         is_dark, accent = self._saved_theme()
-        ctx.setContextProperty("themeStartup", {"dark": is_dark, "accent": accent})
+        ctx.setContextProperty("themeStartup", {
+            "dark": is_dark, "accent": accent,
+            # 海报宽度也一起注入：卡片与窗口首帧尺寸都取决于它，
+            # 晚一步就会"先按默认 200 排好再跳"（见 Theme.applyStartupTheme）
+            "posterWidth": self._saved_poster_width(),
+        })
 
         # **启动尺寸也要在 load 之前注入**（踩坑：启动瞬间下半部分黑边）。
         #
@@ -513,10 +540,14 @@ class QmlApp:
         # 还可能和首帧渲染抢资源（用户会看到窗口"卡一下才出来"）。
         self.rss_bridge.startScanWatch()
 
-        # ---- 检查更新（启动后延迟一次，静默）----
+        # ---- 检查更新（**每天第一次**开软件时延迟一次，静默）----
         # 同样要等界面起来：它启动的是定时器（不是立刻发请求，见
         # AppMenuBridge.INITIAL_DELAY_MS），这里只是把定时器挂上。
         # 结果只用来点亮状态栏「更多」菜单里的小红点，不弹窗、不动状态栏。
+        # 小红点**跨进程亮着**：上次查到的版本号存在 config 里，桥接层建好时
+        # 就还原了（见 AppMenuBridge.__init__），不需要这次检查来点。
+        # **今天已经自动查过就什么都不挂**（记账在 config 里，见
+        # update_check.auto_check_due）；手动「检查更新」不受此限。
         self.app_menu_bridge.startInitialCheck()
 
         return app.exec()
@@ -605,26 +636,43 @@ class QmlApp:
             accent = DEFAULT_ACCENT
         return mode == "dark", accent
 
+    def _saved_poster_width(self) -> int:
+        """配置里的海报宽度；非法/越界时回退 200（与 QML 的 minimum/maximum 对齐）。"""
+        try:
+            w = self.config.getint("ui", "poster_width", 200)
+        except Exception:  # pragma: no cover - 配置异常时退回默认
+            return 200
+        if not (120 <= w <= 400):
+            log.warning("配置中的海报宽度越界，回退 200：%r", w)
+            return 200
+        return w
+
     def _apply_saved_theme(self) -> None:
-        """把配置里的主题注入 QML 的 Theme 单例。
+        """把配置里的主题**与海报宽度**注入 QML 的 Theme 单例。
 
-        实现方式：调用 Main.qml 暴露的 `applyTheme(dark, accent)` 函数 ——
-        比在 Python 里反射访问 QML 单例更稳定，也便于以后扩展更多主题项。
+        实现方式：调用 Main.qml 暴露的 `applyTheme(dark, accent, posterWidth)`
+        函数 —— 比在 Python 里反射访问 QML 单例更稳定，也便于以后扩展更多项。
 
-        注意：**首帧的主题色不靠这里**（那时已经渲染完了），而是在 load 之前
-        通过 `themeStartup` 上下文属性注入，由 Theme 单例在创建时读取
-        （见 `run()` 里的说明）。这里保留一次调用做复核：万一 QML 侧的启动
-        注入被改动或失效，界面仍会被纠正到配置的主题上。
+        注意：**首帧不靠这里**（那时已经渲染完了），而是在 load 之前通过
+        `themeStartup` 上下文属性注入，由 Theme 单例在创建时读取
+        （见 `run()` 里的说明）。这里保留一次调用做复核，同时承担
+        **设置页保存后的即时生效** —— `SettingsBridge.saved` 会走到这里。
+
+        `poster_width` 以前只用于 `_compute_window_size()` 的窗口尺寸，
+        **从未写进 Theme** —— 于是设置页改海报宽度完全没反应（卡片不变、
+        窗口不变），而界面上的小字还写着"下次扫描或重启后生效"（其实永远
+        不生效）。现在一并应用，那句提示才站得住。
         """
         if self.window is None:
             return
         is_dark, accent = self._saved_theme()
+        poster_w = self._saved_poster_width()
         try:
-            self.window.applyTheme(is_dark, accent)  # type: ignore[attr-defined]
-            log.info("已应用主题：mode=%s accent=%s",
-                     "dark" if is_dark else "light", accent)
+            self.window.applyTheme(is_dark, accent, poster_w)  # type: ignore[attr-defined]
+            log.info("已应用界面设置：mode=%s accent=%s poster_width=%s",
+                     "dark" if is_dark else "light", accent, poster_w)
         except Exception as e:  # pragma: no cover - 防御性
-            log.warning("应用主题失败（将使用默认值）：%s", e)
+            log.warning("应用界面设置失败（将使用默认值）：%s", e)
 
     # ---------- 关闭 ----------
     def shutdown(self) -> None:

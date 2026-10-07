@@ -21,6 +21,20 @@ Rectangle {
     signal accepted()
     signal edited()
 
+    /// 主动放弃焦点（清掉聚焦描边、结束文字选中）。
+    ///
+    /// **必须在组件内部做**：
+    /// 聚焦描边读的是 **`input.activeFocus`**（内部那个 TextInput 的焦点），
+    /// 而外部只能拿到本组件（外层 Rectangle）—— 给它设 `focus = false`
+    /// **什么都不会发生**（Rectangle 从来不是焦点项），描边照旧亮着。
+    /// 所以暴露这个方法，由外部在需要时调用。
+    function blur() {
+        input.focus = false
+        // 选中态也要清：焦点没了但高亮的选区还留着，看着仍像"在编辑"
+        if (input.selectedText !== "")
+            input.deselect()
+    }
+
     implicitWidth: 200
     implicitHeight: 34
     radius: Theme.radiusSm

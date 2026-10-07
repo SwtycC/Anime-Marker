@@ -148,6 +148,15 @@ ApplicationWindow {
                     if (typeof player !== "undefined" && player)
                         player.playEpisode(episodeId)
                 }
+                // 「下一集」被点到 → 记一笔日志（播不了的那次也记）。
+                // 必须经 Python 记：QML 的 console.log 进不了日志文件，
+                // 见 PlayerBridge.logNextEpisodeClick。
+                onNextEpisodeClicked: function (subjectTitle, subjectId,
+                                                episodeId, hint) {
+                    if (typeof player !== "undefined" && player)
+                        player.logNextEpisodeClick(subjectTitle, subjectId,
+                                                   episodeId, hint)
+                }
             }
 
             TimelinePage {
@@ -285,7 +294,6 @@ ApplicationWindow {
     // `resetTagState()`（重取 + 退出编辑态）。
     // 因为 addUserTag / toggleApiTag 每次操作都会写库 → 后端 emit
     // tagsChanged → 若这里调 resetTagState，编辑态会被**立刻踢出**
-    // （实测：点一次 ✔ 加完 tag，编辑面板就自己关了）。
     Connections {
         target: typeof library !== "undefined" && library ? library : null
         function onTagsChanged(subjectId) {
@@ -640,7 +648,7 @@ ApplicationWindow {
         //
         // 两个条件都必须带 `window.currentPage === 0`：browseStack 只在外层第 0 页
         // 可见，从详情页用底部导航切到别的页时 currentIndex 仍停在 1，
-        // 只判 currentIndex 会在"设置页按后侧键"这类场景里误触发（实测踩到）。
+        // 只判 currentIndex 会在"设置页按后侧键"这类场景里误触发。
         enabled: onDetail || onWallSearch
 
         onClicked: {
@@ -780,10 +788,15 @@ ApplicationWindow {
      * QML 之前注入 `themeStartup`，Theme 单例创建时就已初始化（见 Theme.qml
      * 的 applyStartupTheme 与 QmlApp.run 里的说明）。
      */
-    function applyTheme(isDark, accentColor) {
+    function applyTheme(isDark, accentColor, posterWidth) {
         Theme.dark = isDark
         if (accentColor && accentColor.length > 0)
             Theme.applyAccent(accentColor)
+        // 海报宽度：设置页点「保存」后由 Python 转进来（0/未传 = 不动）。
+        // 赋值后海报墙的 Flow 会自动重排（PosterCard.posterWidth 绑的是
+        // Theme.posterWidth），不需要重建任何模型。
+        if (posterWidth && posterWidth > 0)
+            Theme.posterWidth = posterWidth
     }
 
     /** 读取当前主题状态（供桥接层回写配置时参考）。 */
@@ -978,7 +991,6 @@ ApplicationWindow {
     //   ① 琥珀："联网匹配失败：连接超时…… —— 条目已加入待确认"（说明原因）
     //   ② 主题色："扫描完成：未匹配"（说明结果）
     // 单浮层实现下后一条会把前一条**覆盖**掉，用户根本看不到那句原因
-    // （实测："在软件里没看到为什么超时的黄色提示框"）。
     // 现在按顺序**从上往下堆叠**：原因在上、结果在下，两条同时可见。
     //
     // **注意与状态栏的分工**：顶部提示条只放**结论**；
@@ -1145,12 +1157,9 @@ ApplicationWindow {
             }
         }
 
-        // **每条各自倒计时**（不再"统一到点删最旧的"）。
+        // **每条各自倒计时**。
         //
-        // 为什么要这样：早期实现是"定时器每 3 秒删最旧那条"，
-        // 于是「网络失败原因」（琥珀，先出现）会在结果提示出现后没多久
-        // **先被删掉** —— 用户正想读原因，它却先没了，反而把不重要的
-        // "扫描完成"留着。现在每条带自己的 `life`，到点各自退场
+        // 现在每条带自己的 `life`，到点各自退场
         // （普通信息与琥珀警告现在统一 5 秒，见上方 _infoLife/_warnLife）。
         Timer {
             id: bannerTimer
@@ -1191,14 +1200,6 @@ ApplicationWindow {
         }
 
         // **过程日志不再进顶部提示条**。
-        //
-        // 理由：过程日志是"滚动的流水"（"共发现 N 个条目"、"✓ 已匹配 X"、
-        // "⚠ 联网匹配失败…"），它们属于**状态栏**（细条、常驻、可以一直刷新，
-        // 见上面那个 Connections）。若同时往顶部提示条灌，会出现：
-        //   ① 每次扫描刷出十几条提示条，把画面盖住；
-        //   ② 网络失败时同时出现 [琥珀]"联网匹配失败：<原因>" 与
-        //      [主题色]"⚠ 联网匹配失败：<原因>" 两条，说的是同一件事、
-        //      底色还不同，用户以为出了两种问题（实测反馈"两条都在说超时"）。
         //
         // 顶部提示条只承载**结论**：扫描完成 / 联网失败 / 扫描失败
         // （分别见 onFinished / onMatchFailed / onFailed）。

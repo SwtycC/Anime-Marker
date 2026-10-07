@@ -7,10 +7,6 @@
 4. 读取主题配置并注入 Theme 单例
 5. 创建 QQmlApplicationEngine，注册 QML 导入路径与桥接层
 6. 加载 Main.qml
-
-> 历史说明：早期版本是 QWidget 界面（`app/ui/`），现已全量迁移到 QML
-> （`app/qml/`），旧实现归档在 `_legacy/`。`run_qml.py` 保留为兼容入口，
-> 与 `main.py` 行为一致。
 """
 
 from __future__ import annotations

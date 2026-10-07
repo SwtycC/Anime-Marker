@@ -280,8 +280,12 @@ class _FetchWorker(QThread):
 
             self.finished_items.emit(items, "")
         except BangumiAuthError as e:
-            log.warning("拉取收藏列表权限不足: %s", e)
-            self.finished_items.emit([], f"Token 权限不足：{e}")
+            # `e` 里已经是给用户看的那句（「Token 已过期或无效（请到设置页…）」），
+            # 直接用它 —— 前面再缀一句「Token 权限不足」只会变成
+            # 「Token 权限不足：Token 已过期…」这种叠词（而且"权限不足"
+            # 正是这次实测里最容易把人带偏的判读：读接口在 Token 过期时同样 401）
+            log.warning("拉取收藏列表失败（Token 已过期或无效）: %s", e)
+            self.finished_items.emit([], str(e))
         except BangumiError as e:
             # 404 在这里几乎总是"用户名填成了昵称"，给出可操作的提示
             msg = str(e)
@@ -611,15 +615,7 @@ class _EpisodeWorker(QThread):
         但用调用方提供的 Session —— 这样每个线程各用各的连接池。
         分页循环保留（集数 >100 时仍能拿全）。
 
-        **踩坑（时间字段，两次实测结论不同）**：返回的
-        `[{episode, type, updated_at}]` 里，`updated_at` 的可用性变过：
-
-        - 早期实测**恒为 0**（字段在、值没有），早期版本见 `not ts: continue`
-          直接丢弃，导致整批记录写库为 0 条、动态页一片空白；
-        - 2026-09-19 复查：该字段**有值**（本账号 30/30 行都是精确到秒的
-          真实单集时间戳）。
-
-        所以现在是"单集时间戳 → 动漫收藏级 updated_at"两级兜底（见 run()）：
+        采用"单集时间戳 → 动漫收藏级 updated_at"两级兜底（见 run()）：
         有真实值就用真实值（同一部的各集能落到不同时刻，更准），
         拿不到才退回收藏级时间。**兜底分支不能删** —— 它是那份"一片空白"
         故障的护栏，而服务端行为已经变过一次，不保证不会再变。
@@ -657,12 +653,17 @@ class _UploadWorker(QThread):
       量小（一个条目几十集），串行的成本可以接受，不值得再引入那套复杂度。
     - **逐条独立 try**：单条失败不影响其余；失败的会留在"待上传"里，
       用户再点一次即只补失败的（幂等由调用方的差集筛选保证）。
+    - **唯一的例外是「Token 被拒」**：401/403 说明服务器不认这个 Token，
+      剩下的每一条都会一模一样地失败 —— 继续打下去只是白等（一部番几十集
+      就是几十次请求），所以见到就**立即收工**，把原因交给界面说清楚。
     """
 
     progress = Signal(int, int)               # (已处理, 总数)
-    # (成功数, 失败数, {bangumi_id: [成功上传的 bangumi_ep_id, ...]})
+    # (成功数, 失败数, {bangumi_id: [成功上传的 bangumi_ep_id, ...]}, 中止原因)
     # 结果随信号一起送，免得回调里去读可能已被 deleteLater 销毁的 worker ✗
-    finished_upload = Signal(int, int, object)
+    # 第四项为空串 = 正常跑完（失败是逐条的网络抖动，可重试）；
+    # 非空 = **Token 被拒，整批中止**，重试没有意义（见 run()）。
+    finished_upload = Signal(int, int, object, str)
 
     def __init__(
         self,
@@ -680,13 +681,26 @@ class _UploadWorker(QThread):
         done = 0
         total = sum(len(eps) for _, eps in self.tasks)
         uploaded: dict[int, list[int]] = {}
+        aborted = ""            # 非空 = Token 被拒，整批中止（见类说明）
         for bid, eps in self.tasks:
+            if aborted:
+                break
             for ep in eps:
                 try:
                     self.api.mark_episode_watched(bid, int(ep["bangumi_ep_id"]))
                     ok += 1
                     uploaded.setdefault(int(bid), []).append(
                         int(ep["bangumi_ep_id"]))
+                except BangumiAuthError as e:
+                    # 服务器不认 Token：剩下的每一条都会同样失败，别再打了
+                    fail += 1
+                    aborted = str(e)
+                    log.warning("补传中止（Token 已过期或无效）：条目 %s 第 %s 集 401，"
+                                "剩余 %s 条未尝试（本地记录都还在，换好 Token 再点一次即可）",
+                                bid, ep.get("ep_index"), total - done - 1)
+                    self.progress.emit(total, total)   # 让进度条走完，别停在半路
+                    self.finished_upload.emit(ok, fail, uploaded, aborted)
+                    return
                 except Exception as e:
                     fail += 1
                     log.warning("补传条目 %s 第 %s 集失败（本地记录已保留，可重试）: %s",
@@ -695,7 +709,7 @@ class _UploadWorker(QThread):
                 self.progress.emit(done, total)
         log.info("补传完成：成功 %s 条，失败 %s 条（涉及 %s 个条目）",
                  ok, fail, len(uploaded))
-        self.finished_upload.emit(ok, fail, uploaded)
+        self.finished_upload.emit(ok, fail, uploaded, "")
 
 
 class _ResolveUserWorker(QThread):
@@ -866,12 +880,7 @@ class InProgressBridge(QObject):
     def _start_episode_fetch(self, collections: list) -> None:
         """**增量**同步集级观看记录（F20）。
 
-        与旧版的区别（一句话）：**该拉哪几部由 `sync_candidates()` 决定，
-        不再由"动态页显示多少条"决定**。旧版按收藏时间从新到旧拉、凑够
-        `ep_timeline_count` 条就停，导致排在后面的上百部（尤其"看过"的番）
-        永远拉不到 —— 实测 149 部看过番只有 4 部留下了逐集记录。
-
-        `ep_timeline_count` 现在**只管显示**（首屏条数 + 加载更多的页大小），
+        `ep_timeline_count` **只管显示**（首屏条数 + 加载更多的页大小），
         与拉取无关；`<= 0` 时跳过同步（用户关闭了集级记录，见 applyEpisodeCount）。
 
         排序：仍按收藏修改时间倒序，这样**分批落库时最新的记录先出现**，
@@ -914,10 +923,8 @@ class InProgressBridge(QObject):
                 "bangumi_id": int(_field(c, "bangumi_id") or 0),
                 "title": _field(c, "name_cn") or _field(c, "name") or "",
                 "local_id": local_map.get(int(_field(c, "bangumi_id") or 0), 0),
-                # 单集时间戳的兜底：集级接口的 `updated_at` 历史上出现过恒为 0
-                # （字段存在但无值，见 _fetch_with_session 的说明），此时用该
-                # 动漫**收藏的最后修改时间**兜底，否则整批记录都会因为"没有
-                # 时间"被丢弃。用收藏时间而不是"本次拉取时刻"：同一部的每集
+                # 单集时间戳的兜底：集级接口的 `updated_at`
+                # 用收藏时间而不是"本次拉取时刻"：同一部的每集
                 # 拿到同一个时间（视觉上仍按动漫聚拢），且那是用户真的看完
                 # 那部的日子。
                 "collection_time": _collection_time(c),
@@ -1099,6 +1106,12 @@ class InProgressBridge(QObject):
             return {"ok": False, "pending": 0, "subjects": 0,
                     "message": "没有勾选要上传的集"}
 
+        # 压根没配 Token 的话，PATCH 必然 401 —— 那种情况说"Token 已过期"
+        # 不对（他从没填过），直接讲清楚该做什么
+        if not getattr(self._api, "has_token", False):
+            return {"ok": False, "pending": 0, "subjects": 0,
+                    "message": "尚未配置 Bangumi Token，无法补传（请到设置页填写）"}
+
         try:
             pend = self._db.pending_uploads()      # {subject_id: [集...]}
             blocked = sum(self._db.blocked_upload_counts().values())
@@ -1160,7 +1173,8 @@ class InProgressBridge(QObject):
             self.message.emit(f"补传中… {done}/{total} 条")
 
     def _on_upload_finished(self, ok: int, fail: int,
-                            uploaded: dict | None = None) -> None:
+                            uploaded: dict | None = None,
+                            aborted: str = "") -> None:
         """补传结束：**先写回本地**，再让那些条目的集级记录重新同步一次。
 
         **为什么必须写回**：补传成功后本地 `watched_episodes` 还没有这一集 ——
@@ -1196,6 +1210,15 @@ class InProgressBridge(QObject):
                 self._refresh_ep_view()
         except Exception as e:
             log.warning("补传后刷新集级记录失败（不影响补传）: %s", e)
+        if aborted:
+            # Token 被拒：**不能说"可再点一次"** —— 换 Token 之前点多少次
+            # 都是同一个结果（这正是用户 2026-10-06 那次踩的坑：日志里
+            # 只有一串 `401 Client Error`，状态栏还劝他重试）
+            # 成功的那些照常写回本地（上面已经写了），这里只把"为什么停下"
+            # 说清楚。可操作的部分放最前 —— 状态栏是单行、右端会被截断。
+            tail = f"（已成功 {ok} 条）" if ok else ""
+            self.message.emit(f"补传中止：{aborted}{tail}")
+            return
         if fail:
             # 失败的不清掉"待上传"状态 —— 小窗里再点一次即只补它们
             self.message.emit(
@@ -1207,8 +1230,7 @@ class InProgressBridge(QObject):
     def resolveUsername(self, token: str = "") -> None:
         """用指定 Token 解析当前账号的 username（设置页「检测」按钮）。
 
-        **异步**（踩坑：早期是 `result="QVariantMap"` 同步返回，实测在
-        "没开代理"时点一下按钮界面直接卡死十几秒）：
+        **异步**：
         QML 调用带 result 的 Slot 是**同步**的，`get_me()` 的 15s 超时
         全部压在 UI 线程上 —— 窗口不重绘、按钮不响应，看起来就是崩溃。
         现在改为「发起后台请求 + 结果用信号回传」，界面全程可交互。
@@ -1222,10 +1244,6 @@ class InProgressBridge(QObject):
         token = (token or "").strip()
         # 探测用的客户端：Token 优先用输入框里的（用户可能改了还没保存），
         # 其次用配置里已保存的。
-        #
-        # **代理必须一并带上**（踩坑）：早期这里写死 `proxy=""`，等于强制
-        # 直连 —— 用户配了代理也会被忽略。而 www.bgm.tv 直连不通是最常见
-        # 的情况，表现为"点检测半天没反应"。
         #
         # 注意 `BangumiClient` **不保存**原始的 token / proxy（只把它们写进
         # session 的 header 与 proxies），所以这里从配置读，而不是从
@@ -1259,9 +1277,7 @@ class InProgressBridge(QObject):
         **这里既不拉取、也不裁剪数据表** —— 与旧版最大的差别：
 
         - **不拉取**：该配置现在只管"动态页显示多少条"，与"要同步哪几部"
-          彻底解耦（同步范围由 `sync_candidates()` 决定）。旧版在这里重新
-          拉取，于是**保存任意设置**（哪怕改的是主题色）都会触发一轮
-          上百个请求的全量同步。
+          彻底解耦（同步范围由 `sync_candidates()` 决定）。
         - **不裁剪**：表里要保留**完整历史**。调小显示条数只是少显示几条，
           而不是把数据删掉 —— 删了再调大又得重新联网拉一遍。
           （被截掉的条数会由 QML 的「加载更多」提示体现。）

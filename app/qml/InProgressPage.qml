@@ -2,10 +2,10 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Window      // Screen.devicePixelRatio（封面解码尺寸用）
 
-// 在看页（阶段 7）：Bangumi「动画 · 在看」列表 + 本地关联。
+// 在看页：Bangumi「动画 · 在看」列表 + 本地关联。
 //
 // 页面语义是"我正在追的番"（导航栏那一项也写着「在看」）。
-// 「看过」的番不在这里 —— 它们数量多（实测 149 部），时间线在「动态」页更合适。
+// 「看过」的番不在这里 —— 它们数量多，时间线在「动态」页更合适。
 //
 // 数据来源：`library.inProgress` —— 服务端收藏缓存（inprogress_cache）
 // **＋** 本地手动标成「在看」的条目（没配 Token / 没匹配 Bangumi 的用户
@@ -37,6 +37,13 @@ Item {
 
     /// 请求播放某一集（由 Main.qml 转给 player.playEpisode，与详情页一致）
     signal playEpisode(int episodeId)
+
+    /// 「下一集」被点到 —— **播得了播不了都发**，只用来记日志。
+    /// 为什么要专门一个信号、还要绕到 Python 记：QML 只能 `console.log`，
+    /// 而那输出进不了日志文件（应用没装 QtMessageHandler，见
+    /// PlayerBridge.logNextEpisodeClick）。hint 是播不了时状态栏那句原因。
+    signal nextEpisodeClicked(string subjectTitle, int subjectId, int episodeId,
+                              string hint)
 
     Flickable {
         id: flick
@@ -126,14 +133,7 @@ Item {
 
                         // ---- 整行点击区：必须声明在内容之前（层级最低）----
                         //
-                        // QML 里**后声明的兄弟项在上层、优先接收事件**。早期这个
-                        // MouseArea 写在最后（层级最高）盖住了「详情」按钮，于是靠
-                        // `propagateComposedEvents: true` + `accepted = false`
-                        // 把点击"漏"给下面的按钮。那个 hack 的副作用是致命的：
-                        // 点击会**继续往更下层同步传播**，而按钮的处理函数在传播
-                        // 途中就把页面切到了详情页 —— 同一次点击于是又落到了详情页
-                        // 的集数行上（那行是点击即播放）→
-                        // **「详情」一点就开始播放**（实测反馈）。
+                        // QML 里**后声明的兄弟项在上层、优先接收事件**。
                         //
                         // 放回最前面后：按钮自己接收点击，空白处归本 MouseArea，
                         // 两条路互不干扰，不需要任何传播技巧。
@@ -144,7 +144,6 @@ Item {
                             anchors.fill: parent
                             // 悬停状态交给 HoverHandler（见下），这里只负责点击
                             // 未入库的行没有本地详情可开，光标明确提示不可点
-                            // （实测 11 部「在看」里通常有 3~4 部未入库）
                             cursorShape: modelData.inLibrary ? Qt.PointingHandCursor
                                                              : Qt.ArrowCursor
                             onClicked: {
@@ -280,23 +279,32 @@ Item {
 
                                 // 「下一集」：直接接着看那一集。
                                 // 集号由后端按 Bangumi 的「已看到第 N 集」算出
-                                // （见 LibraryBridge._next_episode），与左侧进度条
-                                // 「5 / 12 集」同一口径。
+                                // （见 LibraryBridge._next_episode），与左侧进度条同一口径。
                                 //
-                                // **按钮不隐藏**（实测要求）：播不了时把"为什么播不了"
+                                // **按钮不隐藏**：播不了时把"为什么播不了"
                                 // 报到状态栏 —— 没入库 / 本地已看到最新 / 集号数据异常，
                                 // 三种情况的处置完全不同，藏掉按钮等于把信息也藏掉了。
                                 AppButton {
                                     anchors.verticalCenter: parent.verticalCenter
                                     text: "下一集"
                                     onClicked: {
+                                        // 播不了的原因先算出来：日志与状态栏
+                                        // 用同一份文字（日志里那句就是用户
+                                        // 屏幕上看到的那句）
+                                        var hint = modelData.nextEpisodeId > 0
+                                                   ? ""
+                                                   : (modelData.nextEpisodeHint
+                                                      || "没有可播放的下一集")
+                                        root.nextEpisodeClicked(
+                                            modelData.title,
+                                            modelData.localSubjectId || 0,
+                                            modelData.nextEpisodeId, hint)
                                         if (modelData.nextEpisodeId > 0)
                                             root.playEpisode(modelData.nextEpisodeId)
                                         else
                                             root.statusMessage(
                                                 "「" + modelData.title + "」"
-                                                + (modelData.nextEpisodeHint
-                                                   || "没有可播放的下一集"))
+                                                + hint)
                                     }
                                 }
 

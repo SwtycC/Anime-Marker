@@ -12,6 +12,10 @@
 
 **永不抛异常**：检查更新是个"锦上添花"的动作，断网/限流/仓库改名都不该
 影响主流程，也不该弹错误框。所有失败都收敛成 `UpdateInfo.state`。
+
+**自动检查一天只做一次**（见 `auto_check_due` / `mark_auto_checked`）：
+启动时那次静默检查只在"今天还没查过"时发出去，同一天之后再开软件不再自动
+发请求，想查就点「检查更新」。
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from datetime import date
 
 import requests
 
@@ -64,14 +69,14 @@ class UpdateInfo:
 def parse_version(text: str) -> tuple[int, ...]:
     """`v1.2.3` / `1.2.3` / `1.2` → 整数元组，用于比较。
 
-    **不能用字符串比**（踩坑要点）：字典序下 `"1.0.10" < "1.0.9"` 成立 ——
+    **不能用字符串比**：字典序下 `"1.0.10" < "1.0.9"` 成立 ——
     真发了 1.0.10 会被判成"没有更新"。拆成元组比才是对的。
 
     先砍掉预发布/构建后缀（`-rc1` / `-beta.2` / `+build`），再剥前缀 `v`，
     最后取数字段；取不到数字就当 0（`""` → `(0,)`），保证比较永不抛异常。
     最多取 4 段，防住"版本号被人写成含时间戳"这种怪数据。
 
-    **为什么必须砍后缀**（踩坑，自测发现）：直接抓数字的话
+    **为什么必须砍后缀**：直接抓数字的话
     `v1.3.0-rc1` → `(1, 3, 0, 1)`，比 `1.3.0` 的 `(1, 3, 0)` **大** ——
     于是拿一个 rc 版本去催用户更新。砍掉后两者相等，判"没有更新"。
     宁可漏报一次，也不要拿预发布版骚扰人。
@@ -84,7 +89,7 @@ def parse_version(text: str) -> tuple[int, ...]:
 def is_newer(remote: str, local: str = __version__) -> bool:
     """远端版本是否比本地新。
 
-    **比较前把两个元组补齐到等长**（踩坑，自测发现）：`(1, 2, 0) > (1, 2)`
+    **比较前把两个元组补齐到等长**：`(1, 2, 0) > (1, 2)`
     在 Python 里成立（等前缀时更长的那个更大），于是远端 `1.2.0` 与本地
     `1.2` 会被判成"有新版本" —— 而这俩是同一个版本。补零后相等，
     判"没有更新"。
@@ -137,3 +142,75 @@ def fetch_latest(timeout: float = TIMEOUT) -> UpdateInfo:
     state = "newer" if is_newer(tag) else "latest"
     log.info("检查更新：远端 %s / 本地 %s → %s", tag, __version__, state)
     return UpdateInfo(state, tag=tag, url=url)
+
+
+# ---------- 跨进程的记账（config.ini 的 `[update]`）----------
+#
+# 两笔账，都用配置文件而不是内存变量 —— 判的是"今天"和"上次查到什么"这种
+# 跨进程的概念，一关软件就忘了等于没做：
+#
+#   last_auto_check —— 那次自动检查是哪天发出的（一天只发一次）
+#   latest_tag      —— 上次查到确实比本地新的版本号（小红点据此长亮）
+#
+# **为什么按"发出请求"记 last_auto_check，而不是"查成功"记账**（取舍）：
+# 若只有成功才记账，那么断网/被墙时每次开软件都会再来一次 —— 而这恰恰是
+# 最常失败的情形（本程序用户多在国内直连 GitHub API），等于"一天一次"
+# 在最该省的地方失效，还要每次开机白等 8 秒。
+# 所以：**请求发出即算今天的份**，失败不重试，用户仍可随时手动查
+# （手动那条路不受任何限制，见 AppMenuBridge）。
+
+
+def _save_quietly(config, what: str) -> None:
+    """写盘失败（只读、被占用、盘满）**不抛**。
+
+    调用点都在 Qt 槽里（定时器到点 / 检查结果回来），那里冒异常会牵连整个
+    程序 —— 而这两笔账丢了，最坏结果不过是下次开软件多查一次、小红点晚亮
+    一次，不值得冒那个险。
+    """
+    try:
+        config.save()
+    except Exception as e:            # noqa: BLE001 —— 见 docstring
+        log.info("保存%s失败：%s", what, e)
+
+
+def today_str() -> str:
+    """本地日期 `YYYY-MM-DD`（用本地时区 —— "今天"是按用户的手表算的）。"""
+    return date.today().isoformat()
+
+
+def auto_check_due(config, today: str | None = None) -> bool:
+    """今天是否**还没**做过那次自动检查。
+
+    读不到/值不合法（用户手改过配置）都当成"没查过" —— 结果只是多发一次
+    请求，比"永远不再自动查"安全。
+    """
+    return config.get("update", "last_auto_check", "") != (today or today_str())
+
+
+def mark_auto_checked(config, today: str | None = None) -> None:
+    """记下"今天的自动检查已经发出去了"。"""
+    config.set("update", "last_auto_check", today or today_str())
+    _save_quietly(config, "自动检查日期")
+
+
+def load_known_newer(config) -> str:
+    """读出上次查到的"确实比本地新"的版本号（没有则空串）。
+
+    **为什么还要复判一次 `is_newer`**：这笔记账是上次运行写的，之后用户完全
+    可能自己下载新版装上了 —— 本地版本一涨，同一个 tag 自然就不再"新"，
+    红点自己就灭了。不用任何额外的清理逻辑，也不会出现"装完新版还一直催
+    更新"这种最讨人嫌的 bug。
+    """
+    tag = config.get("update", "latest_tag", "").strip()
+    return tag if is_newer(tag) else ""
+
+
+def remember_latest(config, tag: str = "") -> None:
+    """记下最新的版本号。
+
+    `tag` 为空串 = **确认过没有新版**（把记账清掉，红点随之灭）；
+    只在真拿到确定的答案时才调用 —— 断网/限流时**不要**动它，
+    否则查失败会把上次查到的"有新版本"抹掉，红点白亮过一场又灭了。
+    """
+    config.set("update", "latest_tag", (tag or "").strip())
+    _save_quietly(config, "最新版本号")

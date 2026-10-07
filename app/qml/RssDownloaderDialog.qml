@@ -29,6 +29,10 @@ Window {
                            ? library.subjects : []
     property string query: ""
     readonly property var filteredSubjects: {
+        // 一律用 `query`（用户在搜索框里打的那个词）过滤，**与
+        // `showingPicked` 无关**：选中条目后框里显示的是条目名，但
+        // `query` 仍是上一轮的搜索词，列表因此保持那批结果不变
+        // （实测需求："选择后保持搜索上一轮输入的内容"）。
         var q = dlg.query
         if (q === "")
             return dlg.subjects
@@ -43,6 +47,32 @@ Window {
 
     /// 当前选中的条目 id（0 = 不指定，用 qBittorrent 全局路径）
     property int selectedId: 0
+
+    /// 上面那个搜索框此刻显示的是「已选中条目名」还是「用户在搜的词」。
+    ///
+    /// **为什么要区分**：选中后把条目名填进文本框，用户才看得出"我指定了
+    /// 哪个"；但那个框同时兼着搜索 —— 直接填进去就等于把它当成了筛选词，
+    /// 列表会被过滤成孤零零一行（甚至全名匹配不上而显示"无结果"），
+    /// 反而更像坏了。
+    ///
+    /// 所以：**程序回填时置 `true`（只展示、不参与过滤）**；
+    /// 用户一旦动手打字就置回 `false`（恢复成搜索词）。
+    /// 见 `selectedSubjectName` / `filteredSubjects` / `searchField.onEdited`。
+    property bool showingPicked: false
+
+    /// 当前选中条目的显示名（未指定时为空串）。
+    readonly property string selectedSubjectName: {
+        var s = dlg.selectedSubject()
+        return s ? (s.title || s.name || "") : ""
+    }
+
+    /// 内部闸门：`true` 表示**这次文本框变化是程序回填的**，不是用户输入。
+    ///
+    /// 给 `searchField.text` 赋值会触发 `onTextChanged` → `onEdited`，
+    /// 那里会把 `showingPicked` 置回 false（"用户在搜"的语义）——
+    /// 程序回填时不能被这样处理（见 pickSubject 的踩坑说明）。
+    /// 用这个旗标把两种来源分开，比"赋值顺序上做文章"可靠。
+    property bool _fillText: false
 
     /// 保存路径预览（后端算好：{path, note, exists}）。
     ///
@@ -84,14 +114,55 @@ Window {
         dlg.savedBefore = source.downloaderSaved === true
         includeField.text = source.mustInclude || ""
         excludeField.text = source.mustExclude || ""
-        dlg.selectedId = source.saveSubjectId || 0
         dlg.query = ""
-        searchField.text = ""
+        dlg.selectedId = source.saveSubjectId || 0
+        // 上次存过保存位置就把条目名回填进框里 —— 否则每次打开都像
+        // "没指定过"（正是实测反馈的那个感觉）。回填时置 showingPicked，
+        // 让列表保持全量、不按这个名字过滤。
+        dlg.showingPicked = dlg.selectedId !== 0
+        dlg.setTextProgrammatically(
+            dlg.showingPicked ? dlg.selectedSubjectName : "")
         dlg.show()
         dlg.raise()
         dlg.requestActivate()
+        // 记一行"打开了哪个订阅的下载器"（后端从库读订阅名 + 绑定条目）。
+        // 必须**在触发预览之前**：预览会抓一次 RSS 并打出一批"按规则过滤"
+        // 的日志，先记这行才能对上号（实测多订阅时那批日志无从归属）。
+        if (typeof rss !== "undefined" && rss)
+            rss.logDownloaderOpened(dlg.sourceId)
         // 打开就算一次预览（让用户立刻看到当前规则的效果）
         dlg.triggerPreview()
+    }
+
+    /// 选中某个条目：记住 id、把名字回填进框，**列表保持上一轮的搜索结果**。
+    ///
+    /// **`query` 保留、不能清**：那个搜索词是用户
+    /// 用来找条目的线索，选完还要接着用它比选别的季 —— 清掉就等于
+    /// 把他刚打的字抹了。
+    ///
+    /// 回填条目名走 `setTextProgrammatically`（`_fillText` 闸门）：
+    /// 直接赋值会触发 `onEdited`，把 `query` 覆盖成条目全名 ——
+    /// 列表随即按全名过滤、只剩一行（正是要避免的）。
+    function pickSubject(subject) {
+        if (!subject)
+            return
+        dlg.selectedId = subject.id
+        dlg.setTextProgrammatically(dlg.selectedSubjectName)
+        // 回填的是条目名（不是搜索词），列表继续用 `query` 过滤
+        dlg.showingPicked = true
+    }
+
+    /// 程序回填搜索框（不触发"用户开始搜索"的副作用）。见 pickSubject 说明。
+    function setTextProgrammatically(text) {
+        dlg._fillText = true
+        searchField.text = text
+        dlg._fillText = false
+    }
+
+    /// 清除选择（「不指定」按钮与手动开始搜索时调用）。
+    function clearPick() {
+        dlg.selectedId = 0
+        dlg.showingPicked = false
     }
 
     /// 触发预览（内部走防抖）
@@ -185,6 +256,18 @@ Window {
         }
     }
 
+    /// 取消所有输入框的焦点与文字选中（点空白处时调用）。
+    ///
+    /// **必须调 `AppTextField.blur()`，不能给外层设 `focus = false`**
+    /// ：真正持有焦点的是组件**内部的 TextInput**，
+    /// 聚焦描边读的也是 `input.activeFocus`；外层的 Rectangle 不是焦点项，
+    /// 给它赋值等于什么都没做，描边照旧亮着。见 AppTextField.blur()。
+    function clearInputFocus() {
+        includeField.blur()
+        excludeField.blur()
+        searchField.blur()
+    }
+
     // ---- 主体：左右两栏 ----
     Row {
         anchors.left: parent.left
@@ -250,7 +333,7 @@ Window {
 
             // 「保存位置」标题行 + 右侧「重新扫描」按钮。
             //
-            // **为什么把重新扫描放在这里**（实测需求）：用户在预览里看到
+            // **为什么把重新扫描放在这里**：用户在预览里看到
             // "将下载 10 集"，但自己目录里明明已有其中 3 集 —— 原因是查重
             // 第①层读的是**数据库 `episodes` 表**，只有**扫描过**才会写进去。
             // 目录里后来新增/改名/换组的文件不会自动进库，于是被当成新集。
@@ -258,8 +341,7 @@ Window {
             // 不用退回详情页再点一次扫描。
             // 标题行：文字与按钮**垂直居中对齐**。
             //
-            // **为什么给 Row 一个显式高度并让子项 centerIn**（实测反馈
-            // "上下边框与保存位置上下边界对齐"）：Row 的高度由最高的子项
+            // **为什么给 Row 一个显式高度并让子项 centerIn**：Row 的高度由最高的子项
             // 决定，而按钮（24）比文字（约 19）高 —— 若各自
             // `anchors.verticalCenter: parent.verticalCenter`，Row 会以
             // 按钮为基准撑高，文字看着偏上、整行又与相邻元素错位。
@@ -304,8 +386,7 @@ Window {
             // 保存位置说明：**目录由后端算好**（rss.savePathPreview），
             // QML 只负责显示。
             //
-            // **为什么不在这里拼字符串**（实测需求："可以在这段文字的
-            // 下一行写清楚目录在哪，像其他已存在条目一样"）：以前"没有
+            // **为什么不在这里拼字符串**：以前"没有
             // folder_path"的条目只说一句"媒体库根目录下新建「xx」"，
             // 用户看不到**具体路径**，也就不知道会不会和别的季分家。
             // 但路径规则（按系列归位、季子目录名、媒体库根）全在后端
@@ -341,14 +422,27 @@ Window {
                     objectName: "downloaderSubjectSearch"
                     width: parent.width - clearBtn.width - Theme.spacingSm
                     placeholder: "搜索本地条目（支持别名）"
-                    onEdited: dlg.query = searchField.text.trim().toLowerCase()
+                    // 用户一动手打字就**退出"已选中展示"态**，回到搜索语义：
+                    //   - 保留 selectedId（选中没有取消，只是框里换成了搜索词）
+                    //   - 用新输入的内容过滤列表
+                    // 这样"选中后看着不满意、想改选"只需直接接着打字。
+                    onEdited: {
+                        // 程序回填（选中条目 / 打开弹窗）不算"用户在搜索"
+                        if (dlg._fillText)
+                            return
+                        if (dlg.showingPicked)
+                            dlg.showingPicked = false
+                        dlg.query = searchField.text.trim().toLowerCase()
+                    }
                 }
 
                 AppButton {
                     id: clearBtn
                     text: "不指定"
                     onClicked: {
-                        dlg.selectedId = 0
+                        // 语义是"不指定保存位置"（用 qBittorrent 全局路径），
+                        // 顺带把搜索框清空、恢复成可搜索的空态。
+                        dlg.clearPick()
                         dlg.query = ""
                         searchField.text = ""
                     }
@@ -414,7 +508,7 @@ Window {
                                     anchors.fill: parent
                                     hoverEnabled: true
                                     cursorShape: Qt.PointingHandCursor
-                                    onClicked: dlg.selectedId = modelData.id
+                                    onClicked: dlg.pickSubject(modelData)
                                 }
                             }
                         }
@@ -619,5 +713,16 @@ Window {
         }
     }
 
+    // ---- 点空白处 → 取消输入框的焦点 ----
+    //
+    // **必须声明在所有内容之后**（QML 里后声明 = 在上层）。
+    //
+    // **用 TapHandler 置顶**：它只在"没有任何其它 handler 消费这次点击"
+    // 时才触发 —— 按钮 / 输入框 / 列表行自己的 handler 会先把它吃掉，
+    // 所以不会误伤控件；真正落在空白处的点击才会走到 `onTapped`。
+    TapHandler {
+        acceptedButtons: Qt.LeftButton
+        onTapped: dlg.clearInputFocus()
+    }
 
 }

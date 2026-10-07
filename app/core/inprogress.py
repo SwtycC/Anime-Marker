@@ -77,7 +77,8 @@ class InProgressService:
         if not username:
             return self._fallback(
                 "未配置 Bangumi 用户名，且无法从 Token 解析。"
-                "请到「设置」填写 Bangumi 用户名（Token 权限不足时也需手填）。"
+                "请到「设置」填写 Bangumi 用户名"
+                "（Token 已过期或无效、或网络不通时都需手填）。"
             )
         log.info("在看列表加载：username=%s force=%s", username, force)
 
@@ -94,10 +95,9 @@ class InProgressService:
                 collect_type=COLLECT_TYPE_DOING,
             )
         except BangumiAuthError as e:
-            return self._fallback(
-                f"拉取失败（{e}）。请确认用户名是否正确、Token 是否有效。",
-                username=username,
-            )
+            # `e` 本身就写着"Token 已过期或无效（请到设置页重新填写…）"，
+            # 再包一层「请确认…Token 是否有效」就成了同义反复
+            return self._fallback(f"拉取失败：{e}", username=username)
         except BangumiError as e:
             return self._fallback(f"拉取失败：{e}", username=username)
 

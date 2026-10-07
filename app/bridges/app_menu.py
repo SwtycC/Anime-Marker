@@ -9,9 +9,16 @@
 的动作，没有状态要维护 —— 唯一的"状态"是检查更新的结果。
 
 **检查更新的两条路径，反馈口径不同**（见 `checkUpdate` / `startInitialCheck`）：
-  自动（启动后延迟一次）：**只有"查到新版"才有动静**，且只是点亮菜单里的
-    小红点 —— 不弹窗、不动状态栏。每次开软件都冒一句话太吵。
-  手动（用户点了）：**必须有回应**，否则用户不知道点没点上。
+  自动（**每天第一次**开软件后延迟一次）：**只有"查到新版"才有动静**，
+    且只是点亮菜单里的小红点 —— 不弹窗、不动状态栏。每次开软件都冒一句
+    话太吵。同一天再开软件**不发这次请求**（记账见 update_check 的
+    `auto_check_due`），想查点「检查更新」。
+  手动（用户点了）：**必须有回应**，否则用户不知道点没点上，
+    且**任何时候都能查**，不受上面那条"一天一次"的限制。
+
+**小红点一旦亮起就跨进程亮着**：查到的版本号落在 config 里，开软件时直接
+还原（见 `load_known_newer`）—— 不然"今天已经查过，所以这次不查"会连带
+把红点也弄丢，用户当天再开一次软件就以为没更新了。
 """
 
 from __future__ import annotations
@@ -25,8 +32,10 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QDesktopServices
 
 from app import __version__
+from app.core.config import Config
 from app.core.update_check import (
-    ISSUES_NEW, REPO_PAGE, UpdateInfo, fetch_latest,
+    ISSUES_NEW, REPO_PAGE, UpdateInfo, auto_check_due, fetch_latest,
+    load_known_newer, mark_auto_checked, remember_latest,
 )
 from app.utils.paths import logs_dir, resource_path
 
@@ -58,11 +67,18 @@ class AppMenuBridge(QObject):
     #: 给状态栏的一句话（检查更新的手动结果）
     statusMessage = Signal(str)
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(self, config: Config, parent: QObject | None = None) -> None:
         super().__init__(parent)
+        # 两件事都要读它：自动检查"今天的份"的记账、以及红点的还原/落盘
+        # （见 update_check 里那段说明）。
+        self._config = config
         self._worker: _UpdateWorker | None = None
-        self._has_update = False
-        self._latest_tag = ""
+        # 上次运行查到的新版本号 → **开软件就先把红点还原出来**，
+        # 不等今天的检查（今天多半不查了，见 startInitialCheck）。
+        # 直接赋值、不发信号：这会儿 QML 还没绑上来，发也没人听。
+        stored = load_known_newer(config)
+        self._has_update = bool(stored)
+        self._latest_tag = stored
         self._checking = False
         # 这一次请求回来时该按"手动"处理吗（见 _start 的并发说明）
         self._pending_manual = False
@@ -72,7 +88,10 @@ class AppMenuBridge(QObject):
     # ---------- 状态（QML 绑定用）----------
     @Property(bool, notify=hasUpdateChanged)
     def hasUpdate(self) -> bool:
-        """是否有比本地新的版本 —— 菜单项右侧那个小红点读它。"""
+        """是否有比本地新的版本 —— 菜单项右侧那个小红点读它。
+
+        **亮着就一直亮**：值落盘，重开软件时由 __init__ 还原（见模块说明）。
+        """
         return self._has_update
 
     @Property(str, notify=latestTagChanged)
@@ -158,7 +177,14 @@ class AppMenuBridge(QObject):
     # ---------- 检查更新 ----------
     @Slot()
     def startInitialCheck(self) -> None:
-        """启动后延迟一次**静默**检查（由 QmlApp 在界面加载完成后调用）。"""
+        """启动后延迟一次**静默**检查（由 QmlApp 在界面加载完成后调用）。
+
+        **今天已经查过就整个不挂定时器**（而不是挂上去再空转）：连那 8 秒
+        的等待都省掉，日志里也留不下"其实什么也没做"的痕迹。
+        """
+        if not auto_check_due(self._config):
+            log.info("今天已自动检查过更新，跳过（可手动「检查更新」）")
+            return
         if self._initial_timer is None:
             self._initial_timer = QTimer(self)
             self._initial_timer.setSingleShot(True)
@@ -176,6 +202,12 @@ class AppMenuBridge(QObject):
         self._start(manual=True)
 
     def _check_silently(self) -> None:
+        # **先记账、再发请求**：这次请求发出去了就算"今天的份"
+        # （失败也不重试的理由见 update_check 里那段说明）。
+        #
+        # 放在这里而不是 `_on_checked` 里：万一请求还没回来用户就关了软件，
+        # 今天也算查过 —— 否则反复开关软件会反复发请求，正是要避免的。
+        mark_auto_checked(self._config)
         self._start(manual=False)
 
     def _start(self, manual: bool) -> None:
@@ -198,7 +230,12 @@ class AppMenuBridge(QObject):
         self._set_checking(False)
 
         # 小红点 / 版本号：两种路径都要更新（自动那次的全部意义就在这里）
+        #
+        # 两种"确定"的结果都顺手落盘，好让红点跨进程亮着（见 load_known_newer）。
+        # **"failed" / "no_release" 一律不动记账**：查失败不是"没有新版"，
+        # 把上次查到的结果抹掉，就成了"断网一次红点就没了"。
         if info.state == "newer":
+            remember_latest(self._config, info.tag)
             if self._latest_tag != info.tag:
                 self._latest_tag = info.tag
                 self.latestTagChanged.emit()
@@ -206,6 +243,7 @@ class AppMenuBridge(QObject):
                 self._has_update = True
                 self.hasUpdateChanged.emit()
         elif info.state == "latest":
+            remember_latest(self._config)
             if self._has_update:
                 self._has_update = False
                 self.hasUpdateChanged.emit()

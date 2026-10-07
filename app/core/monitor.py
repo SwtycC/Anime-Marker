@@ -23,18 +23,13 @@ from PySide6.QtCore import (Q_ARG, QMetaObject, QObject, QRunnable, Qt,
 import win32con
 import win32gui
 
-from app.core.bangumi_api import BangumiClient, BangumiError
+from app.core.bangumi_api import BangumiAuthError, BangumiClient, BangumiError
 from app.core.database import Database, Episode
 from app.utils.title_parser import parse_progress
 
 log = logging.getLogger(__name__)
 
 # PotPlayer 的播放信息接口：`SendMessage(hwnd, WM_USER, <常量>, 0)`
-#
-# 实测（PotPlayer64，2026-09）：
-#   0x5002 → 总时长（ms），0x5004 → 当前位置（ms），与画面上显示的时间一致 ✓
-#   0x5001（播放状态）在该版本**恒返回 0，不可用** ✗ —— 因此判定"是否在播放"
-#   改用"位置有没有推进"（见 _tick），顺带能防住"把进度条拖到结尾被误判为看完"。
 #
 # 参考：https://deepwiki.com/kavinthangavel/media-player-scrobbler-for-simkl/2.3-media-player-integrations
 PPM_GET_TOTAL_TIME_MS = 0x5002
@@ -111,9 +106,15 @@ class _SyncRunnable(QRunnable):
     @Slot()
     def run(self) -> None:
         err = ""
+        # Token 被拒与"网络抖了一下"要分开报（见 _on_sync_finished）：
+        # 前者重试一万次也一样，得让用户去换 Token
+        auth = False
         try:
             self._monitor.api.mark_episode_watched(
                 self._subject.bangumi_id, self._ep.bangumi_ep_id)
+        except BangumiAuthError as e:
+            err = str(e)
+            auth = True
         except BangumiError as e:
             err = str(e)
         except Exception as e:          # pragma: no cover - 防御性
@@ -125,7 +126,8 @@ class _SyncRunnable(QRunnable):
             Q_ARG(int, self._ep.id),
             Q_ARG(int, int(self._subject.bangumi_id)),
             Q_ARG(str, self._subject.name_cn or self._subject.name or ""),
-            Q_ARG(str, err))
+            Q_ARG(str, err),
+            Q_ARG(bool, auth))
 
 
 class _CompleteRunnable(QRunnable):
@@ -378,8 +380,8 @@ class ProgressMonitor(QObject):
     def _note_miss(self) -> None:
         """连续读不到进度时**提示一次**。
 
-        **为什么必须提示**：这两个来源的失败完全不报错（早期连日志都没有），
-        实测排查时只能靠"数据库里 progress 恒为 0"倒推 ✗ —— 用户则会以为
+        **为什么必须提示**：这两个来源的失败完全不报错，
+        排查时只能靠"数据库里 progress 恒为 0"倒推 ✗ —— 用户则会以为
         是自己没设置对。提示一次即可，不刷屏。
         """
         self._misses += 1
@@ -399,10 +401,9 @@ class ProgressMonitor(QObject):
         两个入口都走这里，保证"无论怎么标，最后一集标完就完结"。
 
         **判定**用 `db.subject_all_watched`（**看过集数** ≥ 官方正片数），
-        不是"本地文件全看过" —— 本地往往缺集（只扫到 5 个文件、番有 12 集），
+        不是"本地文件全看过" —— 本地往往缺集，
         按文件判会把"追到一半"误判成"看完了"；也不是"最大集号 ≥ 官方集数"
-        —— 跨季连续编号的番集号和集数不同量纲（史莱姆第四季从 73 起编号，
-        看到第 89 集 = 本季第 17 集，拿 89 ≥ 24 判就会误标完结）。
+        —— 跨季连续编号的番集号和集数不同量纲。
         两个口径的取舍见 `Database.subject_all_watched`。
 
         **顺序：本地先写，远端异步** —— 与 `_CollectTypeWorker`（用户手动
@@ -465,7 +466,7 @@ class ProgressMonitor(QObject):
     def _trigger_watched(self, ep: Episode) -> None:
         """看完一集：**先写本地，再推 Bangumi**（顺序不能反）。
 
-        **踩坑（顺序反了会怎样）**：早期是"先 POST Bangumi，成功才写本地" ——
+        早期是"先 POST Bangumi，成功才写本地" ——
         一次网络抖动就等于"这集没看过" ✗；而本地记录正是「上传」功能的数据源，
         丢了就得重看一遍才能补回来。
         现在两者解耦：**本地记录 = "我看过"，Bangumi 标记 = "同步成功"** ——
@@ -490,14 +491,11 @@ class ProgressMonitor(QObject):
 
         # ---- 2. 再同步到 Bangumi（失败不影响本地记录）----
         if not ep.bangumi_ep_id:
-            # 实测本机 1446 集里有 455 集属于这种情况（扫描时没拿到集数元数据），
-            # 它们没法同步；「上传」会把这批跳过项一并列出来告诉用户
             log.warning("episode_id=%s 无 bangumi_ep_id，跳过同步（本地已记录）", ep.id)
             return
         # **必须换成 Bangumi 条目 ID**：`Episode.subject_id` 是本地
         # `subjects.id`（外键），而 `mark_episode_watched` 要的是 Bangumi 的
-        # `subject_id` —— 两者毫无关系（实测本机 72 个条目里没有一个相等：
-        # 本地 id=2 对应 bangumi_id=302189）。早期直接传 `ep.subject_id`，
+        # `subject_id` —— 两者毫无关系。早期直接传 `ep.subject_id`，
         # 于是每次自动标记都 POST 到"另一个条目"上，必然 400/404 失败，
         # 表现为「看完自动标记」从来没成功过（`episodes.watched` 全 0、
         # watch_log 为空），而不是网络问题。
@@ -510,9 +508,9 @@ class ProgressMonitor(QObject):
             # 关掉自动上传：只留本地记录，等用户在小窗里勾选上传
             log.info("自动上传已关闭，episode_id=%s 仅记录本地（可在动态页「上传」补传）", ep.id)
             return
-        # ---- 3. 网络同步：**必须放到后台线程**（见下方"致命踩坑"）----
+        # ---- 3. 网络同步：**必须放到后台线程**----
         #
-        # **致命踩坑（实测：程序"未响应"）**：这里是 `_tick()` 的调用链，
+        # 这里是 `_tick()` 的调用链，
         # 而 `_tick` 由 QTimer 在 **UI 线程** 驱动。早期直接在下面同步调
         # `api.mark_episode_watched()`，该请求带 `Retry(total=3, connect=3)`
         # 且 timeout=10s —— **最坏情况在 UI 线程里阻塞 30+ 秒**：
@@ -530,17 +528,27 @@ class ProgressMonitor(QObject):
         # （提示 + 写回本地），只是时机变成"稍后"。
         self._pool.start(_SyncRunnable(self, ep, subject))
 
-    @Slot(int, int, str, str)
+    @Slot(int, int, str, str, bool)
     def _on_sync_finished(self, episode_id: int, bangumi_id: int,
-                          subject_name: str, error: str) -> None:
+                          subject_name: str, error: str,
+                          auth_failed: bool = False) -> None:
         """后台同步的收尾（**在主线程执行**，见 _SyncRunnable 的说明）。
 
         - `error` 非空 → 后台 POST 失败：本地记录早已写好（`_trigger_watched`
-          第 1 步），这里只提示用户可用「上传」补齐。
+          第 1 步），这里只提示用户怎么补。
+          **但"Token 被拒"不能说「可用『上传』补齐」**（`auth_failed=True`）——
+          补传走的还是同一个 Token，点过去只会再吃一次 401，等于把人支到
+          一个必然失败的地方。
         - 成功 → 写回 `watched_episodes` + 清该条目的同步水位，
           这两步都碰数据库，因此必须留在主线程（见 _SyncRunnable 的边界说明）。
         """
         if error:
+            if auth_failed:
+                log.warning("同步到 Bangumi 失败（Token 已过期或无效，"
+                            "本地记录已保留）: %s", error)
+                self.error.emit("Bangumi 同步失败：Token 已过期或无效"
+                                "（本地已记录，请到设置页重新填写）")
+                return
             log.warning("同步到 Bangumi 失败（本地记录已保留，可用「上传」补齐）: %s",
                         error)
             self.error.emit(f"Bangumi 标记失败（本地已记录，可用「上传」补齐）：{error}")
@@ -550,13 +558,11 @@ class ProgressMonitor(QObject):
 
         # ---- 把这一集写回本地「已同步」表 ----
         #
-        # **为什么必须写回**（踩坑）：`watched_episodes` 是「**从 Bangumi 拉回来的**
+        # `watched_episodes` 是「**从 Bangumi 拉回来的**
         # 已标记集」；而这里是「**推过去**」—— 只 POST 不写回，这张表就永远缺这一行。
         # 于是 `Database.pending_uploads()` 的判据
         # （`LEFT JOIN watched_episodes ... WHERE w.bangumi_ep_id IS NULL`）
-        # 会把**刚刚自动上传成功的集**继续算成"待上传" ✗ ——
-        # 实测现象：日志已打印"已同步到 Bangumi"，但「上传」小窗里
-        # 那一集仍然列在待上传清单里，用户以为没传上去。
+        # 会把**刚刚自动上传成功的集**继续算成"待上传" ✗ 
         #
         # 与手动补传走同一条路（见 InProgressBridge._on_upload_finished）：
         # upsert 后动态页立刻出现 `bgm` 标记，不必等下一次集级同步。

@@ -43,6 +43,13 @@ log = logging.getLogger(__name__)
 DISPLAY_FLAT = "flat"
 DISPLAY_GROUPED = "grouped"
 
+# 收藏缓存超过这个年龄就算"数据较旧"。
+#
+# **唯一权威定义**：`inProgressMeta` 拿它决定页头要不要写「数据较旧，建议刷新」，
+# `needsRemoteRefresh` 拿它决定播放结束后要不要自动重拉 —— 两处必须同一个数，
+# 否则会出现"页头说数据旧、后台却认为不用刷新"（或反之）的自相矛盾。
+STALE_CACHE_SECONDS = 3600
+
 
 # 放送日期 tag 的形状：Bangumi 会给每个条目打一个「2015年7月」这样的 tag。
 # 兼容几种变体：`2015年7月` / `2015年7月番` / `2015-07` / `2015/07`
@@ -319,7 +326,7 @@ class LibraryBridge(QObject):
         self._eps_cache: list[dict] = []
         self._eps_dirty = True
         # 海报版本号：换海报后 cover_path 可能指回**同一个文件**（恢复原版），
-        # 而 QML 的 Image 按 URL 缓存解码结果 —— URL 不变就一直显示旧图（踩坑）。
+        # 而 QML 的 Image 按 URL 缓存解码结果 —— URL 不变就一直显示旧图。
         # 按条目记一个递增版本号，以 `?v=N` 追加到 file:// URL 后（query 不参与
         # 本地文件寻址，只作为缓存键的一部分），每次海报变更 +1 强制重新解码。
         self._cover_revs: dict[int, int] = {}
@@ -475,17 +482,7 @@ class LibraryBridge(QObject):
                     pass
 
             # 没有本地缓存就**不回落在线 URL**。
-            #
-            # 早期写的是 `local_cover or it.cover_url`：本地未入库 / 封面还没
-            # 下载的条目，会把 `https://lain.bgm.tv/...` 直接交给 QML 的
-            # `Image.source` —— 让 QML 引擎自己去联网取图。后果：
-            #   ① `lain.bgm.tv` 在内网/被墙环境下连不上 → 控制台刷
-            #      `QML QQuickImage: Connection timed out`（QML 的报错**输出到
-            #      控制台而非日志**，看着像程序出了问题）；
-            #   ② 每个可见行都发一次请求，几十行就是几十个连接，页面卡顿；
-            #   ③ 封面本该由 `cover_cache` 下载到本地后经 `as_file_url()`
-            #      使用（见 §5.12.5），绕过这条链路等于丢了缓存与失败兜底。
-            # 现在只用本地 URL，拿不到就交给 QML 显示占位底色（原本就有的
+            # 只用本地 URL，拿不到就交给 QML 显示占位底色（原本就有的
             # 空态），不再让界面层承担联网职责。
 
             # ---- 用**本地已看的最大集号**修正进度----
@@ -565,7 +562,7 @@ class LibraryBridge(QObject):
         # 没配 Token、或条目压根没匹配到 Bangumi 的用户也能在详情页手动标
         # 「在看」；这些条目不在收藏缓存里（那张表是服务端收藏的镜像），
         # 只有 subjects.collect_type 记着。不补进来，"我在看、但没连
-        # Bangumi"的番就永远不出现在这一页（用户实测要求）。
+        # Bangumi"的番就永远不出现在这一页。
         #
         # 排序：**追加在末尾、按条目名排**。不掺进上面那批的排序里 ——
         # 它们的 `updatedAt` 是"Bangumi 收藏修改时间"，而本地条目只有
@@ -614,10 +611,10 @@ class LibraryBridge(QObject):
         **一行 = 一集**（小窗里勾选的就是"这一集"），字段：
             {episodeId, bangumiEpId, subjectId, title, epIndex, epTitle}
         `title` 是动漫名 —— 小窗里与集名一起显示成「碧蓝之海 第三季 · EP7 妈妈」，
-        否则用户根本看不出待传的是哪一集 ✗（实测反馈）。
+        否则用户根本看不出待传的是哪一集 ✗。
 
         判据统一由 `Database.pending_uploads()` 给出 —— 与实际上传时的筛选
-        **是同一个查询** ✓（否则会出现"显示 3 条只传了 1 条"）。
+        **是同一个查询** ✓。
         """
         try:
             pend_map = self._db.pending_uploads()
@@ -842,13 +839,59 @@ class LibraryBridge(QObject):
         except Exception as e:
             log.exception("读取在看缓存元信息失败: %s", e)
             return {"count": 0, "ageSeconds": -1, "stale": True}
-        # 超过 1 小时视为"数据较旧"，页面提示用户刷新
-        stale = age is None or age > 3600
+        stale = age is None or age > STALE_CACHE_SECONDS
         return {
             "count": count,
             "ageSeconds": -1 if age is None else int(age),
             "stale": stale,
         }
+
+    @Slot(int, result=bool)
+    def needsRemoteRefresh(self, local_subject_id: int) -> bool:
+        """播放结束后要不要**联网**重拉一次收藏数据（`qml_app` 的收尾会问）。
+
+        两个条件满足其一即可：
+
+        ① **页面自己都标着"数据较旧"**（缓存超过 `STALE_CACHE_SECONDS`）——
+           页头写着「建议刷新」却只提示不做事，用户点不点都难说；播放结束
+           正是"数据刚变过"的时刻，顺手拉一次最自然。
+
+        ② **这一条的进度只能来自 Bangumi**（跨篇章编号）。
+           `_load_inprogress` 遇到"本地集号超出本季集数"会**故意不改**进度
+           （宁可不修正也不显示假的） —— 用户看到的结论就是"没同步"。这类条目本地推不出来，
+           只能回查（或多等一次手动刷新）。
+
+        **不做单条回查**：那要多一个 worker + 单行缓存更新 + 用户名解析；
+        整批拉取本来就只有十几条请求、跑在后台线程，且**顺带**让页头的
+        "数据较旧"消失。真嫌请求多再加单条优化也不迟。
+        """
+        # 没配 Token 就别自动拉：拉也是 401，只会在状态栏刷一条错
+        # （用户压根没用 Bangumi 的话，那纯属打扰）
+        if not getattr(self._api, "has_token", False):
+            return False
+
+        try:
+            age = self._db.inprogress_cache_age()
+        except Exception as e:                 # pragma: no cover - 防御性
+            log.warning("读取收藏缓存年龄失败: %s", e)
+            age = None
+        if age is None or age > STALE_CACHE_SECONDS:
+            return True
+
+        if local_subject_id <= 0:
+            return False
+        try:
+            s = self._db.get_subject(int(local_subject_id))
+            if s is None:
+                return False
+            total = int(s.total_eps or 0)
+            if total <= 0:
+                return False        # 集数未知 → 与 _load_inprogress 同口径：用本地值
+            return self._db.max_watched_ep_index(int(local_subject_id)) > total
+        except Exception as e:                 # pragma: no cover - 防御性
+            log.warning("判断是否需回查收藏数据失败 subject_id=%s: %s",
+                        local_subject_id, e)
+            return False
 
     # ---------- 条目列表 ----------
     @Property("QVariantList", notify=collectTypeChanged)
@@ -880,7 +923,7 @@ class LibraryBridge(QObject):
         `subjects` 是长生命周期的缓存（重取会重建整墙卡片，见
         `_on_collect_type_done` 的说明），收藏状态变了它不一定重取 ——
         于是出现"详情页已经显示「看过」、筛选里还算「未标记」，
-        要重扫才好"（用户实测）。这份映射只有两列、重建极廉价，
+        要重扫才好"。这份映射只有两列、重建极廉价，
         且挂在 `collectTypeChanged` 上，状态一变就跟着变。
 
         key 用字符串：QML 里 JS 对象的键一律是字符串（`map[item.id]` 会被
@@ -1710,8 +1753,7 @@ class LibraryBridge(QObject):
         原版缓存文件是 `scanner` / `match` 写的，两者传给
         `cover_cache.download()` 的都是 **bangumi_id**（见 scanner.py 与
         match.py 的调用点），所以真实文件名是 `covers/<bangumi_id>.<ext>`。
-        这里如果按 `s.id` 反推，只要本地 id 与 bangumi_id 不等（几乎所有
-        条目都如此，如 id=2 ↔ bangumi_id=302189），就会算出一个**不存在的
+        这里如果按 `s.id` 反推，只要本地 id 与 bangumi_id 不等，就会算出一个**不存在的
         路径**，于是：
           - `coverInfo().isCustom` 恒为 True → 小窗一打开就打上「自定义」
             徽标、「恢复原版海报」按钮错误地可点；

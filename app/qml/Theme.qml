@@ -10,7 +10,7 @@ import QtQuick
 //    hover / pressed / 文字反色 / 选中底 / 淡背景等派生色全部由它实时算出，
 //    因此「设置里换主题色 → 整个界面跟着变」不需要重启或重建任何页面。
 //
-// 命名约束（Qt 保留字，踩过坑）：
+// 命名约束（Qt 保留字）：
 // - 属性名不能以 on 开头（`onXxx` 被当作信号处理器）→ 用 accentText 而非 onAccent
 // - 不能与 QObject 内置成员重名（`warning` 与 warning() 信号冲突）→ 用 warningColor
 QtObject {
@@ -49,8 +49,7 @@ QtObject {
     /// **为什么必须在这里做**：Theme 单例是本文件第一个属性被读取时创建的，
     /// 也就是 Main.qml 实例化期间 —— 那时点开窗口还是本文件的默认值（蓝），
     /// 等 Python 在界面加载完再调 applyTheme()，首帧早就画出去了。
-    /// 于是肉眼能看到的顺序是：默认蓝渲染一帧 → 跳成配置的主题色
-    /// （实测反馈"打开软件的一瞬间搜索按钮是蓝色，再切到主题色"）。
+    /// 于是肉眼能看到的顺序是：默认蓝渲染一帧 → 跳成配置的主题色。
     /// 在单例创建的那一刻（早于首帧）赋初值就没有这一跳。
     ///
     /// 防御性写法同 NavIcon 读 iconsBaseUrl：单独加载本文件做预览 / 静态检查时
@@ -62,6 +61,10 @@ QtObject {
             dark = themeStartup.dark
         if (themeStartup.accent)
             accentSource = themeStartup.accent
+        // 海报宽度一并注入：它决定卡片与窗口首帧尺寸，晚一步就会看到
+        // "先按 200px 排好、再跳成配置宽度"（与主题色同一个坑）。
+        if (themeStartup.posterWidth)
+            posterWidth = themeStartup.posterWidth
     }
 
     function recalcAccent() {

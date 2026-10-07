@@ -54,8 +54,20 @@ class BangumiError(RuntimeError):
     """Bangumi API 业务异常。"""
 
 
+# 401/403 时给用户/日志看的那句话。**必须点明"过期"**：
+# 正确的动作只有一个：到设置页重新生成一个填进来。所以这句话必须把
+# **动作**说全，而不是把 requests 的原文
+# （`401 Client Error: Unauthorized for url: ...`）直接甩出来 ——
+# 那串东西看不出"该去换 Token"。
+TOKEN_EXPIRED_HINT = "Token 已过期或无效（请到设置页重新填写 Access Token）"
+
+# 读接口（拉收藏 / 逐集记录）专用的那句：除了换 Token，还得勾权限。
+TOKEN_EXPIRED_READ_HINT = (
+    "Token 已过期或无效（请到设置页重新生成，并勾选「读取收藏」权限）")
+
+
 class BangumiAuthError(BangumiError):
-    """Token 无效或权限不足（401/403）。"""
+    """Token 已过期 / 无效 / 权限不足（401/403）。"""
 
 
 class BangumiNotFound(BangumiError):
@@ -75,10 +87,7 @@ class BangumiNotFound(BangumiError):
 def describe_connection_error(exc: Exception) -> str:
     """把连接类异常翻译成一句**能照着做**的提示；认不出来时返回空串。
 
-    为什么需要它：`bgm.tv` 在国内网络下会被 **DNS 污染 + SNI 阻断**
-    （2026-09 实测：DNS 返回 Dropbox / Facebook 段的随机 IP，且每次查询
-    都不同；改用真实 IP 直连时 TLS 握手被 RST，而同一个 IP 换成别的域名
-    能正常返回 200）。这类故障在日志里是一长串 urllib3 堆栈，
+    `bgm.tv` 在国内网络下会被 **DNS 污染 + SNI 阻断**。这类故障在日志里是一长串 urllib3 堆栈，
     原样丢到状态栏只会让人以为"软件坏了"，而实际该做的是**开代理**。
 
     因此按症状分类。**只给症状，不给动作** —— 具体该怎么办取决于
@@ -113,7 +122,7 @@ def is_server_side_error(exc: Exception) -> bool:
     """这个失败是不是**服务端**的问题（请求已到达服务器，只是它返回了 5xx）。
 
     用来决定提示里要不要追加"检查代理"：服务端故障时流量明明通了，
-    再让用户去查代理/换节点只会误导（实测踩过）。
+    再让用户去查代理/换节点只会误导。
     """
     text = str(exc)
     if re.search(r"too many \d{3} error responses", text):
@@ -134,7 +143,7 @@ MIN_ALIAS_LEN = 3
 def extract_aliases(subject: dict) -> list[str]:
     """从 Bangumi subject 响应的 `infobox` 里取出所有别名。
 
-    **为什么需要它（实测）**：`score_subject()` 对"名称完全不相关"的候选
+    `score_subject()` 对"名称完全不相关"的候选
     直接一票否决，而它原先只看 `name_cn` / `name` 两个字段。像
     「未闻花名」这种**本地文件夹用俗称、Bangumi 用全名**的场景：
 
@@ -146,7 +155,7 @@ def extract_aliases(subject: dict) -> list[str]:
     而别名信息**本来就在搜索结果里**（`POST /v0/search/subjects` 的每条
     data 都带 `infobox`），零额外请求，只是从没被读过。
 
-    infobox 结构（实测）：
+    infobox 结构：
         [
           {"key": "中文名", "value": "我们仍未知道那天所看见的花的名字。"},
           {"key": "别名",   "value": [{"v": "Anohana: The Flower..."},
@@ -336,9 +345,7 @@ _STUDIO_LOOKUP: dict[str, str] = {
 }
 
 #: 合作署名里常见的分隔符：「WIT STUDIO×CloverWorks」「A、B」。
-#: **全角也要收**（`＆` U+FF06、`／` U+FF2F）—— 实测有条目写的是
-#: `クラウドハーツ＆横浜アニメーションラボ`，只按半角 `&` 拆就整串认不出来，
-#: 连本来在词表里的「横浜アニメーションラボ」也跟着漏掉。
+#: **全角也要收**（`＆` U+FF06、`／` U+FF2F）
 _STUDIO_SPLIT = re.compile(r"[×✕✗&＆+＋/／、,，;；]|\s+x\s+")
 
 
@@ -444,11 +451,6 @@ class BangumiClient:
         proxy: str = "",
         user_agent: str = USER_AGENT,   # 合规 UA 见 app/__init__.py 的说明
         # 单次请求的超时（连接 + 读取）。
-        #
-        # **从 10 秒降到 6 秒**（实测反馈"超时时间有点长"）：
-        # 真实可用的链路（哪怕走代理绕一圈）通常 1~3 秒内就能建连，6 秒
-        # 足够；连不上时大概率是"被阻断 / 代理没生效"，多等 4 秒也不会变通。
-        # 配合下面的重试次数下调，最坏等待从约 60 秒缩到约 15 秒。
         timeout: float = 6.0,
         fast_probe: bool = False,
         # 配置里的「用户 ID」—— 即 `/v0/me` 的 `username` 字段（**不是昵称**）。
@@ -473,7 +475,7 @@ class BangumiClient:
         self.session = requests.Session()
         # **fast_probe：给"交互式探测"用的快速模式**（设置页「检测」按钮）。
         #
-        # 为什么需要（实测踩坑）：默认的重试策略是 `total=3, connect=3`，
+        # 默认的重试策略是 `total=3, connect=3`，
         # 即连接超时会被重试 **4 次** —— 单次 10s 超时下总共要等约 40 秒。
         # 后台批量任务能忍受（它只是慢），但用户点一下「检测」按钮却要
         # 盯着转圈 40 秒，体感就是"卡死"。探测场景**不需要重试**：
@@ -486,7 +488,7 @@ class BangumiClient:
                 allowed_methods=frozenset(["GET"]),
             )
         else:
-            # **连接重试从 3 次降到 1 次**（实测反馈"超时太长"）：
+            # **连接重试从 3 次降到 1 次**：
             # 原策略 `connect=3` = 连接不通时重试 3 次（共 4 次尝试），
             # 单次 6s 超时下最坏也要约 24 秒才报错 —— 而"连不上"这种失败
             # 重试几乎不会改变结论（实测日志里三次全是同一个 ConnectTimeout）。
@@ -540,10 +542,9 @@ class BangumiClient:
         except requests.HTTPError as e:
             status = getattr(e.response, "status_code", 0)
             if status in (401, 403):
-                log.warning("Bangumi GET %s 权限不足: %s%s", url, status, label)
-                raise BangumiAuthError(
-                    "Token 无效或权限不足（请重新生成 Token 并勾选读取收藏）"
-                ) from e
+                log.warning("Bangumi GET %s 鉴权失败（Token 已过期或无效）: "
+                            "%s%s", url, status, label)
+                raise BangumiAuthError(TOKEN_EXPIRED_READ_HINT) from e
             if status >= 500:
                 # 单个 5xx（没走重试路径时）：同样是服务端的问题，
                 # 不要让它显示成"网络错误"而把用户引去查代理
@@ -581,6 +582,8 @@ class BangumiClient:
             resp.raise_for_status()
             return resp.json() if resp.content else {}
         except requests.RequestException as e:
+            if self._auth_status(e):
+                raise self._auth_error("PATCH", url, label, e)
             log.warning("Bangumi PATCH %s 失败%s: %s", url, label, e)
             raise BangumiError(self._network_hint(e, url)) from e
 
@@ -593,13 +596,34 @@ class BangumiClient:
             resp.raise_for_status()
             return resp.json() if resp.content else {}
         except requests.RequestException as e:
+            if self._auth_status(e):
+                raise self._auth_error("POST", url, label, e)
             log.warning("Bangumi POST %s 失败%s: %s", url, label, e)
             raise BangumiError(self._network_hint(e, url)) from e
+
+    # 写接口的 401/403 必须和读接口一样分类成 `BangumiAuthError`：
+    # 原先它们只抛一个普通的 `BangumiError`，里面裹着 requests 的原文
+    #     Bangumi PATCH .../episodes 失败: 401 Client Error: Unauthorized for url: ...
+    # 于是调用方只能把它当成"网络类失败"处理 —— 「补传」告诉用户
+    # "可再点一次只补失败的"（Token 都过期了，点一百次也一样 ✗），
+    # 播放监控告诉用户"可用「上传」补齐"（同上 ✗）。分不开类就只能误报。
+    @staticmethod
+    def _auth_status(e: Exception) -> bool:
+        """这个 HTTP 错误是不是鉴权类的（401/403）。"""
+        return getattr(getattr(e, "response", None), "status_code", 0) in (401, 403)
+
+    @staticmethod
+    def _auth_error(method: str, url: str, label: str,
+                    e: Exception) -> BangumiAuthError:
+        """记一条能直接照着做的日志，并造出对应的异常。"""
+        log.warning("Bangumi %s %s 鉴权失败（Token 已过期或无效，"
+                    "请到设置页重新填写）: %s%s", method, url, label, e)
+        return BangumiAuthError(TOKEN_EXPIRED_HINT)
 
     def _network_hint(self, exc: Exception, url: str) -> str:
         """连接失败的用户可读提示，并补一句"流量到底走没走代理"。
 
-        **为什么要补这一句（实测踩坑）**：用户看到网络错误后，跑去代理客户端
+        用户看到网络错误后，跑去代理客户端
         里**反复换节点**，但问题根本不在节点 —— 代理客户端的**分流规则**把
         `bgm.tv` 判给了直连（它是国内域名，常被国内规则集收录），于是
         流量压根没进隧道，换哪个节点都一样。不点明这一点，用户会在错误的
@@ -626,9 +650,6 @@ class BangumiClient:
             # 去掉 scheme 少占几个字符（状态栏是单行，右端会被省略号截断）
             shown = addr.split("://")[-1]
             hint += f" —— 已走代理 {shown}"
-        # **不再补"未检测到代理，请去设置里填"**（实测反馈：用户只是询问
-        # 这一栏的作用，不需要它出现在报错里）。而且那句话本身有误导性 ——
-        # 开着 clash 系统代理时压根不用填（requests 会自动读系统代理）。
         # 这里只说清"是什么错"，具体怎么配代理交给文档与设置页说明。
         return hint
 
@@ -636,7 +657,7 @@ class BangumiClient:
     def search_subjects(self, keyword: str, limit: int = 10) -> list[dict]:
         """POST /v0/search/subjects。type=2 限定动画。
 
-        **返回的每条都带 `infobox`**（实测），其中「别名」行就是我们要的
+        **返回的每条都带 `infobox`**，其中「别名」行就是我们要的
         别名列表 —— 见模块级 `extract_aliases()`。**零额外请求**。
         """
         body = {"keyword": keyword, "filter": {"type": [2]}}
@@ -653,12 +674,10 @@ class BangumiClient:
     def studio_from_persons(self, subject_id: int) -> str:
         """`GET /v0/subjects/{id}/persons` → 动画制作公司；取不到返回空串。
 
-        **为什么还要这个端点**（踩坑记录）：infobox 里那一行 `动画制作`
-        **只有一部分条目有** —— 实测 冰菓（27364）的 v0 infobox 42 行里
-        压根没有「动画制作」（只有 `製作` = 制作委员会）。而 Bangumi 网页
+        infobox 里那一行 `动画制作`**只有一部分条目有**。而 Bangumi 网页
         左栏显示的「动画制作: 京都アニメーション」来自**制作人员**这份数据，
         它只在这个端点里（`relation == "动画制作"`，`type=2` 表示公司）。
-        只读 infobox 的话，覆盖率约三分之一，冰菓这种名作反而漏掉。
+        只读 infobox 的话，覆盖率约三分之一，名作反而漏掉。
 
         多个公司（合作署名）用 ` / ` 连接，与 infobox 那条路保持一致。
         """
@@ -750,7 +769,7 @@ class BangumiClient:
     def mark_episode_watched(self, subject_id: int, episode_id: int) -> bool:
         """把一集标记为「看过」（`type=2`）。
 
-        **踩坑（方法写错，2026-09 实测）**：端点路径与请求体早期就写对了，
+        端点路径与请求体早期就写对了，
         但方法写成了 **`POST`** ✗ —— 服务端返回
         **404 `{"title":"Not Found","details":{"path":...}}`**，
         这是"**路径/方法不存在**"（和"资源不存在"不是一回事 ✗），
@@ -772,9 +791,7 @@ class BangumiClient:
 
         端点：`GET /v0/users/{username}/collections/{subject_id}`
 
-        **路径里必须用真实 username，不能用 `-`**（2026-10-03 实测踩坑，
-        这是详情页"回查收藏状态"永远回 404、本地明明收藏了却显示未收藏的
-        根因）：`-`（"当前 Token 对应用户"）这个占位符 Bangumi 只在**部分
+        **路径里必须用真实 username，不能用 `-`**：`-`（"当前 Token 对应用户"）这个占位符 Bangumi 只在**部分
         路由**上实现，同一个 `/collections/{subject_id}` 路径下两个方法的
         表现恰好相反 ——
 
@@ -784,8 +801,7 @@ class BangumiClient:
             POST /v0/users/-/collections/506677          → 400（路由存在，只是 body 不合法）
             POST /v0/users/933287/collections/506677     → 404 ❌（**写不能用 username**）
 
-        即：**这个路径 GET 认 username、POST 只认 `-`**，不能凭"同族接口
-        一样"推断（原先两处都写 `-`，写那边蒙对了，读那边一直错）。
+        即：**这个路径 GET 认 username、POST 只认 `-`**，不能凭"同族接口一样"推断。
 
         "未收藏"就是 404（官方语义），所以这里吞掉 BangumiNotFound 返回
         None；**其它错误照抛** —— 调用方要能区分"确实没收藏"与"没查成"，
@@ -807,8 +823,7 @@ class BangumiClient:
                  body {"type": <int 1~5>}
 
         **为什么用 POST 而不是 PATCH**：与集级收藏（`mark_episode_watched`
-        用 PATCH）不同，条目级这个端点在 spec 里就是 POST —— 早期实现里
-        集级那次错写成 POST 报了 404（见那里踩坑记录），所以要按端点各查
+        用 PATCH）不同，条目级这个端点在 spec 里就是 POST ，所以要按端点各查
         一次，不能凭"同族接口方法一样"推断。POST 是幂等的：条目还没收藏
         时它会新建收藏行，已收藏时更新 type。
 
@@ -820,8 +835,7 @@ class BangumiClient:
 
         **这里的 `-` 是对的，别顺手"统一"成 username**：同一个
         `/v0/users/{x}/collections/{subject_id}` 路径，GET 只认真实
-        username、**POST 只认 `-`**（换成 username 会 404）。实测数据见
-        `get_collection` 的注释。
+        username、**POST 只认 `-`**（换成 username 会 404）。
         """
         if collect_type not in COLLECT_TYPE_NAMES:
             raise ValueError(f"非法的收藏状态：{collect_type}")
@@ -836,9 +850,8 @@ class BangumiClient:
         """当前 Token 对应用户的 `username`（路径参数用），带缓存。
 
         **要的是 `username` 而不是昵称**：接口路径里的那个值是账号的
-        `username` 字段（实测可能就是纯数字 ID，如 `933287`），而界面上
-        显示的是 `nickname` —— 拿昵称去请求会 404「用户不存在」（与
-        `inprogress._FetchWorker` 里同一条踩坑记录）。
+        `username` 字段，而界面上
+        显示的是 `nickname` —— 拿昵称去请求会 404「用户不存在」。
 
         解析顺序与那边一致（先权威、后配置）：`/v0/me` 优先，失败才退回
         配置值；两者都拿不到就抛错。**每次进程只解析一次**（缓存结果），
@@ -860,18 +873,13 @@ class BangumiClient:
 
     def get_me(self) -> Optional[dict]:
         """GET /v0/me，用 Token 解析当前用户（未配置 username 时使用）。
-
-        **失败原因必须分类记日志**：早期这里把两类失败写成同一句
-        「Token 可能无效」，而实际上一半的情况（5xx / 连接失败）请求
-        根本没到鉴权环节 —— 实测让用户以为 Token 坏了，跑去重新生成
-        （Token 一直是好的）。判据很硬：只有 401/403 才与 Token 有关。
         """
         try:
             data = self._get("/v0/me")
             return data if isinstance(data, dict) else None
         except BangumiAuthError as e:
             # 401/403：这才是 Token 本身的问题
-            log.warning("解析当前用户失败（Token 无效或权限不足）: %s", e)
+            log.warning("解析当前用户失败（Token 已过期或无效）: %s", e)
             return None
         except BangumiError as e:
             # 5xx / 连接失败：与 Token 无关，别让用户去重新生成
@@ -970,15 +978,9 @@ class BangumiClient:
               "updated_at": 1786707528 # 该集被标记「看过」的时间（Unix 秒）
             }
 
-        **注意（实测记录，两次结论不同）**：
-        - 早期实测：服务端**未填充** `updated_at`，多部动漫（含 11/24/25 集的
-          条目）全部返回 0 —— 因此不能直接拿它当观看时间。
-        - 2026-09-19 复查：当前数据里该字段**是有值的**（本账号 30/30 行都与
-          收藏级时间不同，精确到秒），走的是真实单集时间戳。
-
         结论：**保留两级兜底**（单集 `updated_at` → 动漫收藏级 `updated_at`），
         见 `bridges/inprogress.py`。真实时间戳缺失时若没有兜底，整批记录
-        会因"无时间"被丢弃（早期版本正是如此，表现为动态页一片空白）。
+        会因"无时间"被丢弃。
         """
         out: list[dict] = []
         offset = 0

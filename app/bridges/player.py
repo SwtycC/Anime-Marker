@@ -286,6 +286,32 @@ class PlayerBridge(QObject):
         self._launch_pool.start(_LaunchWorker(self, ep.id, ep.file_path, launcher))
         return True
 
+    @Slot(str, int, int, str)
+    def logNextEpisodeClick(self, subject_title: str, subject_id: int,
+                            episode_id: int, hint: str) -> None:
+        """记录「在看」页点的是**哪一部**的「下一集」，以及那一集播不播得了。
+
+        **为什么绕到 Python 来记**：QML 里只有 `console.log`，而本应用没装
+        QtMessageHandler —— 那些输出只落在 stderr，**不进日志文件**。排查
+        "下一集播错集 / 点了没反应"时最需要的就是"哪一部、目标第几集"，
+        还得和 `LibraryBridge._next_episode` 里那几条带 `subject_id` 的记录
+        对得上，所以在那里记没用，得在这里。
+
+        `episode_id == 0` 表示算不出可播的下一集，`hint` 就是状态栏上显示
+        的那句原因（未入库 / 本地已看到最新 / 集号异常）—— 一并记下来，
+        用户说"点了没反应"时才不用猜是哪种。
+        """
+        name = subject_title or "（未命名条目）"
+        # 没入库的行 subject_id 是 0，这时不写「本地条目 0」（没意义，
+        # 而且后面那句原因本来就写着「未入库」）
+        who = f"（本地条目 {subject_id}）" if subject_id > 0 else ""
+        if episode_id > 0:
+            log.info("点击「下一集」：%s%s → episode_id=%s",
+                     name, who, episode_id)
+        else:
+            log.info("点击「下一集」：%s%s → 无可播放的下一集：%s",
+                     name, who, hint or "未给出原因")
+
     @Slot(int, str)
     def _on_launch_finished(self, episode_id: int, error: str) -> None:
         """启动链的收尾（**在主线程执行**，见 _LaunchWorker 的说明）。
