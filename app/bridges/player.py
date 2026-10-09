@@ -402,6 +402,25 @@ class PlayerBridge(QObject):
         if ep is not None:
             self._monitor.maybe_complete_subject(ep.subject_id)
 
+    @Slot("QVariantList")
+    def recheckAutoComplete(self, subject_ids: list) -> None:
+        """对这些条目重跑一次「整部看完 → 看过」的判定（本地条目 id 列表）。
+
+        唯一调用方是「动态页 → 上传」补传成功之后的钩子（`QmlApp` 把它接到
+        `InProgressBridge.set_upload_done_hook`）。为什么要它：`maybe_complete_subject`
+        现在有一道闸 —— **还有集没传到 Bangumi 就不改「看过」**（见那里），
+        而补传成功正是那道闸的放行时刻；但没有它就没有第二次触发点
+        （触发点是"看完一集"，那集早就看完了），条目会一直卡在「在看」✗。
+
+        判定口径仍然只在 `ProgressMonitor.maybe_complete_subject` 一处
+        （这里只负责转交 + 兜异常），别在这儿另写一套条件。
+        """
+        for sid in subject_ids or []:
+            try:
+                self._monitor.maybe_complete_subject(int(sid))
+            except Exception as e:      # pragma: no cover - 防御性
+                log.exception("回查「自动完结」失败 subject_id=%s: %s", sid, e)
+
     # ---------- 内部 ----------
     def _resolve_subject_name(self, subject_id: int) -> str:
         """查该集所属动漫的显示名（中文名优先，退回原名）。

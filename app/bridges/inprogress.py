@@ -789,6 +789,8 @@ class InProgressBridge(QObject):
         self._ui_refresh_pending = False
         # 拉取成功后由 QmlApp 接上，用来刷新 QML 的 library.inProgress
         self._done_hook = None
+        # 补传成功后由 QmlApp 接上（通常是 PlayerBridge.recheckAutoComplete）
+        self._upload_done_hook = None
         # 集级记录拉完后额外通知（让动态页重算）
         self._ep_done_hook = None
 
@@ -803,6 +805,19 @@ class InProgressBridge(QObject):
     def set_episode_done_hook(self, hook) -> None:
         """设置集级记录拉完后的回调（通常是 library.reloadWatchedEpisodes）。"""
         self._ep_done_hook = hook
+
+    def set_upload_done_hook(self, hook) -> None:
+        """设置「补传成功」后的回调，参数是本次补传涉及的**本地条目 id 列表**。
+
+        用途：这次补上传的几集里可能就有那部番的**最后几集** —— 补完之后
+        「整部看过」才第一次成立，而「自动完结」（`ProgressMonitor.
+        maybe_complete_subject`）那道闸（还有集没上传就不改「看过」）需要有个人
+        在**这一刻**回来再问一次。否则它再也不会被触发：触发点是"看完一集"，
+        而这集早就看完了，条目会一直卡在「在看」✗。
+
+        回调整批传而不是逐条调：判定只是两条 SQL，一次传完省得每部各发一次。
+        """
+        self._upload_done_hook = hook
 
     # ---------- 状态 ----------
     @Property(bool, notify=runningChanged)
@@ -1201,15 +1216,61 @@ class InProgressBridge(QObject):
             except Exception as e:
                 log.warning("写回本地失败（不影响上传，下次同步会补上）: %s", e)
 
-        # ---- 2. 再让这些条目的集级记录重新同步一次（水位数对不上，拉一次校正）----
+        # ---- 1b. **不要**去改 `inprogress_cache.ep_status`----
+        #
+        # 曾经在这里把刚补传的集号写进缓存那一列，想让「在看」页的"已看 N 集"
+        # 立刻涨上去。**是错的**：那一列的语义是 Bangumi 的 `ep_status`
+        # = **本季第几集**（1~total_eps），而 `_upload_meta["ep_index"]` 是扫描
+        # 写入的**全系列累计集号** —— 史莱姆第四季本地是 `[S4][01_73]`…
+        # `[21_93]`、`total_eps` 却只有 24，补传第 95 集就把 95 写进了那一列，
+        # 页面显示成 **"95 / 24 集"**（实测 2026-10-08，库里的行还在）。
+        # `LibraryBridge._load_inprogress` 那道"本地集号 > 本季集数就不采信"的
+        # 闸门只守**本地那一侧**（它读 `episodes` 表）；缓存这一侧的值被当成
+        # 服务端真值原样上屏，拦不住 ✗ —— 两种编号必须分开放，别混进同一列。
+        #
+        # 而且它**本来就不需要**：在看页的进度取 `max(缓存 ep_status, 本地
+        # max_watched_ep_index)`，而补传的那些集在上传**之前**就已经是本地
+        # `watched=1`（否则根本进不了待传清单）—— 那个数早就是对的，
+        # 缺的只是下面那一次刷新。真正要修的是"页面不重算"，不是"数据不对"。
+        #
+        # 顺带一提，它还会刷新 `updated_at`，把 `inprogress_cache_age()` 的 TTL
+        # 一起往后推 —— **推迟**下一次从 Bangumi 拉全量的自我纠正，越帮越乱。
         touched = set((uploaded or {}).keys())
+
+        # ---- 2. 再让这些条目的集级记录重新同步一次（水位数对不上，拉一次校正）----
         try:
             for bid in touched:
                 self._db.clear_ep_sync_state_for(int(bid))
             if touched:
+                # 动态页：集级记录变了
                 self._refresh_ep_view()
+                # **在看页也要刷**（实测需求："在动态页补传后对在看页进行刷新，
+                # 否则数据不更新"）—— 这一页有两处会因为补传而变：
+                #   · "待上传 N 集"：`pending_uploads()` 的**现查结果**，刚传上去的
+                #     那几集已经从清单里消失了
+                #   · "已看 N 集"：取 `max(缓存, 本地已看最大集号)`（见上面 1b）
+                # 但界面读的是缓存 Property，没人发信号就不会重算。
+                self._refresh_library()
         except Exception as e:
             log.warning("补传后刷新集级记录失败（不影响补传）: %s", e)
+
+        # ---- 3. 补齐了最后几集的话，让「自动完结」回头再看一眼 ----
+        #
+        # 看完最后一集那一刻，这一集还是"本地看过、Bangumi 未标"，
+        # `ProgressMonitor.maybe_complete_subject` 会**故意不完结**（见那里的
+        # 闸门）；补传成功就是它放行的时刻。这里只把这个时刻告诉上层，
+        # 判定本身仍只在那一处（口径唯一）。
+        try:
+            sids: set[int] = set()
+            for ep_ids in (uploaded or {}).values():
+                for eid in (ep_ids or []):
+                    sid = (self._upload_meta.get(int(eid)) or {}).get("subject_id")
+                    if sid:
+                        sids.add(int(sid))
+            if sids and self._upload_done_hook is not None:
+                self._upload_done_hook(sorted(sids))
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("补传后回查「自动完结」失败（不影响补传）: %s", e)
         if aborted:
             # Token 被拒：**不能说"可再点一次"** —— 换 Token 之前点多少次
             # 都是同一个结果（这正是用户 2026-10-06 那次踩的坑：日志里

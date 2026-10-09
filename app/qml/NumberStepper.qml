@@ -184,11 +184,47 @@ Item {
                 enabled: root.enabled
                 activeFocusOnTab: root.enabled
 
-                onEditingFinished: root.commit()
+                // 允许鼠标拖选（默认 false，框里的字选不中）。
+                selectByMouse: true
+
+                // **聚焦时整段选中** —— 这是"手打能不能用"的关键。
+                //
+                // 不选中的话，点进来的光标落在**点击处**（点"8080"中间就是第 2 位），
+                // 于是敲的数字是**插进数字中间**而不是替换：8080 → 敲 9 → 80980 →
+                // 连敲变成 8012380 → 失焦提交时被 clamp 截到上限 65535。
+                // 用户看到的现象就是"打不进去，只能靠 ± 和退格"。
+                // 整段选中后：敲的第一个字符直接替换整个值（3.0 这种小数也能整段重打），
+                // 想局部改就**再点一下**——那时 activeFocus 没变、不触发这里，光标正常落位。
                 onActiveFocusChanged: {
-                    if (!activeFocus)
+                    if (activeFocus)
+                        selectAll()
+                    else
                         root.commit()
                 }
+
+                onEditingFinished: root.commit()
+            }
+
+            // 指针层：**数字框上的指针要像文本框一样是 I 字形**。
+            //
+            // 必须显式加这一层：**裸 `TextInput` 的指针是箭头**，不是 I 字形
+            // （`AppTextField` 同样是靠自己那层 MouseArea 才有的 I 字形）。
+            // 本组件原来没有这一层，所以数字框上的指针一直是箭头。
+            //
+            // 三条都要照抄，缺一不可：
+            //   - `acceptedButtons: Qt.NoButton` + `enabled: false`：不吃任何事件，
+            //     点击/拖选照常落到下层 TextInput；
+            //     只提供光标形状 —— **`cursorShape` 不受 `enabled` 约束**。
+            //   - `anchors.fill: parent` 铺满整个输入框（含左右内边距），
+            //     而不是只盖住文字那一小条。
+            //   - 禁用态给箭头，与 `AppTextField` 只读态给箭头保持一致 ——
+            //     这栏不能改，就不要暗示它能点。
+            MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                enabled: false
+                acceptedButtons: Qt.NoButton
+                cursorShape: root.enabled ? Qt.IBeamCursor : Qt.ArrowCursor
             }
         }
 

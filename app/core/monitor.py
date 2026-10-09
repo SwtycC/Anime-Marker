@@ -431,6 +431,21 @@ class ProgressMonitor(QObject):
             return
 
         name = subj.name_cn or subj.name or ""
+
+        # ---- 还有集没传到 Bangumi → 先不完结----
+        #
+        # 判据复用 `Database.pending_uploads()`（= 本地看过、Bangumi 未标），
+        # 与小窗里的数字、实际补传的筛选**是同一个查询**，不会分叉出第二套口径。
+        # 补齐之后有两条路会自动回来重问一次：
+        #   · `_on_sync_finished` —— 看完一集的自动上传成功；
+        #   · `InProgressBridge._on_upload_finished` —— 手动补传成功（钩子接回来）。
+        #
+        # **没 Token / 没匹配 Bangumi 时不设这道闸**：那时根本无处可传，
+        # 拦住只会让"看完自动标记"对离线用户永久失效
+        # （与"没 Token 时降级为本地可用"同一个原则）。
+        if self._can_upload(subj) and self._has_pending_upload(subject_id, name):
+            return
+
         # 1) 本地快照先落（见上：顺序说明）
         try:
             self.db.set_subject_collect_type(subject_id, 2)
@@ -450,6 +465,32 @@ class ProgressMonitor(QObject):
             return
         self._pool.start(_CompleteRunnable(
             self, int(subject_id), int(subj.bangumi_id), name))
+
+    def _can_upload(self, subj) -> bool:
+        """这一部此刻**有没有可能**把集级记录传上去（有 Token 且匹配了 Bangumi）。
+
+        问的是"有没有可能"而不是"上次传成功没有"：判据只取配置与匹配结果，
+        与网络此刻通不通无关 —— 断网只是"晚一点传"，那道闸照样要拦住「看过」
+        （见 `maybe_complete_subject`）。
+        """
+        if subj is None or not getattr(subj, "bangumi_id", 0):
+            return False
+        return bool(getattr(self.api, "has_token", False))
+
+    def _has_pending_upload(self, subject_id: int, name: str) -> bool:
+        """这一部有没有「本地看过、Bangumi 未标」的集；**查询失败按"有"处理**。
+
+        失败时按有处理（= 暂不完结）是保守的一侧：它只推迟一个自动动作，
+        用户仍可在详情页手动改状态；反过来（失败就当已传完）会静默造成
+        "Bangumi 上还在看、本地已成看过"的分叉 —— 那正是这次要修的毛病。
+        """
+        try:
+            return bool(self.db.pending_uploads([int(subject_id)])
+                        .get(int(subject_id)))
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("统计待上传集失败（按「还有」处理，暂不完结）"
+                        " %s subject_id=%s: %s", name, subject_id, e)
+            return True
 
     @Slot(int, str, str)
     def _on_complete_finished(self, subject_id: int, name: str,
@@ -594,3 +635,11 @@ class ProgressMonitor(QObject):
         except Exception as e:
             log.warning("让条目 %s 的集级记录重新同步失败（不影响标记）: %s",
                         bangumi_id, e)
+
+        # ---- 回头补一次「自动完结」判定 ----
+        #
+        # 这就是 `maybe_complete_subject` 那道闸放行的时刻：看完最后一集时
+        # 这一集还是"本地看过、Bangumi 未标"（PATCH 还在路上），闸拦住了；
+        # 现在它已经在 Bangumi 上了（`watched_episodes` 刚写回），条件成立。
+        # 放在最后而不是写回之前：判定读的正是上面刚写回的那一行。
+        self.maybe_complete_subject(int(ep.subject_id))

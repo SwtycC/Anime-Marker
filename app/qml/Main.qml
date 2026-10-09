@@ -27,7 +27,7 @@ ApplicationWindow {
     // **为什么不写死**（踩坑：启动瞬间下半截黑边）：窗口一旦 `visible: true`
     // 就会立刻渲染首帧，而 Python 侧改尺寸是在 QML 加载**之后**才做的。
     // 早期这里写死 1120×720、随后被改到 860 高，新长出来的那 140px
-    // 来不及绘制 → 下半截先显示为黑色（实测反馈："打开的一瞬间下半部分有黑边"）。
+    // 来不及绘制 → 下半截先显示为黑色。
     // 现在尺寸随主题一起在 load 之前注入，首帧就是最终尺寸。
     //
     // 兜底：注入缺失时（如组件被单独加载、或注入那段被误改）回退到
@@ -50,8 +50,7 @@ ApplicationWindow {
 
     // 窗口底色。
     // 注意：ApplicationWindow 的 `color` 只影响 window 自身，其 contentItem
-    // 仍可能带默认浅色背景 —— 表现在**滚动条透明轨道区域**会透出浅灰
-    // （实测右边缘像素 #f3f3f3，视觉上是深色界面右侧一条白边）。
+    // 仍可能带默认浅色背景 —— 表现在**滚动条透明轨道区域**会透出浅灰。
     // 因此再给 `background` 显式铺一层同色底（background 位于 contentItem 之下）。
     color: Theme.windowBg
     background: Rectangle { color: Theme.windowBg }
@@ -65,7 +64,7 @@ ApplicationWindow {
     // pageStack 的平级页。所以"返回"要恢复**两处位置**：
     //   内层 browseStack → 0（回到海报墙那一格）
     //   外层 currentPage → 当初进来的那一页
-    // 早期只写了内层，于是无论从哪进详情，退出后都落到海报墙（实测反馈）。
+    // 早期只写了内层，于是无论从哪进详情，退出后都落到海报墙。
     //
     // 入口处统一写 `detailOriginPage = window.currentPage`（而不是写死 0/1/2），
     // 这样以后新增入口也不用改返回逻辑。
@@ -84,7 +83,7 @@ ApplicationWindow {
         //     browseStack.currentIndex = 1
         // 是**完全没有反应**的 —— 外层还停在原来的页面，内层切到哪都看不见。
         // 海报墙不受影响（外层本来就在 browseStack 上），所以这个 bug 只在
-        // "从动态页 / 收藏页进详情"时暴露（实测反馈："入库的动漫点击没反应"）。
+        // "从动态页 / 收藏页进详情"时暴露。
         // 正确写法是两句一起写：
         //     browseStack.currentIndex = 1   // 内层：显示详情页
         //     window.currentPage = 0         // 外层：切回 browseStack 所在的那一层
@@ -634,8 +633,23 @@ ApplicationWindow {
     // 鼠标后侧键（XButton1）= "返回上一层"，两处语义：
     //   详情页       → 回到进来的那一页（同 onBackRequested）
     //   海报墙 · 搜索中 → 退出搜索，回到整墙（同浏览器的"返回"退出搜索页）
+    //
+    // **`z: -1` 是必须的，别删**：
+    // 这是个铺满整窗的 MouseArea，而**铺满全窗口的 MouseArea 会把整个窗口的
+    // 指针都压成箭头** —— 它自己没写 `cursorShape`，默认 `Qt.ArrowCursor` 就成
+    // 了"最上层那个设了光标的控件"，于是**下层所有控件**的 cursorShape 全部失效：
+    // 文本框不显示 I 字形、按钮不显示手形，全应用一律箭头。
+    // 关键：**`enabled: false` 挡不住这件事** —— 光标形状不受 enabled 约束，
+    // 之前它靠 `enabled: onDetail || onWallSearch` 在设置页关掉，照样压着。
+    //
+    // 垫到最下层（z: -1）即可：页面里的控件先收事件，没人要的按键才落到这里 ——
+    // 后侧键全应用只有这一处在收（唯一的例外是 `AppTextField` 只读态的
+    // `Qt.AllButtons` 层，只覆盖只读输入框那一小块），所以语义没有变化。
+    // 试过改用 `Item + TapHandler` 代替（它不设光标），但那样**左键/右键都透不
+    // 下去了**，不能用。
     MouseArea {
         anchors.fill: parent
+        z: -1
         acceptedButtons: Qt.BackButton
 
         readonly property bool onDetail: window.currentPage === 0
@@ -687,7 +701,7 @@ ApplicationWindow {
 
         // 入场淡入：用 NumberAnimation 主动播放，而不是
         // `opacity: 0` + `Component.onCompleted: opacity = 1` ——
-        // 后者在窗口尚未显示时完成，且赋值会破坏绑定，实测停在 0 导致整条导航不可见。
+        // 后者在窗口尚未显示时完成，且赋值会破坏绑定，停在 0 导致整条导航不可见。
         opacity: 1
         NumberAnimation on opacity {
             from: 0
@@ -1008,7 +1022,7 @@ ApplicationWindow {
         readonly property int _topMargin: 14
         // 最多同时显示几条（超出时挤掉最旧的，避免刷屏盖满上半屏）
         readonly property int _maxItems: 3
-        // 各条的停留时长：**统一 5 秒**（实测反馈"两个提示框时间都改为 5s"）。
+        // 各条的停留时长：**统一 5 秒**。
         //
         // 早先琥珀警告给了 8 秒（理由是"要用户去看"），但实际用起来：
         // 网络失败时黄条与"扫描完成"同时出现，黄条赖着不走会挡住后面的

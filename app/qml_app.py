@@ -146,6 +146,11 @@ class QmlApp:
         # 集级观看记录（第二阶段）拉完后，刷新动态页数据源
         self.inprogress_bridge.set_episode_done_hook(
             self.library_bridge.reloadWatchedEpisodes)
+        # 补传成功后再问一次「整部看完 → 看过」：那道闸要求"集都传上去了"
+        # 才肯完结（见 ProgressMonitor.maybe_complete_subject），补传正是它
+        # 放行的时刻 —— 没有这条线，补完最后几集的番会一直卡在「在看」。
+        self.inprogress_bridge.set_upload_done_hook(
+            self.player_bridge.recheckAutoComplete)
         # 订阅桥接也需要 config（抓 RSS 的代理/UA）与 api（「从订阅源新建条目」
         # 时匹配 Bangumi）—— 早期只传 db，因为当时只做订阅源管理。
         self.rss_bridge = RssBridge(self.db, self.config, self.api)

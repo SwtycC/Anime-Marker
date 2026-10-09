@@ -1981,6 +1981,15 @@ class Database:
             )
             return len(rows)
 
+    # 注：曾经有过一个 `bump_cached_ep_status()`（补传后把集号写进
+    # `inprogress_cache.ep_status` 好让「在看」页立刻涨一集），**已删除**。
+    # 那一列的语义是 Bangumi 的 `ep_status` = **本季第几集**，而上传元数据里的
+    # `ep_index` 是**全系列累计集号** —— 史莱姆第四季（本地 73~96、`total_eps`
+    # 24）补传第 95 集就把 "95" 写进去，页面显示成 "95 / 24 集"。
+    # 而且根本没必要：那一页的进度取 `max(缓存, 本地已看最大
+    # 集号)`，补传的集在上传前就是本地 `watched=1` 了；要修的是"页面不重算"，
+    # 见 `InProgressBridge._on_upload_finished` 的 1b 说明。
+
     def watched_episode_ids(self, bangumi_id: int) -> set[int]:
         """该条目在 **Bangumi 上已标记「看过」** 的集 ID 集合。
 
@@ -2202,8 +2211,7 @@ class Database:
     def mark_download_scanned(self, record_id: int) -> None:
         """标记该下载记录**已因"下载完成"触发过自动扫描**（v14）。
 
-        **为什么要落库**：
-        见迁移 v14 的说明 —— 内存集合一重启就没了，而已下完的 qB 任务还在，
+        内存集合一重启就没了，而已下完的 qB 任务还在，
         于是每次启动都重扫一遍。这一列让它成为**跨会话**的事实。
 
         **只在"扫描真的发起了"之后调**（见 RssBridge._maybe_scan_completed）：

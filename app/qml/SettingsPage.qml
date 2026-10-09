@@ -59,8 +59,7 @@ Item {
         if (!w)
             return false
 
-        // **必须等到布局真正算完**（实测踩坑：第一次从详情页跳过来时
-        // 高亮框横向撑出页面、第二次起才正确）。
+        // **必须等到布局真正算完**。
         //
         // 本页平时被 StackLayout 藏着，点击浮条那一刻才把 visible 打开，
         // 此时 `FormRow` 的 `width: parent.width` 之类绑定**还没重新求值**
@@ -270,7 +269,14 @@ Item {
         v["scanner.extra_numbering"] = extraNumberingBox.checked
         // qBittorrent
         v["qbittorrent.host"] = qbHostField.text.trim() || "127.0.0.1"
-        v["qbittorrent.port"] = qbPortField.value
+        // 端口现在是**手打输入框**（不再是 NumberStepper），没有 min/max 兜底，
+        // 非法值得在这里拦住：非数字/空 → 回默认 8080（同上面 host 的写法），
+        // 越界 → 夹到 1..65535。注意提交的仍是**整数**（不是字符串）——
+        // _to_ini_text 会把整数值的浮点写成 "8080"，而字符串会原样写进去。
+        var port = parseInt(qbPortField.text.trim(), 10)
+        v["qbittorrent.port"] = isNaN(port)
+                                ? 8080
+                                : Math.min(65535, Math.max(1, port))
         v["qbittorrent.username"] = qbUserField.text.trim()
         v["qbittorrent.password"] = qbPassField.text
         // 按需启动（v14）：路径 + 开关
@@ -280,6 +286,20 @@ Item {
         v["rss.poll_on_start"] = rssPollOnStartBox.checked
         v["rss.poll_interval"] = rssPollField.value
         v["rss.auto_download"] = rssAutoBox.checked
+        // 界面 · 海报宽度
+        //
+        // **必须在这里补上**：这个键以前**只读不写** —— 字段的值
+        // 绑的是 `ui.poster_width`，白名单里也有它，但 collect() 从来不收集，
+        // 于是「改宽度 → 保存」什么也没写盘。后果有两个，都很像"没反应"：
+        //   ① 保存后 `save()` 会 `loadConfig()`，字段立刻被配置里的旧值
+        //      （200）刷回去；
+        //   ② 重开软件还是 200 —— 因为盘上从头到尾就是 200。
+        // 而 Python 侧 `_apply_saved_theme()` 是**从配置里读**这个值再灌给
+        // Theme 的，所以"点「保存」后立即重排"那句提示同样站不住。
+        //
+        // 不走「主题」那套即时保存（themeBridge）：主题是点一下就该变、没有
+        // "保存"语义；海报宽度要重排整个海报墙，按标签上写的**跟保存一起生效**。
+        v["ui.poster_width"] = posterWidthField.value
         return v
     }
 
@@ -318,7 +338,7 @@ Item {
         }
         root.detecting = true
         // **异步**：早期这里同步等返回值，网络超时（没开代理时必然超时）
-        // 会把界面卡死十几秒（实测反馈）。
+        // 会把界面卡死十几秒。
         // 结果由 inprogress.usernameResolved 信号回传，
         // 见下方 Connections。
         root._pendingToken = tokenField.text.trim()
@@ -730,7 +750,7 @@ Item {
                     }
                 }
 
-                // 「自动完结」（v15，实测需求）：在看页追的番，每集都看过后
+                // 「自动完结」（v15）：在看页追的番，每集都看过后
                 // 自动把条目本身也标成「看过」，有 Token 时同步到 Bangumi。
                 // 触发点在"某一集被标看过"之后（播放看完 / 详情页手动勾都算），
                 // 判定是"看到第 N 集 ≥ 官方正片数"，不是"本地文件全看过"
@@ -1127,17 +1147,23 @@ Item {
                     }
                 }
 
+                // 端口**不用 NumberStepper**（用户要求）：端口是个纯数字，
+                // 加减按钮在这里没用（1 步进从 8080 挪到 9090 要点 1000 下），
+                // 手打才是常态。样式与上面的「Web UI 地址」完全一致（同一个
+                // AppTextField），只是宽度只给够 5 位数的窄框。
+                //
+                // `selectAllOnFocus`：点进来整段选中，一敲即替换（同 NumberStepper，
+                // ）。取值与夹取在 collect() 里做。
                 FormRow {
                     width: parent.width
                     label: "Web UI 端口"
-                    NumberStepper {
+                    AppTextField {
                         id: qbPortField
-                        objectName: "qbPortField"
-                        value: root.getFloat("qbittorrent.port", 8080)
-                        minimum: 1
-                        maximum: 65535
-                        step: 1
-                        width: 160
+                        objectName: "qbPortField"     // 探针/诊断脚本按这个名字找，别改
+                        text: String(Math.round(root.getFloat("qbittorrent.port", 8080)))
+                        width: 120
+                        placeholder: "8080"
+                        selectAllOnFocus: true
                     }
                 }
 
@@ -1193,7 +1219,7 @@ Item {
                             text: root.getValue("qbittorrent.exe_path", "")
                             width: parent.width - browseQbExeBtn.width
                                     - Theme.spacingMd
-                            // 不写 placeholder 示例路径（实测要求"去除"）——
+                            // 不写 placeholder 示例路径——
                             // 点「浏览…」选即可，示例反而像已填的值
                             placeholder: "点击「浏览…」选择"
                         }

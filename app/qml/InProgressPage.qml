@@ -254,11 +254,40 @@ Item {
                                 }
                             }
 
-                            // 尾部：本地关联状态 / 详情按钮
+                            // 尾部：同步状态 / 本地关联状态 / 详情按钮
                             Row {
                                 id: tail
                                 anchors.verticalCenter: parent.verticalCenter
                                 spacing: Theme.spacingSm
+
+                                // 「未上传 N 集」：本地看过、Bangumi 上还没标的集数。
+                                //
+                                // **为什么必须有这个标记**：
+                                // 左侧的"已看 N 集"取 `max(缓存, 本地已看最大集号)`，
+                                // 所以它在**没上传成功**时也会往前走 —— 数字是对
+                                // （本地确实看了），但它只在本机成立；没有这个标记
+                                // 的话，用户看到进度涨了就会以为 Bangumi 那边也同步了 ✗。
+                                // 数值来自 `LibraryBridge._load_inprogress` 的
+                                // `pendingUpload`（= `Database.pending_uploads()`，
+                                // 与「上传」小窗、补传筛选同一个判据）。
+                                Rectangle {
+                                    objectName: "inprogressUploadPill"   // 诊断/探针用
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    visible: modelData.pendingUpload > 0
+                                    width: pendLabel.implicitWidth + Theme.spacingMd
+                                    height: 20
+                                    radius: Theme.radiusSm
+                                    color: Theme.warningSoft
+
+                                    Text {
+                                        id: pendLabel
+                                        objectName: "inprogressUploadPillText"
+                                        anchors.centerIn: parent
+                                        text: "未上传 " + modelData.pendingUpload + " 集"
+                                        color: Theme.warningColor
+                                        font.pixelSize: Theme.fontXs
+                                    }
+                                }
 
                                 Rectangle {
                                     anchors.verticalCenter: parent.verticalCenter

@@ -18,6 +18,14 @@ Rectangle {
     /// 光标形状也改回箭头，避免给出"可点"的错误暗示。
     property bool readOnly: false
 
+    /// 聚焦时把整段内容选中（默认关：其余调用处的行为不变）。
+    ///
+    /// 给**纯数字的短输入框**用（如「Web UI 端口」）：整段选中后敲的第一个字符直接替换整个值；想局部改
+    /// 再点一下即可（那时焦点没变、不会再全选）。
+    /// 同时打开 `selectByMouse`（允许拖选），否则框里的字只能用键盘选。
+    /// 与 `NumberStepper` 里的处理保持同一套手感。
+    property bool selectAllOnFocus: false
+
     signal accepted()
     signal edited()
 
@@ -44,6 +52,24 @@ Rectangle {
                   ? Theme.border
                   : (input.activeFocus ? Theme.accent : Theme.border)
 
+    /// 指针层：**I 字形就是靠这一层给的**（别把 cursorShape 写死成箭头）。
+    ///
+    /// **两条实测结论，之前这里的注释是错的，一并订正**：
+    ///   ① **裸 `TextInput` 的指针是箭头，不是 I 字形**。
+    ///      所以"去掉这里就恢复 TextInput 自带的 I 字形"不成立 —— 去掉就只剩箭头。
+    ///   ② `cursorShape` **不受 `enabled` 约束**：MouseArea 哪怕 `enabled: false`，
+    ///      指针划过它的区域时形状照样生效。所以这里可以放心地"可编辑时不参与
+    ///      事件（`acceptedButtons: Qt.NoButton`）+ 只给光标形状"。
+    /// 形状跟着 `readOnly` 走：可编辑 → I 字形；只读 → 箭头（这栏不能改，
+    /// 就别暗示能点），同时吃掉点击。
+    MouseArea {
+        anchors.fill: parent                    // 铺满整块，含左右内边距
+        hoverEnabled: true
+        // 可编辑时不参与事件（点击给 TextInput）；只读时吃掉点击
+        enabled: root.readOnly
+        acceptedButtons: root.readOnly ? Qt.AllButtons : Qt.NoButton
+        cursorShape: root.readOnly ? Qt.ArrowCursor : Qt.IBeamCursor
+    }
     Behavior on border.color { ColorAnimation { duration: Theme.durFast } }
 
     TextInput {
@@ -58,21 +84,23 @@ Rectangle {
         selectedTextColor: Theme.accentText
         echoMode: root.echoPassword ? TextInput.Password : TextInput.Normal
         clip: true
+        // 见 selectAllOnFocus 的说明（默认关，只有数字框开）
+        selectByMouse: root.selectAllOnFocus
+        onActiveFocusChanged: {
+            if (root.selectAllOnFocus && activeFocus)
+                selectAll()
+        }
         // readOnly 用 activeFocusOnPress 拦住"点一下就聚焦"；
         // 注意**不能用 enabled: false** —— 那样文字会整片变淡到几乎看不清，
         // 而这栏的内容（API 地址）恰恰是要让用户看清楚的。
         activeFocusOnPress: !root.readOnly
         readOnly: root.readOnly
+        // **不要在这里写 `cursorShape`**：那是 QtQuick.Controls 的 `TextField`
+        // 才有的属性，裸 `TextInput` 。指针形状全靠上面
+        // 那层铺满的 MouseArea 提供。
 
         onAccepted: root.accepted()
         onTextChanged: root.edited()
-
-        MouseArea {
-            // 只读时把点击吃掉，否则事件会穿透到下面的 TextInput
-            anchors.fill: parent
-            enabled: root.readOnly
-            cursorShape: Qt.ArrowCursor
-        }
 
         Text {
             anchors.fill: parent
