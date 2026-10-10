@@ -31,8 +31,7 @@ Window {
     readonly property var filteredSubjects: {
         // 一律用 `query`（用户在搜索框里打的那个词）过滤，**与
         // `showingPicked` 无关**：选中条目后框里显示的是条目名，但
-        // `query` 仍是上一轮的搜索词，列表因此保持那批结果不变
-        // （实测需求："选择后保持搜索上一轮输入的内容"）。
+        // `query` 仍是上一轮的搜索词，列表因此保持那批结果不变。
         var q = dlg.query
         if (q === "")
             return dlg.subjects
@@ -115,10 +114,10 @@ Window {
         includeField.text = source.mustInclude || ""
         excludeField.text = source.mustExclude || ""
         dlg.query = ""
-        dlg.selectedId = source.saveSubjectId || 0
-        // 上次存过保存位置就把条目名回填进框里 —— 否则每次打开都像
-        // "没指定过"（正是实测反馈的那个感觉）。回填时置 showingPicked，
-        // 让列表保持全量、不按这个名字过滤。
+        dlg.selectedId = dlg.pickOnOpen(source)
+        // 有保存位置（自己存过的、或从绑定条目回落来的）就把条目名回填进
+        // 框里 —— 否则每次打开都像"没指定过"。
+        // 回填时置 showingPicked，让列表保持全量、不按这个名字过滤。
         dlg.showingPicked = dlg.selectedId !== 0
         dlg.setTextProgrammatically(
             dlg.showingPicked ? dlg.selectedSubjectName : "")
@@ -127,7 +126,7 @@ Window {
         dlg.requestActivate()
         // 记一行"打开了哪个订阅的下载器"（后端从库读订阅名 + 绑定条目）。
         // 必须**在触发预览之前**：预览会抓一次 RSS 并打出一批"按规则过滤"
-        // 的日志，先记这行才能对上号（实测多订阅时那批日志无从归属）。
+        // 的日志，先记这行才能对上号。
         if (typeof rss !== "undefined" && rss)
             rss.logDownloaderOpened(dlg.sourceId)
         // 打开就算一次预览（让用户立刻看到当前规则的效果）
@@ -193,11 +192,34 @@ Window {
         return subj && (subj.folderPath || "") !== "" ? subj.folderPath : ""
     }
 
-    function selectedSubject() {
+    function subjectById(id) {
         for (var i = 0; i < dlg.subjects.length; i++)
-            if (dlg.subjects[i].id === dlg.selectedId)
+            if (dlg.subjects[i].id === id)
                 return dlg.subjects[i]
         return null
+    }
+
+    function selectedSubject() {
+        return dlg.subjectById(dlg.selectedId)
+    }
+
+    /// 打开弹窗时该预选哪个条目当保存位置。
+    ///
+    /// 优先用**上次保存过的保存位置**（`saveSubjectId`）；没有的话回落到
+    /// **订阅绑定的那个条目**（`localSubjectId`）—— 「绑定哪个就下到谁的
+    /// 目录」本来就是后端口径：`RssMatcher.plan_save_path` 第一件事就是
+    /// `save_subject_id or local_subject_id`。所以旧版界面会出现自相矛盾的
+    /// 一处：上面写着"未指定 —— 使用 qBittorrent 自己的保存路径"，后端却
+    /// 老老实实按绑定条目算路径、把文件下进那部番的目录。
+    ///
+    /// 回落到绑定条目前**先确认它还在库里**：绑定的条目可能已被删除，
+    /// 这时留 0（= 未指定），别让搜索框回填一个全库都查不到的名字。
+    function pickOnOpen(source) {
+        var saved = source.saveSubjectId || 0
+        if (saved !== 0)
+            return saved
+        var bound = source.localSubjectId || 0
+        return (bound !== 0 && dlg.subjectById(bound) !== null) ? bound : 0
     }
 
     function matches(item, q) {

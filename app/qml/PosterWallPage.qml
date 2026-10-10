@@ -115,7 +115,7 @@ Item {
     // 整个铺满页面、滚动时从搜索胶囊**下面**穿过去。
     // 早期写成"占一条顶部留白"（Flickable 从搜索栏下面开始）时，
     // 顶部那条带子永远是空的、且卡片会在带子下沿被硬生生裁断，
-    // 观感像一条隔断（实测反馈"那一长条白色要透明"）。
+    // 观感像一条隔断。
     // 首行的位置由 Flow 自己的顶部偏移留出（见下面的 _headerGap），
     // 所以静止时首行不会被胶囊压住，滚动时就正常从胶囊下面滑过。
     Item {
@@ -216,7 +216,7 @@ Item {
             //
             // Flow 自身**没有对齐属性**（不像 Row 有 layoutDirection），
             // 它总是从 x 开始左对齐排布。窗口宽度不是「列宽整数倍」时，
-            // 右侧会留下一条空白，视觉上整片网格偏左（实测明显）。
+            // 右侧会留下一条空白，视觉上整片网格偏左。
             //
             // 解决办法：算出这一行实际有几列，再把这行卡片的总宽度
             // 相对可用宽度居中，用 x 偏移补偿。Flow 内所有行共用同一个
@@ -264,6 +264,7 @@ Item {
                     title: modelData.title
                     coverUrl: modelData.coverUrl
                     matchState: modelData.matchState
+                    bangumiId: modelData.bangumiId || 0
                     posterWidth: Theme.posterWidth
 
                     meta: root.buildMeta(modelData)
@@ -373,11 +374,6 @@ Item {
         objectName: "backToTopButton"      // 诊断/探针用
         z: 2                               // 高于 headerBox(1)，与导航同层
         // 出现阈值：**只要往下滚过一点点就出现**。
-        //
-        // 原先是 `> pagePadding * 2`（48px），实测反馈"出现得有点慢" ——
-        // 用户滚过一两行卡片才见到按钮，感觉像"没及时响应"。
-        // 现在降到 16px：轻微下滑即出现（仍不是 0，避免在顶部边缘时
-        // 因惯性回弹反复闪烁）。
         visible: flick.contentY > 16
         opacity: visible ? 1 : 0
         // 淡入用 durFast（更"跟手"）；淡出仍走 durNormal，避免刚回顶就
@@ -477,11 +473,16 @@ Item {
     function facetMatches(item) {
         if (!root.hasFacetFilter)
             return true
-        // 状态：已匹配 = auto / manual（都关联到了 Bangumi 条目），
-        // 未匹配 = pending（扫描时没匹配上，卡片上有「待匹配」角标）
-        if (root.stateFilter === "matched" && item.matchState === "pending")
+        // 状态：**按"这条到底连没连上 Bangumi"判**，与卡片角标同一判据
+        // （见 PosterCard.badgeText）。
+        //
+        // 旧版拿 `matchState` 近似（`pending` 算未匹配、其余算已匹配），
+        // 于是 `manual` 一律被算成「已匹配」—— 纯本地条目（用户自己建的、
+        // 没有 bangumi_id）也被归进去，而它卡片上挂着的恰恰是「本地」角标，
+        // 两个地方自相矛盾。现在有了 `bangumiId`，直接问这个。
+        if (root.stateFilter === "matched" && !(item.bangumiId > 0))
             return false
-        if (root.stateFilter === "unmatched" && item.matchState !== "pending")
+        if (root.stateFilter === "unmatched" && item.bangumiId > 0)
             return false
         // 收藏状态（「收藏状态」栏）：比的是收藏状态本身，不是 tag。
         // 取值 "1"~"5" = 具体状态，"0" = 未标记（见 makeCollectRow）。
@@ -491,7 +492,7 @@ Item {
         // **状态从 `root.collectTypes` 取，不读 `item.collectType`**：
         // 那张墙的条目列表是长生命周期的缓存，收藏状态变了它不一定重取
         // （重取要重建全部卡片），读它会出现"详情页已经是「看过」、
-        // 筛选里还算未标记"（用户实测，要重扫才更新）。映射取不到时
+        // 筛选里还算未标记"。映射取不到时
         // 才回落到条目自己的字段。
         var wantCollect = root.tagSelection[root.collectRowTitle] || ""
         if (wantCollect) {
@@ -671,7 +672,7 @@ Item {
 
     /// 全库「作品名集合」：用于把"其他"栏里的作品名/别名 tag 剔掉。
     ///
-    /// **为什么要剔（实测）**：Bangumi 的 tag 里混着大量**作品名与角色/声优名**
+    /// **为什么要剔**：Bangumi 的 tag 里混着大量**作品名与角色/声优名**
     /// （截图里的「无职转生」「CLANNAD」「为美好的世界献上祝福」「泽野弘之」
     /// 「鬼灭之刃」…）。它们是别的作品的名字，对本作毫无分类意义 ——
     /// 点「无职转生」只会筛出"恰好被打过这个 tag 的条目"，通常就是那一部
@@ -890,15 +891,14 @@ Item {
     // 数据变化时**有意什么都不做**（见下）。
     //
     // 这里原先写的是 `flick.contentY = 0`（"数据变化时刷新，滚动位置回到
-    // 顶部"），而那是个 bug（实测反馈："在动漫详情页单条目重新扫描后，
-    // 回退到海报墙会回到顶部"）：
+    // 顶部"），而那是个 bug（"在动漫详情页单条目重新扫描后，回退到海报墙会回到顶部"）：
     // `subjectsChanged` 不只是"列表内容真的变了"，它也是**单条目重扫的
     // 收尾** —— QmlApp._on_scan_finished 第一件事就是 `library.reload()`。
     // 用户点「重新扫描」时人在详情页，海报墙在后台被这条信号顶回顶部，
     // 返回时看到的就是"跳到了顶上"。
     // 而重扫只改集数，卡片**顺序和数量都没变**，没有任何理由移动视口。
     //
-    // **不需要"先记住位置、重建后再贴回去"那一套**（A/B 对照实测过：
+    // **不需要"先记住位置、重建后再贴回去"那一套**（A/B 对照过：
     // 把那套机制关掉，位置照样保住）：Repeater 重建时 Flickable 的
     // contentY 本来就会原样保留 —— 位置丢失**完全**来自上面那句显式归零。
     // 内容真的变短时（删掉条目），Flickable 自己会把越界的 contentY 夹进

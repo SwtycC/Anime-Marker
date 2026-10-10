@@ -15,9 +15,28 @@ Rectangle {
     property string meta: ""
     property string coverUrl: ""
     property string matchState: "auto"    // auto | manual | pending
+    /// Bangumi 条目 id（0 = 没连上 Bangumi）。角标只看这个值，见 badgeText。
+    property int bangumiId: 0
     property int posterWidth: Theme.posterWidth
 
     signal clicked(int subjectId)
+
+    /// 角标文案（空串 = 不显示角标）。
+    ///
+    /// **判据是 `bangumiId` 而不是 `matchState`**：
+    /// `match_state='manual'` 只说明"关联是用户手动指定的"，它既可能是
+    /// 手动匹配/「新建并绑定」成功、**已经拉到封面·集数·tag** 的条目，
+    /// 也可能是一条纯本地条目。旧版一律挂绿色「手动」，于是那张已经带
+    /// tag 的海报上"手动"两个字完全无从解释。
+    /// 现在角标只回答一个问题：**这条连上 Bangumi 了吗**。
+    ///   - 连上了（auto 或手动指定）→ 不挂角标，卡片自己就是完整的；
+    ///   - 没连上且是扫描留的待办 → 「待匹配」（橙，提示用户去匹配）；
+    ///   - 没连上但是用户自己建的本地条目 → 「本地」（灰，不是待办，
+    ///     只是说明它没有 Bangumi 侧的数据）。
+    readonly property string badgeText: root.bangumiId > 0
+                                        ? ""
+                                        : (root.matchState === "pending"
+                                           ? "待匹配" : "本地")
 
     readonly property int coverHeight: Math.round(posterWidth * Theme.posterRatio)
     readonly property bool _hovered: hoverArea.containsMouse
@@ -58,8 +77,7 @@ Rectangle {
         // 封面用 `MultiEffect` + **预制圆角遮罩图**裁成圆角，使四个角与
         // 卡片的圆角一致。
         //
-        // **为什么用预制遮罩图，而不是现画一个圆角矩形**（多轮实测，
-        // 记录在此避免后人重走）：
+        // **为什么用预制遮罩图，而不是现画一个圆角矩形**（：
         //   ① 遮罩取的是 **alpha 通道**（不是亮度，这点极易误解）。原想用
         //      `Rectangle { radius: 8 }` 现画一个，但作为遮罩源的它
         //      必须"真实渲染"才有纹理；`visible:false` 之外的几种藏法
@@ -68,7 +86,7 @@ Rectangle {
         //   ② 父项 `clip` 只支持轴对齐矩形，裁不了圆角。
         //   ③ 现成的 `OpacityMask` 在 **Qt 6.9 已随 Qt5Compat 移入
         //      PySide6-Addons** —— 本机只装了 Essentials，没有该模块，
-        //      `import` 直接失败（实测），所以只剩 MultiEffect 一条路。
+        //      `import` 直接失败，所以只剩 MultiEffect 一条路。
         //
         // 结论：遮罩必须是**天然带 alpha 的图片资源** —— 这也正是
         // Qt Quick Controls 内部处理圆角/阴影的常规做法。
@@ -93,11 +111,11 @@ Rectangle {
 
             // 封面本体：作为 coverEffect 的 source。
             //
-            // **`layer.enabled` 对 source 是必需的**（实测）：遮罩类效果
+            // **`layer.enabled` 对 source 是必需的**：遮罩类效果
             // 需要 source 提供独立纹理，不开 layer 时遮罩会整体失效
-            // （四个角全变直角 —— 已实测确认）。
+            // （四个角全变直角）。
             //
-            // **`sourceSize` 才是"海报看着糊"的真正解药**（本轮实测）。
+            // **`sourceSize` 才是"海报看着糊"的真正解药**。
             // 不给它时，Qt 会把 1227×1736 的原图**整张**传上 GPU，再靠
             // **一次双线性采样**缩到 200×280 —— 6 倍缩小只用 4 个纹素，
             // 细节成片丢失、边缘出现块状锯齿，这就是用户看到的"比原图模糊"。
@@ -137,9 +155,9 @@ Rectangle {
                 sourceSize.width: Math.round(width * Screen.devicePixelRatio * 2)
                 sourceSize.height: Math.round(height * Screen.devicePixelRatio * 2)
 
-                // 别顺手加 `mipmap: true`（实测，与直觉相反）：
+                // 别顺手加 `mipmap: true`：
                 // 在**无 layer** 的探针里它确实有增益，但本卡片的 coverImage
-                // 开了 `layer`，mip 选择会被放大到整张原图上 —— 真应用实测
+                // 开了 `layer`，mip 选择会被放大到整张原图上 —— 真应用
                 // Laplacian 3436 → 1822、梯度 22.89 → 19.01，明显更糊，
                 // 而 RMSE 只从 15.59 微降到 14.89（"模糊能骗过 RMSE"）。
                 // 所以这里只留 `sourceSize`，不要 mipmap。
@@ -190,12 +208,10 @@ Rectangle {
             // 圆角裁切：以 coverMask 的 **alpha** 为遮罩渲染封面。
             //
             // **为什么不能"干脆不用效果层"**：圆角只能靠遮罩裁，而
-            // `Qt5Compat.GraphicalEffects.OpacityMask` 在本机**不存在**
-            // （当前只装了 PySide6-Essentials，Qt5Compat 在 6.9 已并入
-            // Addons —— 实测 qml 导入目录里没有它）。所以只剩 MultiEffect
+            // `Qt5Compat.GraphicalEffects.OpacityMask` 在本机**不存在**。所以只剩 MultiEffect
             // 这一条路。
             //
-            // **MultiEffect 不背"海报模糊"这个锅**（本轮实测澄清）：
+            // **MultiEffect 不背"海报模糊"这个锅**：
             // 同一张封面，走 MultiEffect+遮罩与走朴素 Image，Laplacian
             // 分别是 13482 / 13467 —— 差 0.1%，等于没有差别；真应用截图
             // 也复现了同一个数（13427）。
@@ -209,8 +225,6 @@ Rectangle {
             // 保留它是为了 DPR>1 的显示器：MultiEffect 的中间纹理按 item
             // 的逻辑尺寸分配，DPR=2 时会被放大一次；把 item 放大到设备
             // 像素再 scale 回来，中间纹理就跟着变大。
-            // —— 这一段**没有在高 DPI 屏上实测过**（手边只有 96 DPI 的
-            // 屏），属于按机制推断的保险措施，别把它当成已验证的结论。
             Item {
                 // 逻辑尺寸（也就是最终显示尺寸）
                 readonly property int logicalWidth: coverArea.width
@@ -248,21 +262,31 @@ Rectangle {
                 visible: !coverImage.visible
             }
 
-            // 匹配状态标记
+            // 匹配状态标记（文案与是否显示都看 badgeText）
             Rectangle {
                 anchors.left: parent.left
                 anchors.top: parent.top
                 anchors.margins: Theme.spacingSm
-                visible: root.matchState !== "auto"
+                visible: root.badgeText !== ""
                 width: badgeLabel.implicitWidth + Theme.spacingMd
                 height: 20
                 radius: Theme.radiusSm
-                color: root.matchState === "pending" ? Theme.warningColor : Theme.successColor
+                // 「待匹配」是要用户动手的待办（橙）；「本地」只是说明
+                // 它没有 Bangumi 侧数据（中性灰），不该抢眼。
+                //
+                // 灰是**写死的两个值**，不能拿 `textSecondary` /
+                // `textTertiary` 顶：那两个是**文字色**，白字压上去对不齐
+                // —— 亮色主题下 `textTertiary`(#8E97A4) 只有 2.9:1，
+                // 暗色主题下 `textSecondary`(#9BA3B4) 更浅。这两个值对白字
+                // 都在 4.8:1 上下（与 ErrorToast / Main 的浮层同类写法）。
+                color: root.matchState === "pending"
+                       ? Theme.warningColor
+                       : (Theme.dark ? "#4B5563" : "#6B7280")
 
                 Text {
                     id: badgeLabel
                     anchors.centerIn: parent
-                    text: root.matchState === "pending" ? "待匹配" : "手动"
+                    text: root.badgeText
                     color: "#FFFFFF"
                     font.pixelSize: Theme.fontXs
                 }

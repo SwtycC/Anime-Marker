@@ -436,9 +436,7 @@ _EP_MAX = 199
 
 # 紧贴在数字**右边**的字符若是这些，说明它是画质/编码参数的一部分：
 #   1080**p** / 1080**P** / 10**bit** / x26**4** / 1920**x**1080
-# 只看"紧邻一位"而不是大窗口 —— 实测踩坑：一开始取了 ±12 字符的窗口，
-# 结果 `- 12 (Baha 1920x1080 AVC AAC MP4)` 里那个**正确的 12** 也被
-# 同一个窗口里的 `1080p` 命中而排除，10 条记录一条都匹配不上。
+# 只看"紧邻一位"而不是大窗口。
 _EP_SUFFIX_BAD_RE = re.compile(r"(?i)^(?:[pP]\b|bit|fps|k\b|[xX]\d)")
 
 
@@ -468,8 +466,7 @@ def _title_similar(a: str, b: str) -> float:
     """两个标题的**字符重合度**（0~1，按短串算）。
 
     用"逐字包含"而不是编辑距离：中/日文标题里发布组名与画质参数
-    差异很大，但**作品名那几个字是相同的**（实测 `从后面来的神威先生`
-    vs `從後面來的神威先生` 虽然简繁不同、仍有「神威先生」等字重合）。
+    差异很大，但**作品名那几个字是相同的**。
     编辑距离会被这些差异淹没，按字统计更稳。
     """
     if not a or not b:
@@ -542,7 +539,7 @@ class RssBridge(QObject):
     #:
     #: 参数 `source_id`：0 = 检查**全部**启用订阅（「立即检查」按钮）；
     #: >0 = 只检查该订阅（「下载器」保存后自动触发，见 `setDownloader`）。
-    #: 为什么带上它（实测需求）：保存下载器后要**立刻**按新规则拉一次，
+    #: 为什么带上它：保存下载器后要**立刻**按新规则拉一次，
     #: 否则用户得等下一次定时轮询（默认 30 分钟），体验上就是"点了保存
     #: 却什么都没发生"。只查该订阅而不是全量 —— 用户刚改的就这一个，
     #: 没必要把所有订阅重新跑一遍（都是网络请求）。
@@ -746,8 +743,7 @@ class RssBridge(QObject):
                 "downloadCount": sum(stats.values()),
                 # **统计口径修正**：数据库里成功写入的是 `done`
                 # （见 rss_service.STATUS_DONE），而这里原先只数
-                # `completed` —— 导致界面上"完成"永远显示 0（实测截图
-                # "下载 10（完成 0）"，其实 10 条都下完了）。
+                # `completed` —— 导致界面上"完成"永远显示 0。
                 # 两个键都算上，兼容历史数据。
                 "completedCount": int(stats.get("done", 0))
                                   + int(stats.get("completed", 0)),
@@ -1148,10 +1144,32 @@ class RssBridge(QObject):
         （有就存，没有就留空），两种条目一视同仁。
         """
         try:
+            # ---- 保存位置「跟着绑定走」----
+            #
+            # 下载器弹窗现在会**按绑定条目预选保存位置**（见
+            # RssDownloaderDialog.pickOnOpen），而那个框点一次「保存」就会
+            # 写成显式的 `save_subject_id`。于是绑定关系一变，那个值就成了
+            # 陈旧的指向 —— 解绑后下载仍进那部番的目录、改绑后仍进旧条目的
+            # 目录。两条都不是用户要的。
+            #
+            # 规则：**`save_subject_id` 等于旧绑定条目时，跟着改**（解绑则
+            # 清空，回落到 qBittorrent 全局路径）。等于不代表用户显式选过，
+            # 因为预选写下去的就是这个值 —— 无法区分，按"跟随"处理。
+            # 用户显式选了**别的**条目时不动它：那是独立的选择。
+            old = self._find_source(source_id)
+            old_bound = int(getattr(old, "local_subject_id", 0) or 0)
+            old_save = int(getattr(old, "save_subject_id", 0) or 0)
+            follow = {}
+            if old_bound and old_save == old_bound:
+                follow["save_subject_id"] = int(subject_id) or None
+                log.info("订阅 #%s 的保存位置跟随绑定条目变更：#%s → %s",
+                         source_id, old_save, follow["save_subject_id"] or "未指定")
+
             if subject_id <= 0:
                 self._db.update_rss_source(source_id,
                                            local_subject_id=None,
-                                           bangumi_id=None)
+                                           bangumi_id=None,
+                                           **follow)
                 self.message.emit("已解除绑定")
             else:
                 subj = self._db.get_subject(subject_id)
@@ -1163,6 +1181,7 @@ class RssBridge(QObject):
                     source_id,
                     local_subject_id=subj.id,
                     bangumi_id=subj.bangumi_id or None,
+                    **follow
                 )
                 self.message.emit(
                     f"已绑定到「{subj.name_cn or subj.name}」")
@@ -1175,6 +1194,10 @@ class RssBridge(QObject):
     @Slot(int, result=bool)
     def removeSource(self, source_id: int) -> bool:
         """删除订阅源（连带删除其下载记录，外键 CASCADE）。"""
+        # **先取名字再删**——
+        # 删完那一行就没了，之后只能看到 `#25` 这种 ID，出问题（删错订阅）
+        # 时完全对不上号。取名字失败不影响删除本身，只让日志退化回 ID。
+        name = self._source_name(source_id)
         try:
             # 外键 ON DELETE CASCADE 已在 schema 里声明，
             # 但 download_history 的 source_id 是 REFERENCES rss_sources(id)
@@ -1184,10 +1207,39 @@ class RssBridge(QObject):
             log.exception("删除订阅源 %s 失败: %s", source_id, e)
             self.failed.emit(f"删除失败：{e}")
             return False
-        log.info("已删除订阅源 #%s", source_id)
+        log.info("已删除订阅源 #%s「%s」", source_id, name)
         self.reload()
-        self.message.emit("订阅已删除")
+        self.message.emit(f"订阅「{name}」已删除")
         return True
+
+    def _find_source(self, source_id: int):
+        """按 id 取订阅源（查不到 / 读失败都返回 None）。
+
+        数据库没有单个订阅的 getter，而订阅是**几十级别**的量，为它单开一条
+        SELECT 不如现查一遍 `list_rss_sources()`（与 `_source_name` 同一取舍）。
+        """
+        try:
+            return next((s for s in self._db.list_rss_sources()
+                         if s.id == int(source_id)), None)
+        except Exception as e:              # pragma: no cover - 防御性
+            log.warning("读取订阅 #%s 失败: %s", source_id, e)
+            return None
+
+    def _source_name(self, source_id: int) -> str:
+        """订阅源显示名；查不到退回 `#id`。
+
+        与 `logDownloaderOpened` 一样走 `list_rss_sources()` 现查 ——
+        订阅数量是几十级别，为它单独加一条 SELECT 不划算。
+        """
+        try:
+            src = next((s for s in self._db.list_rss_sources()
+                        if s.id == int(source_id)), None)
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("读取订阅 #%s 名称失败: %s", source_id, e)
+            return f"#{source_id}"
+        if src is None:
+            return f"#{source_id}"
+        return (getattr(src, "name", "") or "").strip() or f"#{source_id}"
 
     # ---------- 下载记录 ----------
     _downloads_dirty = True
@@ -1227,7 +1279,7 @@ class RssBridge(QObject):
             # `torrent_hash` 是 qBittorrent 按种子**内容**算出来的，我们
             # 下发时拿不到（`torrents_add` 只返回 "Ok."，不回传 hash），
             # 所以库里那一列一直是 NULL —— 只按 hash 匹配的话**永远查不到**，
-            # 界面上进度条一根都不会出现（实测现象）。
+            # 界面上进度条一根都不会出现。
             #
             # 按标题匹配是可行的：RSS 条目标题与 qBittorrent 里的任务名
             # 通常一致（qB 用种子里的 name，站点一般就用标题当 name）。
@@ -1443,12 +1495,6 @@ class RssBridge(QObject):
 
         返回 `{"path": 完整路径, "note": 界面显示的两行文案, "exists": 是否存在}`；
         `path` 为空表示"不干预，用 qBittorrent 自己的保存路径"。
-
-        **为什么由后端算而不是 QML 拼**（"在这段文字的下一行
-        写清楚目录在哪"）：QML 若自己拼一遍，就出现了**第二套路径规则** ——
-        界面显示 `F:\XX\XXXX\第二季`、文件却可能因为后端规则稍有
-        不同而落到别处。用户最不能接受的就是"看到的和实际的不一致"。
-        所以复用一个 `RssMatcher.plan_save_path`（纯推算、无副作用）。
 
         `subject_id` 传 0 时用订阅自己绑定的条目（与真正下发时的口径一致）。
         """

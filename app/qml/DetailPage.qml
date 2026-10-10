@@ -15,8 +15,7 @@ Item {
     /// `action` = 可选动作："settings" → 浮条可点击、跳转设置页
     /// （普通提示传空串）。
     ///
-    /// **发射时必须把三个参数都传齐**（踩坑，实测日志：
-    /// `DetailPage.qml:290: Error: Insufficient arguments`）：Qt 6 的 QML
+    /// **发射时必须把三个参数都传齐**：Qt 6 的 QML
     /// 里调用 signal 少传参数会直接报错、**该次提示静默丢失** —— 早期按
     /// Qt 5 的习惯只写前一个/前两个参数，于是"点重新扫描"这类提示弹不出来，
     /// 只在日志里留一条 Error。信号声明不支持默认值，只能每个发射点写全。
@@ -53,10 +52,9 @@ Item {
     property bool collectBusy: false
     /// 点击后**立刻**显示的状态（0 = 没有待确认的点击）。
     ///
-    /// **为什么要它（乐观更新）**：写入要发一个 POST 到 Bangumi（实测
-    /// 往返数百毫秒到 1 秒），而选中态原先只认 `subject.collectType` ——
+    /// **为什么要它（乐观更新）**：写入要发一个 POST 到 Bangumi，而选中态原先只认 `subject.collectType` ——
     /// 那是**写入成功后**才回写的快照。于是"点一下→亮起"中间空着将近
-    /// 一秒，用户实测反馈"点击按钮后对应按钮亮起的时间也快一点"。
+    /// 一秒。
     /// 现在点下去的那一帧就先用这个值把按钮点亮，等 `collectTypeChanged`
     /// 回来（Main.qml → load()）再以库里/远端的结果为准：
     ///   - 写成功 → 值一致，视觉无变化；
@@ -98,12 +96,12 @@ Item {
         // **这里不要加"collectType == 0 才调"这类判据**（踩过）：那正是
         // "错的快照永远没人纠正"的成因 —— CLANNAD 早在网页端取消了收藏，
         // 本地快照还留着「在看」，于是详情页一直显示错的，而这条判据
-        // 让后端根本没机会去纠正它（用户实测反馈"有 token 按 bangumi 上处理"）。
+        // 让后端根本没机会去纠正它。
         //
         // **这里被 load() 反复调到是正常的，不会重复发请求**：后端有
         // "本次运行已回查过的条目"闸门（`_collect_queried`）。**别把闸门
         // 去掉**——回查完成会触发 collectTypeChanged → Main.qml reload →
-        // 又调到这里，自激成无限循环（2026-10-03 实测刷出上百次 404）。
+        // 又调到这里，自激成无限循环。
         if (typeof library !== "undefined" && library)
             library.requestCollectType(sid)
         // 存量条目自动补拉标签（异步，不阻塞界面；已有 tag 时是空操作）。
@@ -313,7 +311,7 @@ Item {
     ///
     /// 空输入时点击不做任何事（不退出）—— 退出编辑统一走 ×。
     /// 早先版本让空输入的 ✔ 兼任"保存退出"，但那样用户会以为
-    /// "按勾 = 完成"，与"按叉才能退出"的心智冲突（实测反馈）。
+    /// "按勾 = 完成"，与"按叉才能退出"的心智冲突。
     function commitTagInput() {
         if (root.newTagText.trim() === "")
             return
@@ -444,8 +442,8 @@ Item {
                         // 双线性采样**缩到 240×336（约 5 倍缩小），细节成片丢失、
                         // 边缘出块状锯齿 —— 就是"详情页海报比原图糊"的原因。
                         //
-                        // 倍数取"物理像素的 2 倍"：实测的拐点，少了偏糊、多了
-                        // 又重新锯齿。完整数据与推导见 PosterCard.qml 里的长注释。
+                        // 倍数取"物理像素的 2 倍"。
+                        // 完整数据与推导见 PosterCard.qml 里的长注释。
                         sourceSize.width: Math.round(width * Screen.devicePixelRatio * 2)
                         sourceSize.height: Math.round(height * Screen.devicePixelRatio * 2)
                     }
@@ -761,8 +759,7 @@ Item {
                     //
                     // 为什么单独留一行：输入框的"浮动标签"会浮到框上方
                     // （见 tagLabel），距输入框顶部约一个字高。若紧跟 tag 行
-                    // 排布，浮起的「标签」会插进上面那排 chip 的空隙里
-                    // （实测：贴着 "日本" 那个 tag 下沿，看着像被压住）。
+                    // 排布，浮起的「标签」会插进上面那排 chip 的空隙里。
                     // ColumnLayout 没有 topPadding，用显式占位项补出这段空间。
                     Item {
                         Layout.fillWidth: true
@@ -811,6 +808,7 @@ Item {
 
                             TextInput {
                                 id: tagInput
+                                objectName: "detailTagInput"   // 诊断/探针用
                                 anchors.fill: parent
                                 anchors.leftMargin: Theme.spacingMd
                                 anchors.rightMargin: Theme.spacingMd
@@ -819,6 +817,9 @@ Item {
                                 font.pixelSize: Theme.fontXs
                                 clip: true
                                 text: root.newTagText
+                                // 同 AppTextField：裸 TextInput 默认 false，
+                                // 不打开就选不中字（见那里的说明）
+                                selectByMouse: true
                                 onTextEdited: root.newTagText = tagInput.text
                                 // 回车 = 点 ✔（有内容则添加）
                                 onAccepted: root.commitTagInput()
@@ -835,8 +836,7 @@ Item {
                                 // 原因：原版输入框 padding 1rem（约 44px 高），
                                 // 上移半个字高后下半截仍在框内、不挡输入内容。
                                 // 这里为了与 tag chip 同高只有 24px，同样上移
-                                // 6px 会让大半个字留在框里、和输入内容重叠
-                                // （实测："标签"压住了刚输入的 tag 文字）。
+                                // 6px 会让大半个字留在框里、和输入内容重叠。
                                 // 整字移出框外后，浮起的标签变成框上方的小标注。
                                 y: tagField.floated ? -height
                                                     : (tagField.height - height) / 2
@@ -892,7 +892,7 @@ Item {
 
                 // 同系列切换
                 //
-                // **用 Flow 而不是 Row**（实测反馈）：同系列条数多、按钮上又是
+                // **用 Flow 而不是 Row**：同系列条数多、按钮上又是
                 // 完整标题时（KONOSUBA 五部、青春猪头少年四部），一行根本塞不下 ——
                 // Row 不会折行，超出的部分**直接溢出到窗口右边，永远点不到**。
                 // Flow 会自动折到下一行，和上面标签栏用的是同一个做法。
@@ -929,7 +929,7 @@ Item {
                             Text {
                                 id: sibLabel
                                 anchors.centerIn: parent
-                                // 显示**完整**条目名（实测反馈）：早先会把与
+                                // 显示**完整**条目名：早先会把与
                                 // seriesName 重复的前缀截掉，但那个前缀往往
                                 // 是整个系列唯一的辨识部分 ——
                                 // 「青春猪头少年不会梦到兔女郎学姐」变成
@@ -1108,7 +1108,7 @@ Item {
         icon: "trash"
         label: "删除"
         danger: true
-        // 垃圾桶图标比默认（20）大一号（实测反馈"图标放大一点"）。
+        // 垃圾桶图标比默认（20）大一号。
         // **只改这一个实例**：海报墙的「添加动漫」按钮仍用组件默认值，
         // 因此这里覆盖属性而不是去动 FloatingActionButton 里的 iconSize ——
         // 后者是共用属性，改了会把另一个按钮也一起放大。

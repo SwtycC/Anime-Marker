@@ -350,9 +350,7 @@ class LibraryBridge(QObject):
         self._api = api
 
     # 注：**曾经**在启动时做过一次"清掉缓存里没有的条目"的对齐，已删除。
-    # 它用"最近一次同步的收藏缓存"当权威，而那个缓存可能比本地值更旧：
-    # 实测"在网站上标了看过 → 详情页回查写进本地 2 →
-    # 重启后被启动对齐清成 0 → 又回到「未标记」 → 再进详情页才恢复"。
+    # 它用"最近一次同步的收藏缓存"当权威，而那个缓存可能比本地值更旧。
     # 缓存只能当"秒显"的加速，不能当**删数据**的依据 —— 现在真值一律
     # 由详情页回查网络得到（见 requestCollectType），同步时那次清理
     # 仍然保留（那次缓存是刚拉的全量，判据成立）。
@@ -667,7 +665,7 @@ class LibraryBridge(QObject):
 
         拿 `ep_status=16` 去和本地 `ep_index`（73~93）比，永远对不上
         （`16+1=17` 不在 73~93 里），于是退回"第一个 > 17 的" → 永远给
-        **第一集 73**。实测：明明看到第 16 集，点「下一集」还是打开第 1 集。
+        **第一集 73**。
 
         所以先用 `watched_episodes` 取"本地/远端已看的最大集号"（与本地同
         口径），它比 `ep_status` 更精确（逐集记录，而 `ep_status` 只是个
@@ -677,7 +675,7 @@ class LibraryBridge(QObject):
         规则：优先取 `ep_index == 已看到 + 1` 的那一集（"接着看"的那集）；
         编号对不上（本地缺集/续篇从中间编号）时退回"第一集 ep_index 大于
         已看到的"；都没有则返回 0，并给出一句能解释清楚的原因 ——
-        界面上按钮**不隐藏**，点不动时把原因报到状态栏（实测要求）。
+        界面上按钮**不隐藏**，点不动时把原因报到状态栏。
 
         为什么要区分原因：三种"播不了"的处置完全不同 ——
         没入库（去入库）、本地已看到最新（正常，无需做什么）、
@@ -733,7 +731,7 @@ class LibraryBridge(QObject):
             return int(later[0].id), ""
         # 走到这里说明本地没有任何"第 want 集及以后"的集。两种成因要分开说：
         if len({float(e.ep_index or 0) for e in eps}) == 1:
-            # 所有集号一模一样 → 扫描时标题没解析出来（实测：某部 12 集全是 2.0）
+            # 所有集号一模一样 → 扫描时标题没解析出来
             return 0, ("本地集号异常（%d 集全是第 %g 集，扫描解析可能失败），"
                        "无法判断下一集" % (len(eps), float(eps[0].ep_index or 0)))
         return 0, ("本地没有更靠后的集了（已看到第 %d 集，本地共 %d 集）"
@@ -829,8 +827,7 @@ class LibraryBridge(QObject):
         **必须是带 `notify` 的 Property，不能是 `@Slot`**（改过一处）：
         QML 里原先写 `library.inProgressMeta()` —— 那是"在绑定里调一次函数"，
         没有任何可追踪的依赖，于是**只在页面创建时算一次**，此后列表怎么变
-        页头数字都不动（实测：列表 14 行、页头写着 13 部，用户一眼就能看出
-        对不上）。改成 Property 后 QML 用 `library.inProgressMeta`，
+        页头数字都不动。改成 Property 后 QML 用 `library.inProgressMeta`，
         列表一变就重算。
         """
         try:
@@ -1529,7 +1526,7 @@ class LibraryBridge(QObject):
           ② 有 Token → 再回查一次网络（每条目每会话最多一次），**以网络为准**。
 
         ① 是为了"快"：网络往返数百毫秒，而海报是立刻出现的；只用 ② 的话
-        选中态会明显慢半拍（用户实测反馈"最好跟展示图出现的时间一样快"）。
+        选中态会明显慢半拍。
 
         ② 是为了"对"：缓存只是上次同步时的状态，**不是权威**——
            - 缓存里没有它：可能确实没收藏，也可能只是还没同步过
@@ -1569,8 +1566,7 @@ class LibraryBridge(QObject):
         # ① 收藏同步缓存里就有答案 → **同步**落库 + 通知，一个请求都不发。
         #
         # 这条路的全部意义是"快"：emit 是主线程内的直接调用，QML 收到后
-        # 立刻 reload，选中态**与海报同一帧**出现（用户实测反馈"最好跟
-        # 展示图出现的时间一样快"）。走网络的话要等几百毫秒，
+        # 立刻 reload，选中态**与海报同一帧**出现。走网络的话要等几百毫秒，
         # 用户看到的是"海报早就在了、状态还在转"。
         #
         # **这一步不看本地快照**：快照可能是错的。缓存里有答案时以它为准，
@@ -1679,9 +1675,7 @@ class LibraryBridge(QObject):
         """只写本地快照（见 setCollectType 的模式 ②）。
 
         提示语**只说结果**："已标记为「在看」· 仅本地"。
-        技术原因（没配 Token / 条目没匹配）只进日志 —— 用户实测反馈
-        不希望提示里出现"未配置 Bangumi Token……"这类解释：
-        他要的只是"点上了没有"，机制细节写在状态栏里既长又像报错。
+        技术原因（没配 Token / 条目没匹配）只进日志。
         """
         try:
             self._db.set_subject_collect_type(subject_id, collect_type)
@@ -1718,8 +1712,7 @@ class LibraryBridge(QObject):
 
     def _on_collect_type_done(self, subject_id: int, ok: bool, message: str,
                               new_type: int) -> None:
-        # **无论 new_type 是否为 0 都要通知 QML**（踩坑，实测反馈"重新扫描后
-        # 没有选中当前动漫的状态"）。
+        # **无论 new_type 是否为 0 都要通知 QML**。
         #
         # 原先写的是 `if new_type: emit(...)` —— 于是回查结果为 0
         # （条目在 Bangumi 上确实没收藏）时**什么都不发**，选择器停在
@@ -1836,6 +1829,16 @@ class LibraryBridge(QObject):
             # 0 时界面**一个都不选中**，并由 requestCollectType 异步回查。
             "collectType": int(s.collect_type or 0),
             "matchState": s.match_state or "auto",
+            # Bangumi 条目 id（0 = 没连上 Bangumi，纯本地条目）。
+            #
+            # **海报墙要的就是这个，不是 `matchState`**：角标与
+            # 「已匹配/未匹配」筛选问的都是"这条到底连没连上 Bangumi"，而
+            # `match_state='manual'` 只说明"关联是用户手动指定的"—— 它既可能
+            # 有 bangumi_id（新建并绑定 + 匹配成功、手动匹配成功），也可能是
+            # 一条纯本地条目。拿 match_state 回答这个问题的后果就是：一条
+            # 已经拉到封面/集数/tag 的条目，海报上却挂着绿色「手动」，用户
+            # 只能来问"这什么意思"。
+            "bangumiId": int(s.bangumi_id or 0),
             "totalEps": int(s.total_eps or 0),
             "folderPath": s.folder_path or "",
             # 封面转 URL，QML 的 Image 才能加载（含中文路径也能用）；
@@ -1889,7 +1892,7 @@ class LibraryBridge(QObject):
             #
             # ① 只用 items[0] 不够 —— 别名可能登记在别的季上，用户搜那个
             #    别名就搜不到这张卡 ✗。
-            # ② 只收别名也不够（**实测踩到**）：下面的 update 会把
+            # ② 只收别名也不够：下面的 update 会把
             #    title/name/nameCn 三个字段**统一替换成 series_name**，
             #    于是各成员原本的正式名被彻底覆盖掉。实例：
             #       组成员 1（TV）   name_cn="链锯人"     别名=[Chainsaw Man, 电锯人]

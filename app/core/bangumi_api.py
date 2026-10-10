@@ -97,9 +97,7 @@ def describe_connection_error(exc: Exception) -> str:
     text = str(exc)
     low = text.lower()
     # 5xx 被重试耗尽：请求**已经到达服务器**，是它对端出错。
-    # 别把用户引去查代理 —— 实测：Bangumi 后端故障期间
-    # `/collections` 稳定 502 而同一秒 `/subjects` 稳定 200，
-    # 响应头带 `CF-RAY`、502 页面是源站 nginx 的默认错误页。
+    # 别把用户引去查代理。
     m = re.search(r"too many (\d{3}) error responses", text)
     if m:
         return f"Bangumi 服务端故障（连续返回 {m.group(1)}）—— 与本地网络无关，稍后重试"
@@ -202,7 +200,7 @@ def extract_aliases(subject: dict) -> list[str]:
 # infobox 里"动画制作"那一行的 key（Bangumi 的简繁/日文写法都收进来）。
 #
 # **故意不收「製作」/「制作」**：那一行是**制作委员会**，不是动画公司 ——
-# 实测「白聖女と黒牧師」的 `製作` 是
+# 「白聖女と黒牧師」的 `製作` 是
 # `「白聖女と黒牧師」製作委員会（講談社、Aniplex、Crunchyroll、動画工房）`，
 # 拿来当公司名会得到一长串无意义文本（公司名只偶然出现在括号里）。
 _STUDIO_KEYS = frozenset({
@@ -514,6 +512,26 @@ class BangumiClient:
             self.session.headers["Authorization"] = f"Bearer {token}"
         if proxy:
             self.session.proxies = {"http": proxy, "https": proxy}
+            # ---- **必须同时关掉 trust_env**----
+            #
+            # 只设 `session.proxies` 是不够的：requests 合并时**环境代理会
+            # 覆盖它**。`Session.merge_environment_settings()` 里先
+            # `proxies.setdefault(k, env_proxies[k])` 把环境代理塞进来，
+            # 紧接着 `proxies = merge_setting(proxies, self.proxies)` ——
+            # 而 `merge_setting(request_setting, session_setting)` 是
+            # **request_setting（= 环境那份）赢**。Windows 上"环境代理"
+            # 就是「Internet 选项」注册表里那个（本机 127.0.0.1:7890），
+            # 于是设置页填了代理也会被系统代理顶掉。
+            #
+            # 语义与设置页那行的说明对齐（"留空则用系统代理"）：
+            #   填了 → 只用填的这个（trust_env=False，环境/系统代理一概不参与）
+            #   留空 → 不动 trust_env，照旧走系统代理
+            #
+            # 代价（可接受）：trust_env 还管着 `REQUESTS_CA_BUNDLE` 之类的
+            # 环境证书设置。本应用没有任何 `verify=` 配置，用不上那些。
+            # 这个会话也被封面下载复用（cover_cache.download 传的就是它），
+            # 一并受益 —— 否则会出现"API 走代理、封面不走"的半截状态。
+            self.session.trust_env = False
 
     # ---------- 底层 ----------
     @staticmethod
@@ -716,7 +734,7 @@ class BangumiClient:
 
         优先 infobox 是因为多数情况下它就在搜索响应里（扫描时白拿）；
         只有它没有「动画制作」时才多发一个 `/persons` 请求 ——
-        实测约三分之二的条目需要这一下（见 studio_from_persons 的说明）。
+        约三分之二的条目需要这一下（见 studio_from_persons 的说明）。
         结果由调用方写进数据库，之后不再请求。
         """
         studio = extract_studio(subject or {})

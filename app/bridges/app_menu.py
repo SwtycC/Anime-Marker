@@ -53,9 +53,16 @@ class _UpdateWorker(QThread):
 
     done = Signal(object)          # UpdateInfo
 
+    def __init__(self, proxy: str = "", parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        #: 设置页「代理」里填的那个（空串 = 走系统代理）。**在 _start 里
+        #: 现读配置**，所以设置页改完不用重启，下一次检查就用新的
+        #: （同 scanner 的 accept_score 那套：每个 worker 启动时现读）。
+        self._proxy = proxy
+
     def run(self) -> None:
         # fetch_latest 自己吞掉所有异常（见模块说明），这里不必再兜
-        self.done.emit(fetch_latest())
+        self.done.emit(fetch_latest(proxy=self._proxy))
 
 
 class AppMenuBridge(QObject):
@@ -219,7 +226,10 @@ class AppMenuBridge(QObject):
             return
         self._pending_manual = bool(manual)
         self._set_checking(True)
-        self._worker = _UpdateWorker()
+        # 代理**每次现读**（与 Bangumi 客户端同一个键）：设置页改完不必重启，
+        # 下一次检查就走新的。留空则空串 → fetch_latest 不指定代理、走系统代理。
+        self._worker = _UpdateWorker(
+            self._config.get("bangumi", "proxy", ""))
         self._worker.done.connect(self._on_checked)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()

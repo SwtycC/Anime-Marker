@@ -156,14 +156,6 @@ Item {
                     text: root.addFormVisible ? "取消" : "添加订阅"
                     onClicked: {
                         root.addFormVisible = !root.addFormVisible
-                        // **不要顺手清掉 editingId**（踩坑，实测反馈"点击右上角
-                        // 的添加订阅，动漫栏的编辑都不弹出表单"）：
-                        // 这两件事本来互不冲突 —— 新增表单在页面顶部、
-                        // 编辑表单在各自卡片下面，可以同时存在。
-                        // 早期这里写了 `root.editingId = 0`，于是点一次
-                        // 「添加订阅」会**把所有卡片的编辑表单一并收掉**，
-                        // 用户再点某条的「编辑」时，虽然 editingId 变了、
-                        // 但那个"新增时清空"的残留状态让人以为坏了。
                         // 现在只切换 addFormVisible，编辑状态不受影响。
                         if (root.addFormVisible)
                             addForm.setValues("", "", "new_only")
@@ -179,8 +171,7 @@ Item {
 
             // ---- 新增表单（只用于「新增」，编辑时表单在卡片下方内联展开）----
             //
-            // 编辑不再复用这里的表单：实测反馈"从动漫那点击的编辑，就显示在
-            // 该动漫下边"，即表单要贴着**被编辑的那一条**。顶部这份只服务新增。
+            // 顶部这份只服务新增。
             SubscriptionForm {
                 id: addForm
                 objectName: "subAddForm"
@@ -266,8 +257,7 @@ Item {
 
                                 // ---- 弹簧：把「启用」推到最右侧 ----
                                 //
-                                // **踩坑（实测："可以水平往右移，移动到最右侧
-                                // 吗"）**：这里原来是
+                                // **踩坑**：这里原来是
                                 //     Item { width: 1; height: 1; Layout.fillWidth: true }
                                 // —— 那是从 **RowLayout** 里抄来的写法，而本行是
                                 // **`Row`**。`Layout.fillWidth` 属于 QtQuick.Layouts
@@ -419,7 +409,6 @@ Item {
 
                             // ---- 编辑表单：**内联在被编辑的卡片下方** ----
                             //
-                            // 实测需求："从动漫那点击的编辑，就显示在该动漫下边"。
                             // 放在这里（卡片 Column 的末尾）而不是页面顶部，
                             // 用户点哪条就改哪条，视线不用跳。
                             SubscriptionForm {
@@ -487,7 +476,7 @@ Item {
                     width: parent.width
                     visible: root.downloads.length === 0
                     // 文案随"有没有订阅"变化：早期固定写"轮询下载功能尚未
-                    // 接入"，而**功能接上之后那句话就成了假话**（实测踩到）。
+                    // 接入"，而**功能接上之后那句话就成了假话**。
                     // 现在按是否有订阅源给不同引导。
                     text: root.sources.length === 0
                           ? "还没有订阅源，添加并启用后会自动检查新集"
@@ -581,10 +570,7 @@ Item {
                                     }
                                 }
 
-                                // 失败原因（v11 落库）：**直接显示在记录上**，
-                                // 而不是让用户去翻日志（实测需求："增加日志
-                                // 判断为什么失败"——日志是给开发者看的，
-                                // 界面上能一眼看到才算解决问题）。
+                                // 失败原因（v11 落库）：**直接显示在记录上**，而不是让用户去翻日志。
                                 Text {
                                     width: parent.width
                                     visible: modelData.lastError !== ""
@@ -634,6 +620,7 @@ Item {
     // ---- 绑定条目弹窗 ----
     Dialog {
         id: bindDialog
+        objectName: "bindDialog"        // 诊断/探针用
         modal: true
         anchors.centerIn: parent
         width: 420
@@ -642,11 +629,11 @@ Item {
 
         /// 把推断出的名称写进「新建条目」输入框。
         ///
-        /// **为什么要绕这一层**（踩坑，实测"小窗获取依旧没有生效"）：
+        /// **为什么要绕这一层**：
         /// `newSubjectField` 声明在下面 `contentItem` 的 Column 内部，
         /// 那个 id **对文件根作用域不可见** —— 直接在末尾的
         /// `Connections.onTitleSuggested` 里写 `newSubjectField.text = name`
-        /// 会**静默失效**（不报错、不生效；实测 emit 后 text 仍为空）。
+        /// 会**静默失效**。
         /// 而 `bindDialog` 这个 id 在根作用域可见，所以在它上面暴露一个
         /// 方法，外层通过 `bindDialog.setName(name)` 调用即可 ——
         /// 方法体在 Dialog 内部求值，那里能看到 `newSubjectField`。
@@ -670,10 +657,10 @@ Item {
                 font.pixelSize: Theme.fontSm
             }
 
-            // ---- 搜索框（实测要求："绑定条目添加搜索"）----
+            // ---- 搜索框----
             //
             // 为什么必须有：可绑定条目是**整个媒体库**（所有匹配到 Bangumi
-            // 的条目，实测本机 88 个），一次铺开要滚很久才能找到目标。
+            // 的条目），一次铺开要滚很久才能找到目标。
             // 输入关键词即时过滤，比滚动快得多。
             //
             // 匹配范围用 `searchText`：后端已经把它拼成
@@ -812,7 +799,7 @@ Item {
                     onClicked: {
                         if (typeof rss === "undefined" || !rss)
                             return
-                        // **不要写 `root.matchBox`**（实测报错，见下方日志）：
+                        // **不要写 `root.matchBox`**：
                         // `matchBox` 是本组件作用域里的一个 id，而 `root`
                         // （SubscriptionPage）上**没有**这个属性 ——
                         // `root.matchBox` 求值为 undefined，再取 `.checked`
@@ -989,8 +976,7 @@ Item {
         function onFailed(msg) { root.statusMessage(msg) }
         // 推断出的番名 → 自动填入「名称」框。
         //
-        // **三个地方都要填**（踩坑，实测反馈"获取到的名称可以直接填在
-        // 框里"）：`suggestSubjectName` 有**三个**调用方 ——
+        // **三个地方都要填**（：`suggestSubjectName` 有**三个**调用方 ——
         //   ① 添加订阅表单的「获取」  → addForm
         //   ② 编辑订阅表单的「获取」  → editForm
         //   ③ 绑定弹窗里的「获取」    → newSubjectField
@@ -1003,7 +989,7 @@ Item {
         //
         // ---- 逐个 try，绝不让一个失败拖垮后面的 ----
         //
-        // **致命踩坑（实测"小窗获取依旧没有生效"）**：`editForm` 声明在
+        // **致命踩坑**：`editForm` 声明在
         // 下面 `Repeater` 的 **delegate 内部**（每个订阅卡片各一份）。这意味着：
         //   ① 它在 delegate 作用域里 —— 根作用域的 Connections 访问不到；
         //   ② **一个订阅都没有时，delegate 根本不会被创建**，`editForm`
@@ -1034,7 +1020,7 @@ Item {
             rss.refreshTorrents()
     }
 
-    // ---- 下载进度自动刷新（实测需求："进度条持续刷新，5s 自动刷新"）----
+    // ---- 下载进度自动刷新----
     //
     // **只在"记录面板打开 且 本页可见"时运行**（running 绑定那两个条件）：
     // 不这么收紧的话，用户在别的页面看番时也会每 5 秒去问一次

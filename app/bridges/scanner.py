@@ -46,6 +46,8 @@ class ScannerBridge(QObject):
     logMessage = Signal(str)
     finished = Signal(int, int)             # matched, pending
     failed = Signal(str)
+    # 本次扫描的结论文案变了（见 resultSummary）
+    resultSummaryChanged = Signal()
     # 「添加动漫」完成：携带新入库条目的 subject_id（0 = 未入库，如待确认）
     #
     # 为什么要单独一个信号：这条路径由用户从弹窗发起、预期是"加完直接
@@ -86,6 +88,11 @@ class ScannerBridge(QObject):
         self._added_subject_id = 0
         # 本次「添加动漫」是否勾选了匹配（决定播报要不要提"未匹配"）
         self._last_match_requested = True
+        # 本次「详情页重扫」的目标条目**本来就关联着 Bangumi** 吗
+        # （决定"没重新匹配"要不要报成未匹配，见 _make_summary）
+        self._target_linked = False
+        # 本次扫描的结论文案（空串 = 还没扫过）
+        self._result_summary = ""
 
     def set_api(self, api: BangumiClient) -> None:
         self._api = api
@@ -132,6 +139,49 @@ class ScannerBridge(QObject):
         是废话（他没要求匹配），只报"已加入"即可。见 Main.qml 的播报逻辑。
         """
         return self._last_match_requested
+
+    @Property(str, notify=resultSummaryChanged)
+    def resultSummary(self) -> str:
+        """本次扫描的**结论文案**（顶部提示条显示的那一句）。
+
+        **为什么文案由后端给、而不是 QML 按数量拼**：单条目扫描的结论
+        **推不出来**。`matched` 只数"本次新匹配上了几条"，而详情页重扫一条
+        **已经关联 Bangumi** 的条目时，扫描会走 manual 记录保护 —— 跳过重新
+        匹配、只回填集数（见 `ScanWorker._process`），数量因此恒为
+        0；界面据此报"扫描完成：未匹配"，可那条目明明是匹配着的。
+        同理「添加动漫」没勾选匹配时也不该提"未匹配"（用户压根没要求匹配）
+        —— 这正是 `lastMatchRequested` 当初想解决的问题，只是 QML 侧一直没接。
+
+        全量扫描仍然用"匹配 N 个，待确认 M 个"（扫一整个库，用计数才自然）。
+        """
+        return self._result_summary
+
+    def _make_summary(self, was_adding: bool) -> str:
+        """算出结论文案。
+
+        `was_adding` 由调用方传：`_on_ok` 里 `_adding` 会在取完新条目 id 后
+        就被置回 False（那是给下一次扫描复位用的），算文案时读不到它了。
+        """
+        if not self._single_scan:
+            return ("扫描完成：匹配 %d 个，待确认 %d 个"
+                    % (self._matched, self._pending))
+        if was_adding:
+            if self._matched:
+                return "扫描完成：已匹配"
+            if not self._added_subject_id:
+                # 空目录 / 没有视频：说"未匹配"会让人以为匹配坏了
+                return "扫描完成：没有找到可入库的视频"
+            if not self._last_match_requested:
+                # 用户主动没勾「匹配 Bangumi」：只报"加上了"，
+                # 提"未匹配"是废话（他没要求匹配）
+                return "扫描完成：已加入"
+            return "扫描完成：未匹配"
+        # ---- 详情页重扫 ----
+        # 目标条目**本来就关联着** Bangumi 时，本次没重新匹配也是"已匹配"：
+        # 重扫的用处是刷新集数，不是重新认领作品。
+        return ("扫描完成：已匹配"
+                if (self._matched or self._target_linked)
+                else "扫描完成：未匹配")
 
     # ---------- 动作 ----------
     @Slot(result=str)
@@ -208,6 +258,7 @@ class ScannerBridge(QObject):
         self._worker = worker
         # 全量扫描：允许完成回调发起「在看/动态」同步（见 _on_ok）
         self._single_scan = False
+        self._target_linked = False     # 见 _make_summary（全量用不到，清掉免残留）
         self._set_running(True)
         worker.start()
         log.info("扫描已启动，媒体库：%s", self._config.library_paths)
@@ -228,7 +279,7 @@ class ScannerBridge(QObject):
         那条路径另有用途：单扫要**复算祖先上下文**才能和全扫算出同一套
         关键词（见 `ScanWorker._ancestor_state`）—— 早先这里刻意传 `[]`，
         结果同一条目"重扫"与"全扫"得到不同关键词、甚至被写下不同的
-        `series_name`（实测："重新扫描后变成待确认"、"被丢出系列"）。
+        `series_name`。
         用户改过媒体库路径、旧条目已不在库下时，复算自然失败并退回旧行为。
         """
         if self._running:
@@ -297,6 +348,10 @@ class ScannerBridge(QObject):
         # 标记为单条目扫描：完成回调据此决定**不发起**「在看/动态」同步
         # （见 _on_ok 的说明）。
         self._single_scan = True
+        # 目标条目**本来就关联着** Bangumi 吗 —— 重扫这种条目时扫描会走
+        # manual 记录保护、**跳过重新匹配**（数量恒为 0），结论文案不能
+        # 据此报"未匹配"（见 _make_summary）。
+        self._target_linked = bool(subj.bangumi_id)
         self._set_running(True)
         worker.start()
         log.info("单条目扫描已启动：subject_id=%s（%s）", subject_id, folder)
@@ -469,10 +524,14 @@ class ScannerBridge(QObject):
         self._adding = True
         self._added_subject_id = 0
         # 记下用户有没有勾选匹配 —— 播报"未匹配"的前提取决于它
-        # （用户主动选择不匹配时，报"未匹配 N"是废话）。见 lastMatchRequested。
+        # （用户主动选择不匹配时，报"未匹配"是废话）。见 _make_summary。
+        #
+        # **这里原先被紧接着的一行 `= True` 覆盖掉了**：于是
+        # `lastMatchRequested` 恒为真、"没勾匹配就不提未匹配"这条从未生效
+        # —— 而 QML 侧也一直没接这个属性，两边一起错着看不出来。
         self._last_match_requested = bool(match)
-        # 本次「添加动漫」是否勾选了匹配（决定播报要不要提"未匹配"）
-        self._last_match_requested = True
+        # 「添加动漫」不是重扫：目标条目是**新加**的，无所谓"本来就关联"
+        self._target_linked = False
         self._set_running(True)
         worker.start()
         log.info("添加动漫已启动：%s（匹配=%s）", target, match)
@@ -488,6 +547,10 @@ class ScannerBridge(QObject):
             log.warning("扫描已被用户中止")
             self.logMessage.emit("扫描已中止")
         self._set_running(False)
+        # 文案要换掉：本次是中止，不是"完成"（否则提示条会把**上一次**扫描的
+        # 结论再弹一遍 —— `resultSummary` 是常驻属性，不设就留着旧值）
+        self._result_summary = "扫描已中止"
+        self.resultSummaryChanged.emit()
         self.finished.emit(self._matched, self._pending)
 
     # ---------- 内部 ----------
@@ -521,9 +584,12 @@ class ScannerBridge(QObject):
     def _on_ok(self) -> None:
         self._set_running(False)
         log.info("扫描完成：匹配 %s，待确认 %s", self._matched, self._pending)
+        # 下面要读 `_adding`，但它在本方法里会被置回 False（那是给下一次
+        # 扫描复位的），先留一份下来算结论文案（见 _make_summary）。
+        was_adding = self._adding
         # 扫完的**汇总文案不再走 logMessage**。
         #
-        # **为什么**（踩坑，实测）：原先这里 emit 一句"扫描完成：匹配 N 个，
+        # 原先这里 emit 一句"扫描完成：匹配 N 个，
         # 待确认 M 个"，而 QML 侧 `onLogMessage` 会把每条日志都弹成提示条、
         # `onFinished` 里又弹了同样一句 —— 于是**同一个结果闪两遍**
         # （前一条被后一条覆盖，看起来像抖了一下）。汇总属于"最终结果"，
@@ -553,6 +619,11 @@ class ScannerBridge(QObject):
                 self.logMessage.emit("该目录下没有找到可入库的视频")
             self.subjectAdded.emit(self._added_subject_id)
 
+        # 结论文案要在 `finished` **之前**算好并置位：QML 的
+        # `onFinished` 里直接读 `scanner.resultSummary` 播报。
+        self._result_summary = self._make_summary(was_adding)
+        self.resultSummaryChanged.emit()
+        log.info("扫描结论：%s", self._result_summary)
         self.finished.emit(self._matched, self._pending)
 
     def _on_failed(self, msg: str) -> None:

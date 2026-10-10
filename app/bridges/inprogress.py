@@ -48,10 +48,8 @@ from app.core.database import Database, EpSyncState
 
 log = logging.getLogger(__name__)
 
-# 收藏分页上限。**注意口径变了**：以前是"每类各 600"（看过 600 + 在看 600），
-# 现在一次拉全部状态，600 变成**所有状态共用**的额度 —— 触顶会在尾部静默
-# 截断（`iter_user_collections` 会记 warning）。实测本账号 160 条，
-# 2000 对个人用户足够，同时避免异常账号把内存打爆。
+# 收藏分页上限。 —— 触顶会在尾部静默
+# 截断（`iter_user_collections` 会记 warning）。避免异常账号把内存打爆。
 MAX_ITEMS = 2000
 
 # 收藏状态的中文名（只用于日志）。枚举取值见 bangumi_api 的 COLLECT_TYPE_*。
@@ -148,9 +146,8 @@ def sync_candidates(
        对"请求成功但确实没有逐集标记"的条目（只标了整部状态、剧场版）
        它会**每次刷新都重拉**，形成死循环。正确做法是"成功就写水位"
        （含 0 行，那是终态答案），失败不写 → 下次自然重试。
-    3. **没有用 `ep_status > 0` 当门槛**：实测 `ep_status` 与逐集记录条数
-       **不是一回事**（bangumi_id=515594 的 ep_status=16 却只有 11 条记录），
-       它只省十几个请求，却引入一个不可证伪的假设。
+    3. **没有用 `ep_status > 0` 当门槛**： `ep_status` 与逐集记录条数
+       **不是一回事**，它只省十几个请求，却引入一个不可证伪的假设。
     4. **30 天超期兜底**：覆盖"看过/搁置的番事后补标了几集、而 Bangumi
        没动整部收藏行"这种漏网情形。150 部摊到每天约 5 个请求。
     """
@@ -282,8 +279,7 @@ class _FetchWorker(QThread):
         except BangumiAuthError as e:
             # `e` 里已经是给用户看的那句（「Token 已过期或无效（请到设置页…）」），
             # 直接用它 —— 前面再缀一句「Token 权限不足」只会变成
-            # 「Token 权限不足：Token 已过期…」这种叠词（而且"权限不足"
-            # 正是这次实测里最容易把人带偏的判读：读接口在 Token 过期时同样 401）
+            # 「Token 权限不足：Token 已过期…」这种叠词（读接口在 Token 过期时同样 401）
             log.warning("拉取收藏列表失败（Token 已过期或无效）: %s", e)
             self.finished_items.emit([], str(e))
         except BangumiError as e:
@@ -329,8 +325,6 @@ class _FetchWorker(QThread):
         cover = images.get("large") or images.get("common") or images.get("medium") or ""
 
         # 总集数兜底链：subject.eps → total_episodes → 已看集数。
-        # 实测「碧蓝之海 第三季」的 eps 为 0（Bangumi 数据缺失），
-        # 此时用 ep_status 兜底，至少不会显示成"共 0 集"。
         eps = subject.get("eps") or subject.get("total_episodes") or 0
         ep_status = raw.get("ep_status") or 0
         if not eps and ep_status:
@@ -362,13 +356,11 @@ class _EpisodeWorker(QThread):
 
     为什么需要并发：集级接口是**每部动漫一次请求**
     （`/v0/users/-/collections/{sid}/episodes`），串行拉 160 部要几十秒。
-    线程池 8 并发，实测 120 个请求约 2 秒。
+    线程池 8 并发。
 
     **为什么不再"凑够即停"**：`ep_timeline_count` 只管"动态页显示多少条"，
     而动态页要的是**完整历史** —— 早停会让排在后面的上百部（尤其是"看过"
     的番，它们按收藏时间排序时排在最近追的番后面）永远拉不到。
-    实测症状：库里有 149 部看过番，`watched_episodes` 却只有 4 部的记录。
-    现在"该不该拉"由 `sync_candidates()` 决定（增量），不看显示条数。
 
     **为什么按批发信号**：首次全量约 20 秒，只在结束时发一次会让动态页
     20 秒白屏。每批（BATCH 部）发一次 `synced`，主线程收一批写一批。
@@ -466,8 +458,7 @@ class _EpisodeWorker(QThread):
         # ---- 每个线程一个独立 Session ----
         #
         # **踩坑（性能）**：`requests.Session` **不是线程安全的**。
-        # 多线程共享同一个 Session 时，内部连接池会成为瓶颈，
-        # 实测 30 个请求用 8 并发要 **44 秒**（而独立 Session 只要 2 秒）。
+        # 多线程共享同一个 Session 时，内部连接池会成为瓶颈。
         # 原因是共享 Session 的 `HTTPAdapter` 在多线程下会争用同一批连接，
         # 叠加本项目配置的 3 次重试与指数退避，耗时被放大 20 倍以上。
         #
@@ -578,8 +569,7 @@ class _EpisodeWorker(QThread):
         out["dropped"] = len(raw) - len(rows)   # 总丢弃数（含 type≠2 的，仅供诊断）
         # **判据用的计数**：只统计"本该保留、却因时间戳缺失被丢"的那些。
         # 早先用 `raw_count > 0 而 rows == 0` 当判据 ✗，把"整部没标过单集"
-        # 也当成故障 → 那批条目**每次刷新都被重拉**（实测一次同步刷出
-        # 23 行 WARNING、每轮都重新请求这 23 部 ✗）。
+        # 也当成故障 → 那批条目**每次刷新都被重拉**。
         out["no_time"] = no_time
         out["ok"] = True
         return out
@@ -659,11 +649,18 @@ class _UploadWorker(QThread):
     """
 
     progress = Signal(int, int)               # (已处理, 总数)
-    # (成功数, 失败数, {bangumi_id: [成功上传的 bangumi_ep_id, ...]}, 中止原因)
+    # (成功数, 失败数,
+    #  {bangumi_id: [成功上传的 bangumi_ep_id, ...]},
+    #  {bangumi_id: [失败的 bangumi_ep_id, ...]},
+    #  中止原因)
     # 结果随信号一起送，免得回调里去读可能已被 deleteLater 销毁的 worker ✗
-    # 第四项为空串 = 正常跑完（失败是逐条的网络抖动，可重试）；
+    # 中止原因为空串 = 正常跑完（失败是逐条的网络抖动，可重试）；
     # 非空 = **Token 被拒，整批中止**，重试没有意义（见 run()）。
-    finished_upload = Signal(int, int, object, str)
+    #
+    # 失败清单也一并送（而不是回调里拿 uploaded 反推）：
+    # **中止时剩下的那些集根本没被尝试**（`return` 掉了），
+    # 反推不出它们属于哪一部 —— 而那恰恰是最需要点名的时候。
+    finished_upload = Signal(int, int, object, object, str)
 
     def __init__(
         self,
@@ -681,35 +678,44 @@ class _UploadWorker(QThread):
         done = 0
         total = sum(len(eps) for _, eps in self.tasks)
         uploaded: dict[int, list[int]] = {}
+        failed: dict[int, list[int]] = {}
         aborted = ""            # 非空 = Token 被拒，整批中止（见类说明）
         for bid, eps in self.tasks:
             if aborted:
                 break
             for ep in eps:
+                eid = int(ep["bangumi_ep_id"])
                 try:
-                    self.api.mark_episode_watched(bid, int(ep["bangumi_ep_id"]))
+                    self.api.mark_episode_watched(bid, eid)
                     ok += 1
-                    uploaded.setdefault(int(bid), []).append(
-                        int(ep["bangumi_ep_id"]))
+                    uploaded.setdefault(int(bid), []).append(eid)
                 except BangumiAuthError as e:
                     # 服务器不认 Token：剩下的每一条都会同样失败，别再打了
                     fail += 1
+                    failed.setdefault(int(bid), []).append(eid)
+                    # 本条目**剩余未尝试**的集也算进"失败"名单：它们同样没传上去，
+                    # 日志点名时不该漏掉（否则用户以为就那一集有问题）
+                    rest = [int(x["bangumi_ep_id"]) for x in eps
+                            if int(x["bangumi_ep_id"]) != eid]
+                    if rest:
+                        failed.setdefault(int(bid), []).extend(rest)
                     aborted = str(e)
                     log.warning("补传中止（Token 已过期或无效）：条目 %s 第 %s 集 401，"
                                 "剩余 %s 条未尝试（本地记录都还在，换好 Token 再点一次即可）",
                                 bid, ep.get("ep_index"), total - done - 1)
                     self.progress.emit(total, total)   # 让进度条走完，别停在半路
-                    self.finished_upload.emit(ok, fail, uploaded, aborted)
+                    self.finished_upload.emit(ok, fail, uploaded, failed, aborted)
                     return
                 except Exception as e:
                     fail += 1
+                    failed.setdefault(int(bid), []).append(eid)
                     log.warning("补传条目 %s 第 %s 集失败（本地记录已保留，可重试）: %s",
                                 bid, ep.get("ep_index"), e)
                 done += 1
                 self.progress.emit(done, total)
         log.info("补传完成：成功 %s 条，失败 %s 条（涉及 %s 个条目）",
-                 ok, fail, len(uploaded))
-        self.finished_upload.emit(ok, fail, uploaded, "")
+                 ok, fail, len(uploaded) + len(failed))
+        self.finished_upload.emit(ok, fail, uploaded, failed, "")
 
 
 class _ResolveUserWorker(QThread):
@@ -996,7 +1002,7 @@ class InProgressBridge(QObject):
         - 其余（含"成功且确实 0 条"）→ 写库 + 记水位，那是终态。
           其中"0 条"绝大多数是**整部只标了在看/想看、从没标过单集** ✗ ——
           它们本来就是 0 条，那是终态答案、必须记水位，否则每轮刷新都会
-          重新请求它们（实测一次同步重拉 23 部 ✗）。
+          重新请求它们。
         """
         written = 0
         no_marks = 0        # "成功但确实 0 条"的部数（正常终态，不是跳过）
@@ -1090,6 +1096,68 @@ class InProgressBridge(QObject):
                 log.exception("刷新收藏数据缓存失败")
 
     # ---------- 补传：本地看过 → Bangumi（F21）----------
+
+    @staticmethod
+    def _short_title(title: str, limit: int = 24) -> str:
+        """日志用短标题：截断 + 去掉换行，避免一行日志被撑爆。
+
+        只影响日志，不进界面，所以不需要 `Theme` 那套尺寸口径。
+        """
+        t = (title or "").replace("\n", " ").replace("\r", " ").strip()
+        return t if len(t) <= limit else t[:limit] + "…"
+
+    def _upload_target_desc(self, tasks: list) -> str:
+        """把「本次要补传哪些动漫」拼成一行，供日志/状态栏使用。
+
+        条数多时只列前几个再收尾 —— 日志是给人扫一眼的，
+        列 20 部反而把关键信息（有没有那一部）淹掉。
+        """
+        parts: list[str] = []
+        for _bid, eps in tasks:
+            sid = int((self._upload_meta.get(int(e["bangumi_ep_id"])) or {})
+                      .get("subject_id") or 0) if eps else 0
+            name = self._subject_display_name(sid)
+            parts.append(f"{name}（{len(eps)} 集）")
+        if len(parts) > 5:
+            head = "、".join(parts[:5])
+            return f"{head} 等 {len(parts)} 部"
+        return "、".join(parts)
+
+    def _upload_subject_names(self, by_bangumi: dict | None) -> list[str]:
+        """`{bangumi_id: [ep_id, ...]}` → 去重后的动漫名列表（按首次出现排序）。"""
+        names: list[str] = []
+        seen: set[str] = set()
+        for ep_ids in (by_bangumi or {}).values():
+            for eid in (ep_ids or []):
+                meta = self._upload_meta.get(int(eid)) or {}
+                sid = int(meta.get("subject_id") or 0)
+                if sid <= 0:
+                    continue
+                name = self._subject_display_name(sid)
+                if name not in seen:
+                    seen.add(name)
+                    names.append(name)
+        return names
+
+    def _subject_display_name(self, subject_id: int) -> str:
+        """本地条目名（中文名优先），查不到就退回 `#id`。
+
+        **必须按 subject_id 回查库**：`_upload_meta` 里虽然也带了
+        `subject_name`，但那个名字是**补传开始时**取的 —— 它是
+        `uploadEpisodes()` 里同一处循环填进去的，两者同源。
+        这里仍回查是为了让日志口径只有一个来源（`get_subject`），
+        改动条目的显示名规则时不用同步改两处。
+        """
+        if subject_id <= 0:
+            return "未知条目"
+        try:
+            subj = self._db.get_subject(int(subject_id))
+        except Exception:
+            subj = None
+        if subj is None:
+            return f"#{subject_id}"
+        return self._short_title(subj.name_cn or subj.name or f"#{subject_id}")
+
     @Slot("QVariantList", result="QVariantMap")
     def uploadEpisodes(self, episode_ids: list) -> dict:
         """把**勾选的那几集**补传到 Bangumi（**幂等**）。
@@ -1174,8 +1242,11 @@ class InProgressBridge(QObject):
         self._upload_worker.finished_upload.connect(self._on_upload_finished)
         self._upload_worker.finished.connect(self._upload_worker.deleteLater)
         self._upload_worker.start()
-        log.info("开始补传：勾选 %s 集 / 实际待传 %s 集 / %s 个条目（%s 集所在条目未匹配 Bangumi，已跳过）",
-                 len(ids), total, len(tasks), unmatched)
+        # 日志要点名**具体是哪几部动漫**——只报 "N 集 / M 个条目"
+        # 时，出问题（传错条目、漏了某部）完全看不出来。
+        log.info("开始补传：勾选 %s 集 / 实际待传 %s 集 → %s"
+                 "（%s 集所在条目未匹配 Bangumi，已跳过）",
+                 len(ids), total, self._upload_target_desc(tasks), unmatched)
         msg = f"开始补传 {total} 集（{len(tasks)} 部）…"
         if blocked:
             msg += f"；另有 {blocked} 集缺 Bangumi 集号，无法补传"
@@ -1189,6 +1260,7 @@ class InProgressBridge(QObject):
 
     def _on_upload_finished(self, ok: int, fail: int,
                             uploaded: dict | None = None,
+                            failed: dict | None = None,
                             aborted: str = "") -> None:
         """补传结束：**先写回本地**，再让那些条目的集级记录重新同步一次。
 
@@ -1223,7 +1295,7 @@ class InProgressBridge(QObject):
         # = **本季第几集**（1~total_eps），而 `_upload_meta["ep_index"]` 是扫描
         # 写入的**全系列累计集号** —— 史莱姆第四季本地是 `[S4][01_73]`…
         # `[21_93]`、`total_eps` 却只有 24，补传第 95 集就把 95 写进了那一列，
-        # 页面显示成 **"95 / 24 集"**（实测 2026-10-08，库里的行还在）。
+        # 页面显示成 **"95 / 24 集"**。
         # `LibraryBridge._load_inprogress` 那道"本地集号 > 本季集数就不采信"的
         # 闸门只守**本地那一侧**（它读 `episodes` 表）；缓存这一侧的值被当成
         # 服务端真值原样上屏，拦不住 ✗ —— 两种编号必须分开放，别混进同一列。
@@ -1237,6 +1309,17 @@ class InProgressBridge(QObject):
         # 一起往后推 —— **推迟**下一次从 Bangumi 拉全量的自我纠正，越帮越乱。
         touched = set((uploaded or {}).keys())
 
+        # ---- 1c. 点名具体动漫----
+        # 上传失败的条目**尤其**要点名：日志里只有 "成功 3 / 失败 2"
+        # 时，用户根本不知道该重传哪一部。成功的一并列出，
+        # 是为了对照确认"我勾的那几部是不是都传上去了"。
+        ok_names = self._upload_subject_names(uploaded)
+        if ok_names:
+            log.info("补传成功 %s 条，涉及动漫：%s", ok, "、".join(ok_names))
+        fail_names = self._upload_subject_names(failed)
+        if fail_names:
+            log.info("补传失败 %s 条，涉及动漫：%s", fail, "、".join(fail_names))
+
         # ---- 2. 再让这些条目的集级记录重新同步一次（水位数对不上，拉一次校正）----
         try:
             for bid in touched:
@@ -1244,8 +1327,7 @@ class InProgressBridge(QObject):
             if touched:
                 # 动态页：集级记录变了
                 self._refresh_ep_view()
-                # **在看页也要刷**（实测需求："在动态页补传后对在看页进行刷新，
-                # 否则数据不更新"）—— 这一页有两处会因为补传而变：
+                # **在看页也要刷**—— 这一页有两处会因为补传而变：
                 #   · "待上传 N 集"：`pending_uploads()` 的**现查结果**，刚传上去的
                 #     那几集已经从清单里消失了
                 #   · "已看 N 集"：取 `max(缓存, 本地已看最大集号)`（见上面 1b）
@@ -1281,11 +1363,14 @@ class InProgressBridge(QObject):
             self.message.emit(f"补传中止：{aborted}{tail}")
             return
         if fail:
-            # 失败的不清掉"待上传"状态 —— 小窗里再点一次即只补它们
+            # 失败的不清掉"待上传"状态 —— 小窗里再点一次即只补它们。
+            # **点名失败的动漫**：只报条数时用户不知道自己去小窗里该找哪一部。
+            who = f"（{'、'.join(fail_names)}）" if fail_names else ""
             self.message.emit(
-                f"补传完成：成功 {ok} 条，失败 {fail} 条（可再点一次只补失败的）")
+                f"补传完成：成功 {ok} 条，失败 {fail} 条{who}（可再点一次只补失败的）")
         else:
-            self.message.emit(f"补传完成：{ok} 条已同步到 Bangumi")
+            who = f"（{'、'.join(ok_names)}）" if ok_names else ""
+            self.message.emit(f"补传完成：{ok} 条已同步到 Bangumi{who}")
 
     @Slot(str)
     def resolveUsername(self, token: str = "") -> None:

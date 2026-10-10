@@ -28,7 +28,7 @@ from datetime import date
 import requests
 
 from app import USER_AGENT, __version__
-from app.core.bangumi_api import describe_connection_error
+from app.core.bangumi_api import describe_connection_error, is_server_side_error
 
 log = logging.getLogger(__name__)
 
@@ -101,19 +101,57 @@ def is_newer(remote: str, local: str = __version__) -> bool:
     return a > b
 
 
-def fetch_latest(timeout: float = TIMEOUT) -> UpdateInfo:
-    """问一次 GitHub，返回 `UpdateInfo`。**不抛异常**（见模块说明）。"""
+def _proxy_hint(exc: Exception, proxy: str) -> str:
+    """失败原因后面补一句"走的是哪个代理"（空串 = 不加）。
+
+    与 `BangumiClient._network_hint` 同一套判断，只是这里没有会话：
+    用户填了就用填的那个，留空则把**实际生效的系统代理**读出来
+    （`get_environ_proxies`）——留空不等于"没走代理"，不点明的话
+    用户会以为程序压根没走代理。
+    """
+    if is_server_side_error(exc):
+        return ""                      # 服务端 5xx：流量已通，别引去查代理
+    if proxy:
+        return f" —— 已走代理 {proxy.split('://')[-1]}"
+    try:
+        env = requests.utils.get_environ_proxies(API_LATEST) or {}
+    except Exception:                  # pragma: no cover - 防御性
+        env = {}
+    addr = env.get("https") or env.get("http") or ""
+    return f" —— 已走系统代理 {addr.split('://')[-1]}" if addr else ""
+
+
+def fetch_latest(timeout: float = TIMEOUT, proxy: str = "") -> UpdateInfo:
+    """问一次 GitHub，返回 `UpdateInfo`。**不抛异常**（见模块说明）。
+
+    `proxy` 是设置页「代理」里填的那个（空串 = 不指定，走系统代理）——
+    与 Bangumi 客户端同一口径，见下面 `proxies` 的说明。
+    """
     try:
         resp = requests.get(
             API_LATEST,
             timeout=timeout,
+            # **必须逐请求显式传**，不能只靠环境/系统代理：GitHub 在国内
+            # 基本只有走代理才通，而设置页那个代理本应用只在 Bangumi 侧用过
+            # 不传的话"填了代理"对检查更新无效，表现为"API 能通、检查更新永远失败"。
+            #
+            # 显式 `proxies=` 的优先级**高于**环境代理（见 requests 的
+            # `Session.request` → `merge_setting(proxies, self.proxies)`），
+            # 所以填了就一定用它；留空传 `None` 才是"交给系统代理"
+            # —— 与 `rss_feed.fetch` 同一套写法。
+            proxies=({"http": proxy, "https": proxy} if proxy else None),
             # GitHub 要求带 User-Agent（缺了会 403）；这里复用项目那份 ——
             # 里面的联系方式也正是"出问题该找谁"。
             headers={"User-Agent": USER_AGENT,
                      "Accept": "application/vnd.github+json"},
         )
     except Exception as e:
-        msg = describe_connection_error(e) or str(e)
+        hint = describe_connection_error(e)
+        # 只有**已归类为网络问题**的失败才补"走的是哪个代理"：GitHub 连不
+        # 上时，"填了代理却没生效"和"代理生效了但节点不通"是两件事，光看
+        # "网络不通"分不出来。认不出来的错误（如响应不是 JSON）原样报
+        # —— 口径与 Bangumi 侧 `BangumiClient._network_hint` 完全一致。
+        msg = (hint + _proxy_hint(e, proxy)) if hint else str(e)
         log.info("检查更新失败（网络）：%s", msg)
         return UpdateInfo("failed", error=msg)
 

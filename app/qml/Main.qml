@@ -180,6 +180,8 @@ ApplicationWindow {
 
             SubscriptionPage {
                 id: subscriptionPage
+                // 与相邻各页一致：给个 objectName，自动化脚本才找得到这一页
+                objectName: "subscriptionPage"
                 onStatusMessage: function (text) {
                     statusBar.setMessage(text, 5000)
                 }
@@ -1012,6 +1014,7 @@ ApplicationWindow {
     // 再弹一遍 —— 否则同一次事件会出现两条措辞不同的提示。
     Item {
         id: banner
+        objectName: "banner"             // 诊断/探针用（读 messages 验文案）
 
         // 每条消息：{ text, warn, action, subjectId }
         property var messages: []
@@ -1225,21 +1228,18 @@ ApplicationWindow {
 
         // 扫描结果的统一播报（**只在这里播一次**）。
         //
-        // 措辞分两种：
-        //   单个目录（「添加动漫」/ 详情页重扫）：
-        //       只报**一个**结论 —— "扫描完成：已匹配" 或 "扫描完成：未匹配"。
-        //       **不带原因**：失败原因由那条黄色提示负责说明，这里复述
-        //       一遍只会让两条提示内容重叠。
-        //   全量扫描：沿用"匹配 N 个，待确认 M 个"（扫一整个库，
-        //       用"个"计数才自然，也能一眼看出规模）。
+        // 文案**由后端给**（`scanner.resultSummary`），这里不再自己拼 ——
+        // 数量推不出结论：详情页重扫一条**已经关联 Bangumi** 的条目时，
+        // 扫描走 manual 记录保护、**跳过重新匹配**，`matched` 恒为 0，
+        // 而旧版据此报"扫描完成：未匹配"。
+        // 各种情形（重扫 / 添加动漫勾没勾匹配 / 空目录）的措辞见
+        // `ScannerBridge._make_summary`。
+        //
+        // **注意与上面那条琥珀警告的分工**：结论只说一句，失败原因由
+        // onMatchFailed 的黄条负责，这里复述一遍只会让两条内容重叠。
         function onFinished(matched, pending) {
-            if (scanner.singleScan) {
-                banner.show(matched > 0 ? "扫描完成：已匹配"
-                                        : "扫描完成：未匹配")
-            } else {
-                banner.show("扫描完成：匹配 " + matched
-                            + " 个，待确认 " + pending + " 个")
-            }
+            if (scanner.resultSummary !== "")
+                banner.show(scanner.resultSummary)
             library.reload()
         }
 

@@ -22,8 +22,11 @@ Rectangle {
     ///
     /// 给**纯数字的短输入框**用（如「Web UI 端口」）：整段选中后敲的第一个字符直接替换整个值；想局部改
     /// 再点一下即可（那时焦点没变、不会再全选）。
-    /// 同时打开 `selectByMouse`（允许拖选），否则框里的字只能用键盘选。
     /// 与 `NumberStepper` 里的处理保持同一套手感。
+    ///
+    /// **不再兼职"能不能拖选"**：早期它同时兼着 `selectByMouse`，
+    /// 于是默认 `false` 的那些框（全应用绝大多数）连按住左键拖都选不中字。
+    /// 两件事已经拆开 —— 拖选见下面 `selectByMouse`，恒定打开。
     property bool selectAllOnFocus: false
 
     signal accepted()
@@ -84,8 +87,16 @@ Rectangle {
         selectedTextColor: Theme.accentText
         echoMode: root.echoPassword ? TextInput.Password : TextInput.Normal
         clip: true
-        // 见 selectAllOnFocus 的说明（默认关，只有数字框开）
-        selectByMouse: root.selectAllOnFocus
+        // ---- 鼠标拖选：**恒定打开** ----
+        //
+        // 裸 `TextInput` 的 `selectByMouse` 默认是 `false`（只有
+        // QtQuick.Controls 的 `TextField` 才默认 `true`）—— 于是框里的字
+        // 只能用键盘选：按住左键从第一个字拖到最后一个字，松手时**一个都没
+        // 选上**。
+        //
+        // 与只读态不冲突：只读时上面那层 MouseArea 吃掉了点击
+        // （`acceptedButtons: Qt.AllButtons`），根本到不了这里。
+        selectByMouse: true
         onActiveFocusChanged: {
             if (root.selectAllOnFocus && activeFocus)
                 selectAll()
