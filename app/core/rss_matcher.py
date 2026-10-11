@@ -4,8 +4,6 @@
 1. 标题清洗 → 提取动漫名 + 集数序号
 2. 两层查重：本地媒体库 → qBittorrent 任务
 3. 按该订阅自己的规则（`rss_sources.rule`：只下新集 / 全部下载）决定是否下发
-
-注：原第 3 层"download_history"已按实测需求去掉，见 `_dedup`。
 """
 
 from __future__ import annotations
@@ -20,19 +18,12 @@ from app.core.config import Config
 from app.core.database import Database, RssSource
 from app.core.qbittorrent_api import QbClient
 from app.core.rss_feed import FeedEntry
-from app.utils.title_parser import extract_episode_index, clean_anime_title
+from app.utils.title_parser import (
+    extract_episode_index, episode_candidates, clean_anime_title)
 
 log = logging.getLogger(__name__)
 
-# 下载规则（**只剩两个**）
-#
-#
-# **踩坑（实测，很隐蔽）**：`RULE_ALL` 原先**没有被定义**，`VALID_RULES`
-# 里也没有 `"all"` —— 而界面上的「全部下载」存的正是 `"all"`。
-# 于是用户选「全部下载」后，`_resolve_rule` 把它当成未知规则，
-# **静默回退成 new_only**（只打一条 warning 日志）：
-#     用户看到的现象是"两个选项选哪个都一样"。
-# 现在补上定义并加进 VALID_RULES。
+# 下载规则
 RULE_NEW_ONLY = "new_only"        # 只下本地媒体库没有的集
 RULE_ALL = "all"                  # 不看本地，没下载过就下（补齐用）
 
@@ -81,7 +72,7 @@ _ILLEGAL_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 # 季数表达：第N季 / 第N部分 / 第N期 / SN / Season N / Nth season / Ⅱ Ⅲ Ⅳ…
 #
-# **只用于"系列目录下的子目录名"**（方案 A），不参与任何匹配逻辑 ——
+# **只用于"系列目录下的子目录名"**，不参与任何匹配逻辑 ——
 # 匹配靠 Bangumi 与标题清洗，这里纯粹是给文件找个不重名的落脚点。
 #
 # **顺序有讲究**（`_season_dir_name` 取**第一个**命中的）：越具体的排前面。
@@ -95,8 +86,6 @@ _SEASON_HINTS = [
     # ② 中文「篇章名 + 篇」——**必须排在最后且要求前置字非空**，
     #    否则会把「第N篇」里的单个"篇"字、以及番名里恰好以"篇"结尾的字
     #    （如某些作品名）一起吞掉。
-    #    实测案例：'鬼灭之刃 刀匠村篇' → 期望 '刀匠村篇'。
-    #    用 `[^\s]{1,6}篇` 限长，避免把整句都吃进来。
     r"[^\s]{1,6}篇",
 ]
 _SEASON_RES = [re.compile(p) for p in _SEASON_HINTS]
@@ -181,6 +170,13 @@ class JudgeResult:
     reason: str
     subject_id: Optional[int] = None
     is_pack: bool = False
+    #: 查重命中的**层次**：`"local"` / `"qb"`；空串 = 不是查重挡下的。
+    #:
+    #: 用途是让调用方收尾：这一集已经被确认"不用下了"，那么这条
+    #: (订阅, 集号) 上残留的失败记录也该跟着收尾（见
+    #: `PollWorker._clear_stale_failure`）。**不能用 `reason` 文本来判**——
+    #: 那是给人看的文案，改一个字这里就静默失效了。
+    dedup_hit: str = ""
 
 
 class RssMatcher:
@@ -240,12 +236,7 @@ class RssMatcher:
         # 判新要在**本地 episodes** 上做（查"这一集本地有没有"），所以这里
         # 要的是**本地 subjects.id**，不是 bangumi_id。
         #
-        # **踩坑（实测）**：早期写的是 `source.bangumi_id or 模糊匹配` ——
-        # 而 `_match_local_subject` 返回的和下面的 `list_local_ep_indices`
-        # 需要的都是**本地主键**，两者混用会让"已绑定的订阅"查错条目
-        # （用 bangumi_id 去当本地 id 查，永远查不到 → 判新失效、重复下载）。
-        #
-        # 现在优先取绑定关系（v10 起存 local_subject_id），没绑定才退回
+        # 优先取绑定关系（v10 起存 local_subject_id），没绑定才退回
         # 用标题模糊匹配本地条目。
         subj_id = (source.local_subject_id
                    or self._match_local_subject(title))
@@ -258,10 +249,10 @@ class RssMatcher:
 
         ep_for_db = float(ep_index) if ep_index is not None else 0.0
 
-        # **规则必须在查重之前解析**（踩坑）：`_dedup` 要看规则 ——
+        # **规则必须在查重之前解析**：`_dedup` 要看规则 ——
         # `all` 要**整套跳过查重**，`new_only` 才走那两层。
         # 早期把 `_resolve_rule` 放在查重之后，于是查重永远拿不到规则、
-        # 两个规则效果相同（实测反馈"行为一样"）。
+        # 两个规则效果相同。
         rule = self._resolve_rule(source)
 
         # ---- 顺序：闸门/开关在前，查重在后 ----
@@ -284,7 +275,7 @@ class RssMatcher:
         # 判据用独立的 `downloader_saved` 标记而不是"过滤词是否为空"：
         # 用户可能**就是**不想过滤（两个框留空），那也是一种有效的保存。
         #
-        # **位置必须在查重之前**（实测修复）：早期这段放在 `_dedup` 之后，
+        # **位置必须在查重之前**：早期这段放在 `_dedup` 之后，
         # 于是"没保存过"的订阅在预览里**每一条都返回这句话** —— 查重
         # 算出来的结论（本地已有 / qB 有同名任务）被这个原因文案盖掉，
         # 用户看到 12 条一模一样的"未配置下载器"，误以为查重根本没跑。
@@ -323,10 +314,11 @@ class RssMatcher:
         # 走到这一步说明该集是"确实需要下载的新内容"，两个规则在此
         # 行为一致 —— 这正是期望的结果。
         if rule != RULE_ALL:
-            hit = self._dedup(entry, source, subj_id, ep_for_db, is_pack, rule)
+            hit, where = self._dedup(entry, source, subj_id, ep_for_db,
+                                     is_pack, rule)
             if hit:
                 return JudgeResult(entry, ep_for_db, False, False, hit,
-                                   subj_id, is_pack)
+                                   subj_id, is_pack, dedup_hit=where)
 
         # 走到这里 = 允许下载。
         #
@@ -347,8 +339,11 @@ class RssMatcher:
         ep_index: float,
         is_pack: bool,
         rule: str,
-    ) -> str:
-        """返回非空字符串表示命中（已被下载/已存在）。
+    ) -> tuple[str, str]:
+        """返回 `(命中原因, 命中层次)`；原因为空串表示没命中。
+
+        第二项是给调用方收尾用的（`"local"` / `"qb"`）—— 命中说明"这一集
+        已经不用下了"，那么这条 (订阅, 集号) 上残留的失败记录也该跟着收尾。
 
         **只在 `new_only` 下被调用**（`all` 在 `judge` 里就跳过了整套查重，
         见那里的说明），所以这里不再判断规则。
@@ -356,33 +351,26 @@ class RssMatcher:
         **两层**都是"这集我这儿已经有了"的不同口径：
           ① 本地媒体库 —— 硬盘上有文件（可能是别处拷来的，程序没下过）
           ② qBittorrent 现有任务 —— 正在下或下完了
-        （原第③层"下载历史"已按实测需求去掉，见下方说明）
         """
         # ① 本地媒体库
-        if not is_pack and self._is_already_local(subject_id, ep_index):
-            return f"本地媒体库已有第 {ep_index:g} 集"
+        if not is_pack and self._is_already_local(subject_id, ep_index,
+                                                  entry.title):
+            return f"本地媒体库已有第 {ep_index:g} 集", "local"
 
         # ② qBittorrent 现有任务
-        if self.qb is not None:
+        #
+        # **已知连不上就整层跳过**（不发请求、也不打日志）：qBittorrent 没开
+        # 是很常见的状态，而一次失败的连接要十几秒。一轮轮询里可能有很多条都走到这里，每条都去撞一次
+        # 会把整轮拖垮；而失败原因在被跳过的**第一条**里已经记过了，
+        # 再刷 N 行一模一样的话没有意义。
+        if self.qb is not None and not getattr(self.qb, "known_unavailable", False):
             try:
                 if self.qb.has_torrent_like(entry.title):
-                    return "qBittorrent 中已存在同名任务"
+                    return "qBittorrent 中已存在同名任务", "qb"
             except Exception as e:
                 log.warning("qBittorrent 查重失败（跳过该层）：%s", e)
 
-        # **没有第 ③ 层**（实测需求："本程序下载过就跳过不需要"）。
-        #
-        # 早期这里还有一层「下载历史中已存在」，去掉了。原因：
-        #   - 这一层与 ①② 高度重叠 —— 下过的集要么文件已在媒体库
-        #     （① 命中），要么 qB 里还有任务（② 命中），真正"只有下载
-        #     记录能挡住"的只剩"下完就删了源文件、qB 任务也清了"这种
-        #     边角情形；
-        #   - 用户明确表示不需要这种拦截。
-        #
-        # **代价（写在这里免得以后当成 bug 来查）**：上面那种边角情形
-        # 下，重新检查时会**再下一次**。如果需要"无论如何都不重下"，
-        # 用 `all` 之外的行为无法表达 —— 这是刻意接受的取舍。
-        return ""
+        return "", ""
 
     # ---------- 保存路径（下载到指定条目的目录）----------
     def plan_save_path(self, source: RssSource) -> tuple[str, str, bool]:
@@ -493,15 +481,6 @@ class RssMatcher:
         #     → 条目永远没有集数（详情页一直显示"没有集数"），
         #       `total_eps` 也一直是 0（连"是否看完"都判不了）。
         #
-        # **踩坑（实测"扫描出一个新条目"，同一目录出现两张卡）**：
-        # 早期这段写回放在了 `if exists: return path` **之后** —— 于是
-        # "目录已经存在"（比如用户手动建好了、或上一轮下载已经建过）
-        # 时就**跳过了写回**，`folder_path` 仍然是空。后果不止是扫不了：
-        #     ① 扫描匹配失败 → `upsert_pending_subject` 按 `folder_path`
-        #        判重 → 查不到空路径的它 → **新插一条 pending 占位**；
-        #     ② 再扫一次匹配成功 → `upsert_subject` 按 `bangumi_id` 找到
-        #        原条目并更新它 —— 于是同一目录留下**两条**：
-        #        一条 auto（原条目）+ 一条孤儿 pending（实测 #890/#891）。
         # 现在把写回**移到 `exists` 判断之外**，两个分支都会补上路径，
         # 判重键因此能对上，不再产生重复条目。
         #
@@ -535,10 +514,26 @@ class RssMatcher:
                 out.append(Path(p))
         return out
 
-    def _is_already_local(self, subject_id: Optional[int], ep_index: float) -> bool:
+    def _is_already_local(
+        self, subject_id: Optional[int], ep_index: float, title: str = ""
+    ) -> bool:
+        """本地媒体库里有没有这一集。
+
+        **为什么要拿多个候选号去比**：RSS 侧与扫描侧是两套解析器
+        （见 `title_parser.extract_episode_index` 的长注释），同一个文件
+        算出来的集号有可能不一致 —— 拿单值去比，一旦不一致就**永远**
+        判成新集，每轮轮询反复下发同一集。这里把「明确写法」的候选都拿去
+        比一遍，任一命中即认为本地已有。
+
+        候选只取明确写法（`episode_candidates` 的说明见 title_parser）：
+        收纳「随便一个独立数字」会把真正缺的那集误判成已有。
+        """
         if subject_id is None:
             return False
-        return ep_index in self.db.list_local_ep_indices(subject_id)
+        local = self.db.list_local_ep_indices(subject_id)
+        if ep_index in local:
+            return True
+        return any(c in local for c in episode_candidates(title))
 
     # ---------- 辅助 ----------
     def _resolve_rule(self, source: RssSource) -> str:

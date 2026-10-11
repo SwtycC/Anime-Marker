@@ -36,7 +36,7 @@ from typing import Optional
 
 import requests
 from requests.adapters import HTTPAdapter
-from PySide6.QtCore import QObject, Property, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, Property, QTimer, Signal, Slot
 
 from app.core.bangumi_api import (
     COLLECT_TYPE_DOING, COLLECT_TYPE_DONE, COLLECT_TYPE_DROPPED,
@@ -45,6 +45,7 @@ from app.core.bangumi_api import (
 )
 from app.core.config import Config
 from app.core.database import Database, EpSyncState
+from app.utils.qt_thread import NamedThread
 
 log = logging.getLogger(__name__)
 
@@ -198,7 +199,7 @@ def _parse_iso(value: str) -> Optional[datetime]:
     return dt
 
 
-class _FetchWorker(QThread):
+class _FetchWorker(NamedThread):
     """后台拉取收藏列表（**动画 · 看过 + 在看**，见 run() 里的说明）。
 
     两类都拉的原因：动态页的逐集记录主要产生于追番期间，只收「看过」
@@ -351,7 +352,7 @@ class _FetchWorker(QThread):
         }
 
 
-class _EpisodeWorker(QThread):
+class _EpisodeWorker(NamedThread):
     """并发拉取集级观看记录（F20）—— **全量同步 + 按批回传**。
 
     为什么需要并发：集级接口是**每部动漫一次请求**
@@ -634,7 +635,7 @@ class _EpisodeWorker(QThread):
         return out[:limit]
 
 
-class _UploadWorker(QThread):
+class _UploadWorker(NamedThread):
     """把「本地看过、Bangumi 还没标」的集逐条补传（F21）。
 
     - **为什么走线程**：一次可能几十条 POST，串行要几秒到几十秒，放 UI 线程会卡界面。
@@ -718,7 +719,7 @@ class _UploadWorker(QThread):
         self.finished_upload.emit(ok, fail, uploaded, failed, "")
 
 
-class _ResolveUserWorker(QThread):
+class _ResolveUserWorker(NamedThread):
     """后台解析 Token 对应的 username（设置页「检测」按钮）。
 
     独立成 QThread 的理由见 `InProgressBridge.resolveUsername` 的说明：

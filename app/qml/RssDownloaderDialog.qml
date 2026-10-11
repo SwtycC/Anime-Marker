@@ -90,6 +90,20 @@ Window {
                                         && scanner
                                         ? scanner.running : false
 
+    /// 左栏宽度（**可拖动**，见下方 splitter）。
+    ///
+    /// **为什么必须给最小值**：
+    /// 左栏里有「必须包含」「必须不包含」两个输入框和条目列表，拖到
+    /// 几十像素后这些控件全被压扁到不可用，用户还得自己拖回来 ——
+    /// 比不能拖更糟。`minLeftWidth` 保证拖到底也还剩得下那两个输入框。
+    ///
+    /// 上限定成"总宽 - 预览最小宽"，防止把右栏挤没（预览是本弹窗的
+    /// 主要价值，不能被拖到看不见）。
+    property int leftWidth: Math.max(minLeftWidth,
+                                     Math.round(width * 0.5) - Theme.spacingXl / 2)
+    readonly property int minLeftWidth: 320
+    readonly property int minRightWidth: 260
+
     // 预览（来自 RssBridge 的 Property）
     readonly property var previewItems: typeof rss !== "undefined" && rss
                                         ? rss.previewItems : []
@@ -303,7 +317,12 @@ Window {
         // ============ 左：设置 ============
         Column {
             id: leftCol
-            width: Math.round(parent.width * 0.5) - Theme.spacingXl / 2
+            // 宽度由 `dlg.leftWidth` 决定（可拖动，见下方 splitter）；
+            // 这里再夹一次上下限：窗口 resize 到很窄时不能让它溢出。
+            width: Math.max(dlg.minLeftWidth,
+                            Math.min(dlg.leftWidth,
+                                     parent.width - dlg.minRightWidth
+                                     - splitter.width - Theme.spacingXl * 2))
             spacing: Theme.spacingMd
 
             Text {
@@ -552,9 +571,76 @@ Window {
             }
         }
 
+        // ============ 中：可拖拽分隔条 ============
+        //
+        // **为什么需要它**：
+        // 两栏各占一半时文件名只能显示十几个字，用户想看完整名字得往左拖。
+        //
+        // 命中区域比视觉宽度大（线 3px、命中 10px）：3px 的细线很难点中。
+        // 用 `Item` 容器承载更宽的 MouseArea，线本身只是里面的一根 Rectangle。
+        Item {
+            id: splitter
+            width: 10
+            height: parent.height
+
+            // **只在「悬停」或「正在拖」时亮起**。
+            readonly property bool hot: dragArea.containsMouse || dragArea.dragging
+
+            Rectangle {
+                anchors.centerIn: parent
+                width: 3
+                height: parent.height
+                radius: width / 2
+                color: splitter.hot ? Theme.accent : Theme.border
+                Behavior on color { ColorAnimation { duration: Theme.durFast } }
+            }
+
+            MouseArea {
+                id: dragArea
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.SplitHCursor
+                // 拖动中不要被别的手势抢走（TapHandler 那个"点空白清焦点"
+                // 就在最上层，见文件末尾）
+                preventStealing: true
+
+                /// 是否正在拖动（**自己维护**，MouseArea 没有内置的 dragging）
+                property bool dragging: false
+                property real pressX: 0
+                property real startWidth: 0
+
+                onPressed: function (mouse) {
+                    dragging = true
+                    pressX = mouse.x
+                    startWidth = leftCol.width
+                }
+                onReleased: dragging = false
+                // 拖动中被取消（比如窗口失焦）也要复位，否则线一直亮
+                onCanceled: dragging = false
+
+                onPositionChanged: function (mouse) {
+                    if (!dragging)
+                        return
+                    var want = startWidth + (mouse.x - pressX)
+                    // 上下限在**赋值处**夹紧：既是"最小值"的保证，
+                    // 也避免把右栏挤成 0 宽（预览直接消失）。
+                    dlg.leftWidth = Math.max(
+                        dlg.minLeftWidth,
+                        Math.min(want,
+                                 dlg.width - dlg.minRightWidth
+                                 - Theme.spacingXl * 2 - width))
+                }
+                // 双击恢复默认对半分（常见的分隔条交互，用户不用手拖回去）
+                onDoubleClicked: dlg.leftWidth = Math.max(
+                    dlg.minLeftWidth,
+                    Math.round(dlg.width * 0.5) - Theme.spacingXl / 2)
+            }
+        }
+
         // ============ 右：预览 ============
         Column {
-            width: parent.width - leftCol.width - Theme.spacingXl
+            width: parent.width - leftCol.width - splitter.width
+                   - Theme.spacingXl * 2
             height: parent.height
             spacing: Theme.spacingSm
 
@@ -596,16 +682,45 @@ Window {
                 clip: true
 
                 Flickable {
+                    id: prevFlick
                     anchors.fill: parent
                     anchors.margins: 2
                     clip: true
                     contentHeight: prevList.implicitHeight
+
+                    // ---- 横向滚动----
+                    //
+                    // 现在改为**显式测量**：维护 `longestRowWidth`
+                    // （见下面 `_rowWidth`），它才是真正需要滚动的宽度。
+                    contentWidth: Math.max(prevFlick.width, longestRowWidth)
                     boundsBehavior: Flickable.StopAtBounds
                     ScrollBar.vertical: AppScrollBar { policy: ScrollBar.AsNeeded }
+                    ScrollBar.horizontal: AppScrollBar {
+                        policy: ScrollBar.AsNeeded
+                    }
+
+                    /// 所有预览行里**最宽的那一行**需要占的宽度（含左侧
+                    /// 状态标签 + 间距 + 标题文字）。
+                    ///
+                    /// 由每行自己在 `onImplicitWidthChanged` 时上报 ——
+                    /// 这是唯一能拿到"文字真实宽度"的办法：`Text.implicitWidth`
+                    /// 在没设 `width` 时就是完整内容宽度，而它**不会**被
+                    /// 自动汇总到父 Column（见上方踩坑一）。
+                    property real longestRowWidth: 0
+
+                    /// 行上报宽度：只增不减地记录最大值。
+                    /// 行被销毁（刷新预览）时由 `prevList` 重建，值会重新累计。
+                    function reportRowWidth(w) {
+                        longestRowWidth = Math.max(longestRowWidth, w)
+                    }
 
                     Column {
                         id: prevList
-                        width: parent.width
+                        // 宽度仍绑视口：短名字时各行填满整块背景。
+                        // 需要更宽时由上面 `contentWidth` 决定滚动范围，
+                        // 行内文字靠 `implicitWidth` 溢出（Flickable 不裁剪
+                        // 子项，只有它自己 `clip`）。
+                        width: prevFlick.width
 
                         Repeater {
                             model: dlg.previewItems
@@ -641,13 +756,24 @@ Window {
                                         }
                                     }
 
+                                    // 文字块：`width` 仍是"视口内可用宽度"
+                                    // （保证行高与布局稳定），但**不再 elide** ——
+                                    // 超出部分溢出到右侧，靠外层横滚查看。
+                                    //
+                                    // **行宽 = 标签(52) + 两段间距 + 标题实际宽度**。
+                                    // 标题与原因两个 Text 都要参与取最大值
+                                    // （原因文案也可能很长，如"本地媒体库已有第 1 集"）。
                                     Column {
+                                        id: prevText
                                         anchors.verticalCenter: parent.verticalCenter
                                         width: parent.width - 52 - Theme.spacingSm * 2
                                         spacing: 1
 
                                         Text {
-                                            width: parent.width
+                                            id: prevTitle
+                                            // **故意不设 width**：让 Text 按内容
+                                            // 自然撑开，`implicitWidth` 就是完整
+                                            // 标题宽度（长文件名体现在这里）。
                                             text: (modelData.ep > 0
                                                    ? "EP" + Math.round(
                                                          modelData.ep * 100) / 100
@@ -658,17 +784,37 @@ Window {
                                                    ? Theme.textPrimary
                                                    : Theme.textTertiary
                                             font.pixelSize: Theme.fontXs
-                                            elide: Text.ElideRight
+                                            // **不要写 elide**（见 Flickable 说明）
                                         }
 
                                         Text {
-                                            width: parent.width
+                                            id: prevReason
                                             visible: (modelData.reason || "") !== ""
                                             text: modelData.reason || ""
                                             color: Theme.textTertiary
                                             font.pixelSize: Theme.fontXs
-                                            elide: Text.ElideRight
+                                            // 同样不 elide，但只有在可见时
+                                            // 才参与行宽（隐藏的 Text 也占
+                                            // implicitWidth，会把行算宽）
                                         }
+
+                                        // 上报本行需要的总宽度（见 prevFlick 说明）
+                                        function republish() {
+                                            var w = 52 + Theme.spacingSm * 2
+                                                  + Math.max(prevTitle.implicitWidth,
+                                                             prevReason.visible
+                                                             ? prevReason.implicitWidth
+                                                             : 0)
+                                            prevFlick.reportRowWidth(
+                                                w + Theme.spacingSm * 2
+                                                + Theme.spacingLg)
+                                        }
+
+                                        // `implicitWidth` 变化时重新上报 —— Text 的
+                                        // 文字/字体变化都会触发，覆盖首次渲染与
+                                        // 数据刷新两种情况。
+                                        onImplicitWidthChanged: republish()
+                                        Component.onCompleted: republish()
                                     }
                                 }
                             }

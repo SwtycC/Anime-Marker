@@ -49,6 +49,10 @@ _BLOCK_NOISE_RE = re.compile(
 _CJK_RE = re.compile(r"[一-鿿]")
 
 # 集数：第 1 话 / EP01 / E01 / [01] / - 01 / 12.5
+#
+# **这张表 `clean_anime_title` 也在用**（去集号片段，兼着 RSS 判新的模糊
+# 匹配）。集号提取另有一套更严格的规则，见下面的 `_scan_episodes` —— 改
+# 这里会同时改匹配，要整库回放核对，不值当。
 _EP_PATTERNS = [
     re.compile(r"第\s*(\d+(?:\.\d+)?)\s*[话集回]"),
     re.compile(r"(?i)\bE[P]?\s*0*(\d+(?:\.\d+)?)\b"),
@@ -56,18 +60,129 @@ _EP_PATTERNS = [
     re.compile(r"[\s\-\_\[\]]0*(\d+(?:\.\d+)?)(?:v\d+)?[\s\-\_\[\]]"),
 ]
 
+#: 分隔符后的集号（`Title - 01`）。**必须单独一层并排在通用规则之前**，
+#: 否则 `Season 2 - 01` 里季号的 `2` 会被通用规则先撞上（见 `_scan_episodes`）。
+_EP_SEP_RE = re.compile(r"[-–—]\s+0*(\d+(?:\.\d+)?)(?:v\d+)?(?![\w.])")
 
-def extract_episode_index(name: str) -> Optional[float]:
-    """从标题/文件名提取集数序号，失败返回 None。"""
-    stem = Path(name).stem if ("." in name and "/" not in name and "\\" not in name) else name
-    for rx in _EP_PATTERNS:
+#: 纯数字括号块（`[01v2]` / `（05）`）——发布组的标准命名，可信度高。
+_EP_BRACKET_RE = re.compile(r"[\[【(（]\s*0*(\d+(?:\.\d+)?)(?:v\d+)?\s*[\]】)）]")
+
+#: 正片集号的上限。超过它的基本是画质参数或年份（`- 1080`、`(2021)`）。
+_EP_MAX = 199.5
+
+#: 「这是季数，不是集数」——`Season 2` / `S2` / `第2季` 里的那个数字。
+#: 与 `app/core/scanner.py` 的 `_SEASON_PREFIX_RE` / `_SEASON_SUFFIX_RE`
+#: **同一口径**（那边踩过这个坑，长注释在 scanner 里）。
+_SEASON_PREFIX_RE = re.compile(
+    r"(?i)(?:\bS(?:eason)?\s*$|第\s*$|\b\d+(?:st|nd|rd|th)\s+season\s*$)")
+_SEASON_SUFFIX_RE = re.compile(r"(?i)^\s*(?:st|nd|rd|th)\s+season\b")
+
+#: 视频扩展名。**只有认出来才剥后缀**，见 `_stem`。
+_MEDIA_EXT_RE = re.compile(
+    r"(?i)\.(?:mp4|mkv|avi|rmvb|wmv|flv|mov|m4v|mpg|mpeg|ts|webm|iso)$")
+
+
+def _stem(name: str) -> str:
+    """去掉视频扩展名；**不是视频文件就原样返回**。
+
+    **为什么不能用 `Path(name).stem`**：RSS 条目给的是**标题**不是文件名。
+    `Path('Tantei wa Mou, Shindeiru. S2 - 01').stem` 会把最后一个点后面
+    整段当扩展名砍掉，变成 `'Tantei wa Mou, Shindeiru'` —— 集号 `- 01`
+    一起没了，解析直接返回 None。只认已知的视频扩展名即可避开。
+    """
+    return _MEDIA_EXT_RE.sub("", name)
+
+
+def _is_season(stem: str, m: "re.Match[str]") -> bool:
+    """这个数字是不是季号（看它紧挨着的前后缀）。"""
+    return bool(_SEASON_PREFIX_RE.search(stem[:m.start()])
+                or _SEASON_SUFFIX_RE.match(stem[m.end():]))
+
+
+def _push(out: list[float], raw: str) -> None:
+    """收一个候选：超上限的（画质参数/年份）丢掉，重复的不再收。"""
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return
+    if val <= _EP_MAX and val not in out:
+        out.append(val)
+
+
+def _scan_episodes(stem: str, explicit_only: bool = False) -> list[float]:
+    """按可信度从高到低收集集号候选（输入须已过 `_stem`）。
+
+    `explicit_only=True` 时**只收明确写法**（①②③④），不收第⑤层
+    「标题里随便一个独立数字」的兜底 —— 那一层连季号都可能收进来，
+    拿它去比对本地媒体库会漏下真正缺的那集（见 `episode_candidates`）。
+    """
+    out: list[float] = []
+
+    # ① 「第X话 / EP01」—— 写法明确，唯一候选，直接定案
+    for rx in (_EP_PATTERNS[0], _EP_PATTERNS[1]):
         m = rx.search(stem)
         if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                continue
-    return None
+            _push(out, m.group(1))
+            return out
+
+    # ② 分隔符后的集号（`Title - 01`）
+    for m in _EP_SEP_RE.finditer(stem):
+        if not _is_season(stem, m):
+            _push(out, m.group(1))
+
+    # ③ 数字结尾（`01.mkv`、`… - 01`）
+    m = _EP_PATTERNS[2].search(stem)
+    if m and not _is_season(stem, m):
+        _push(out, m.group(1))
+
+    # ④ 纯数字括号块（`[01v2]`）
+    for m in _EP_BRACKET_RE.finditer(stem):
+        _push(out, m.group(1))
+
+    if explicit_only:
+        return out
+
+    # ⑤ 其余独立数字 —— 兜底，可信度最低，**排除季号**
+    for m in _EP_PATTERNS[3].finditer(stem):
+        if not _is_season(stem, m):
+            _push(out, m.group(1))
+    return out
+
+
+def extract_episode_index(name: str) -> Optional[float]:
+    """从标题/文件名提取集数序号，失败返回 None。
+
+    原实现把 `_EP_PATTERNS`依次 `search`、谁先命中就返回谁，
+    而最后那条通用规则用的是**最左匹配**。于是
+
+        [黒ネズミたち] 青之芦苇 第二季 / Ao Ashi Season 2 - 01 (Baha …)
+
+    里 `Season` 后面的 **2 先被撞上** → 判成「第 2 集」；而扫描侧
+    （`scanner.extract_ep_candidates`，有季号排除）算的是**第 1 集**。
+    同一个文件两边号码不同，查重第①层拿 2.0 去比本地库的 {1.0} 永远
+    不命中 —— **每轮轮询都把这条已经下过的第 1 集当成新集再下一次**，
+    并顺带把 qBittorrent 拉起来。
+
+    现在改成按可信度分层（见 `_scan_episodes`），并排除季号，与扫描侧
+    口径对齐。顺带修掉 `Path(name).stem` 把 RSS 标题当文件名切的问题
+    （见 `_stem`）。
+    """
+    cands = _scan_episodes(_stem(name))
+    return cands[0] if cands else None
+
+
+def episode_candidates(name: str) -> list[float]:
+    """RSS 标题里的**高可信度**集号候选，按可信度从高到低。
+
+    用途：查重第①层的**容错比对**。RSS 侧与扫描侧是两套解析器，同一集
+    算出来的号有可能不一致，拿单值去比就会一直判成新集。把明确写法的
+    候选都拿去比，任一命中即认为本地已有。
+
+    **刻意不收第⑤层兜底**：那层连季号都可能收进来
+    （`… Nouka 2 - 01` → `[2, 1]`），拿它去比会把**真正缺的那集**
+    误判成"已有"。漏下比重复下更难发现，宁可窄一点。
+    """
+    return _scan_episodes(_stem(name), explicit_only=True)
 
 
 def clean_anime_title(name: str) -> str:

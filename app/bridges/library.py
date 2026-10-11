@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
-from PySide6.QtCore import QObject, Property, QThread, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, Property, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QImage
 from PySide6.QtWidgets import QFileDialog
 
@@ -36,6 +36,7 @@ from app.core.matcher import extract_season
 from app.utils.cover_cache import cover_path_for, known_cover_files
 from app.utils.cover_cache import download as download_cover
 from app.utils.paths import covers_dir
+from app.utils.qt_thread import NamedThread, retire_worker
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +103,7 @@ def as_file_url(path: str) -> str:
         return ""
 
 
-class _TagFetchWorker(QThread):
+class _TagFetchWorker(NamedThread):
     """后台拉取单个条目的前 10 个 tag + 动画制作公司（详情页进入时的自动补录）。
 
     为什么独立成 worker：进入详情页就要发一次网络请求（存量条目），
@@ -178,7 +179,7 @@ class _TagFetchWorker(QThread):
         self.done.emit(self._subject_id, True, msg, bool(studio))
 
 
-class _CollectTypeWorker(QThread):
+class _CollectTypeWorker(NamedThread):
     """读 / 写单个条目的 Bangumi 收藏状态（详情页那排状态选择器）。
 
     **为什么要线程**：两件事都要发网络请求 ——
@@ -1479,17 +1480,35 @@ class LibraryBridge(QObject):
     def _start_tag_worker(self, subject_id: int, bangumi_id: int,
                           need_tags: bool = True,
                           need_studio: bool = True) -> None:
-        self._tag_worker = _TagFetchWorker(self._db, self._api,
-                                           subject_id, bangumi_id,
-                                           need_tags, need_studio)
-        self._tag_worker.done.connect(self._on_tag_fetch_done)
-        self._tag_worker.finished.connect(self._tag_worker.deleteLater)
-        self._tag_worker.start()
+        w = _TagFetchWorker(self._db, self._api,
+                            subject_id, bangumi_id, need_tags, need_studio)
+        w.done.connect(self._on_tag_fetch_done)
+        # 引用留到 `finished` 才摘（不能挂在 `done` 上，见 utils/qt_thread.py）
+        w.finished.connect(lambda: self._retire_tag_worker(w))
+        self._tag_worker = w
+        w.start()
+
+    def _retire_tag_worker(self, w: _TagFetchWorker) -> None:
+        """线程**真正结束**后：摘引用 + 接上排队的那一条。
+
+        **为什么"接续"要等到这里做**（原来在 `_on_tag_fetch_done` 里）：
+        `done` 是 `run()` 内部发的，那时线程还在跑。在原处直接
+        `requestTagFetch(pending)` 会新起一个 worker 并覆盖 `self._tag_worker`
+        —— 旧线程的引用被挤掉，撞上 Qt6 的 `qFatal`（**进程当场消失**，
+        没有堆栈、没有崩溃报告，见 utils/qt_thread.py）。快速翻详情页正是
+        踩这条的姿势（每次触发"排队 → 接续"）。
+        """
+        if self._tag_worker is not w:
+            return                  # 已被后来者顶替：别动别人的引用
+        retire_worker(self, "_tag_worker", w)
+        pending = self._tag_fetch_pending
+        self._tag_fetch_pending = None
+        if pending:
+            self.requestTagFetch(pending)
 
     def _on_tag_fetch_done(self, subject_id: int, ok: bool, message: str,
                            studio_written: bool = False) -> None:
-        # done 在 finished 之前发出，这里先摘掉引用再让 deleteLater 生效
-        self._tag_worker = None
+        # **这里不摘 `_tag_worker`** —— `done` 时线程还在跑，见 _retire_tag_worker
         if ok:
             self.tagsChanged.emit(subject_id)
             # 新拉到的 tag 同样要进海报墙的筛选目录（见 tagsBySubject），
@@ -1503,10 +1522,6 @@ class LibraryBridge(QObject):
             self._dirty = True
             self.subjectsChanged.emit()
         self.statusMessage.emit(message)
-        pending = self._tag_fetch_pending
-        self._tag_fetch_pending = None
-        if pending:
-            self.requestTagFetch(pending)
 
     def waitTagWorker(self, ms: int = 3000) -> None:
         """退出时等待进行中的标签拉取线程（QmlApp.shutdown 调用）。"""

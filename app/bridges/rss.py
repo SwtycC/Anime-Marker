@@ -22,7 +22,7 @@ import logging
 import re
 from typing import Optional
 
-from PySide6.QtCore import QObject, Property, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, Property, QTimer, Signal, Slot
 
 from app.core.config import Config
 from app.core.database import Database, RssSource
@@ -30,6 +30,7 @@ from app.core.matcher import SubjectMatcher
 from app.core.rss_feed import RssError, fetch_and_parse
 from app.core.rss_matcher import RssMatcher
 from app.utils.title_parser import guess_anime_name
+from app.utils.qt_thread import NamedThread, retire_worker
 
 log = logging.getLogger(__name__)
 
@@ -110,7 +111,7 @@ _QB_STATE_LABELS = {
 }
 
 
-class _FeedTitleWorker(QThread):
+class _FeedTitleWorker(NamedThread):
     """抓取订阅源，从最近几条条目里推断出**动漫名**，交给界面预填。
 
     为什么要线程：抓 RSS 是网络请求（超时 15s），同步做会把界面卡住。
@@ -196,7 +197,7 @@ class _FeedTitleWorker(QThread):
         self.done.emit(self._source_id, best, "", self._url)
 
 
-class _CreateSubjectWorker(QThread):
+class _CreateSubjectWorker(NamedThread):
     """从订阅源新建本地条目（可带 Bangumi 匹配）。
 
     需求："条目名先从订阅源中获取，自动填入文本框，然后支持
@@ -309,7 +310,7 @@ class _CreateSubjectWorker(QThread):
         )
 
 
-class _PreviewWorker(QThread):
+class _PreviewWorker(NamedThread):
     """「下载器」里的预览：抓一次订阅源，跑完整判新，列出**会下载哪些集**。
 
     **为什么必须真抓 RSS 而不是只过滤词**：预览的意义就是
@@ -380,11 +381,12 @@ class _PreviewWorker(QThread):
         self.done.emit(int(src.id), out, "")
 
 
-class _TorrentStatusWorker(QThread):
+class _TorrentStatusWorker(NamedThread):
     """向 qBittorrent 查一次任务列表，供下载记录显示进度。
 
-    为什么要线程：`torrents_info()` 是 HTTP 调用；qBittorrent 没开时
-    要等到连接超时（3s）才失败 —— 同步做会让界面卡住 3 秒。
+    订阅页有个 5 秒定时器在调这里，所以 qBittorrent 没开时这笔账会**反复**
+    收。`_note_failure` 的冷却窗口把它压成「30 秒内只真连一次」，窗口内
+    的调用立刻返回 —— 这个 worker 因此多数时候是瞬间结束的。
 
     **失败不算错误**：qBittorrent 没启动是很常见的状态（用户先开本程序），
     此时只是拿不到进度、记录仍按数据库里的状态显示，不该弹报错打扰用户。
@@ -617,7 +619,7 @@ class RssBridge(QObject):
         #: 晚半分钟没有任何影响（而且真正下完那一刻用户通常也不在等）。
         self._scan_timer = QTimer(self)
         self._scan_timer.setInterval(30 * 1000)
-        self._scan_timer.timeout.connect(self.refreshTorrents)
+        self._scan_timer.timeout.connect(self._auto_refresh_torrents)
         #: "扫描是否正在进行"的查询回调（QmlApp 注入 `scanner_bridge.running`）。
         #:
         #: 本桥接不认识 ScannerBridge（见 scanRequested 的说明），但"要不要
@@ -648,6 +650,9 @@ class RssBridge(QObject):
         没配 qBittorrent 时不启动：`refreshTorrents` 会每 30 秒白跑一次
         "读不到任务"（qb=None → `_TorrentStatusWorker` 直接回空），
         不仅没意义，还会在日志里留下噪声。
+
+        配了也不是每 30 秒真连 —— 定时器接的是 `_auto_refresh_torrents`，
+        它会先看有没有在途任务，没有就整轮跳过（见那里的说明）。
         """
         if self._qb is None:
             log.info("未配置 qBittorrent，跳过「下载完自动扫描」的后台轮询")
@@ -783,10 +788,17 @@ class RssBridge(QObject):
 
     @Slot()
     def requestPoll(self) -> None:
-        """界面点「立即检查」→ 转给 QmlApp（它持有 RssService）。"""
+        """界面点「立即检查」→ 转给 QmlApp（它持有 RssService）。
+
+        **顺带强刷一次 qBittorrent 进度**（不带 `_has_inflight_downloads`
+        的闸门）。后台定时器在没有在途任务时是不连 qBittorrent 的，而
+        "手动检查"就是用户明确要求的那个恢复点 —— 他点了，就该拿一次
+        真数据（顺便也能把"下完了但还没扫上"的条目补扫掉）。
+        """
         if self._poll_running:
             self.message.emit("正在检查，请稍候…")
             return
+        self.refreshTorrents()
         self.pollRequested.emit(0)          # 0 = 全部启用订阅
 
     @Slot(int)
@@ -1097,14 +1109,16 @@ class RssBridge(QObject):
         self._preview_running = True
         self._preview_hint = ""
         self.previewChanged.emit()
-        self._preview_worker = _PreviewWorker(
-            self._db, self._config, src, must_include, must_exclude)
-        self._preview_worker.done.connect(self._on_preview)
-        self._preview_worker.finished.connect(self._preview_worker.deleteLater)
-        self._preview_worker.start()
+        w = _PreviewWorker(self._db, self._config, src,
+                           must_include, must_exclude)
+        w.done.connect(self._on_preview)
+        # 引用留到 `finished` 才摘（不能挂在 `done` 上，见 utils/qt_thread.py）
+        w.finished.connect(lambda: retire_worker(self, "_preview_worker", w))
+        self._preview_worker = w
+        w.start()
 
     def _on_preview(self, source_id: int, items: list, error: str) -> None:
-        self._preview_worker = None
+        # 不在这里摘 `_preview_worker`：`done` 时线程还在跑，见 utils/qt_thread.py
         self._preview_running = False
         if error:
             self._preview_items = []
@@ -1327,6 +1341,65 @@ class RssBridge(QObject):
         return out
 
     @Slot()
+    def _auto_refresh_torrents(self) -> None:
+        """后台 30 秒定时器的入口：**没有在途任务就不去碰 qBittorrent**。
+
+        **为什么必须挡这一层**：这个定时器原先直接接 `refreshTorrents`，于是
+        只要配了 qBittorrent，它就会**每 30 秒无条件连一次** —— 不管有没有
+        东西在下载、也不管有没有东西要显示。qBittorrent 没开时，日志里就
+        会一直出现"读取 qBittorrent 任务失败"，用户完全不知道为什么。
+
+        它服务两件事，都只在"有在途任务"时才有意义：
+          - 进度条显示（`_load_downloads` 要拿真实 progress）；
+          - **下完自动扫描**（`_maybe_scan_completed` 靠 progress≥1 判定
+            "下完了"，再触发扫描 —— 扫描才用到 Bangumi 接口）。
+        两者都以一条"已交给 qBittorrent 且结论未落定"的记录为前提。
+        没有这种记录时，连上去也什么都做不了。
+
+        **手动路径不受影响**：订阅页可见时以及下载面板的 5 秒定时器仍然
+        直接调 `refreshTorrents` —— 用户正看着，就该给他真数据。
+
+        **qBittorrent 也不会因此"该启动时不启动"**：按需启动只发生在
+        `RssService` 的下发路径上（见那里的说明），与这里无关。
+
+        **恢复连接的条件有两个**：出现新任务（新记录是 `pushed` 且未扫，
+        闸门自然放行），或者用户点「立即检查」（`requestPoll` 直接调
+        `refreshTorrents`，绕过闸门）。
+        """
+        # 先用**上次拿到的**任务列表补扫一遍，**不发任何请求**：
+        # 有些记录已经确认下完、只是那一次的扫描没能发出去（扫描器正忙 /
+        # 条目暂时读不到），这些只需要重试扫描，不必再问一次 qBittorrent。
+        # 少了这一步，那些记录就永远等着"下一次轮询" —— 可轮询恰恰被
+        # 闸门停掉了，于是"下完自动扫描"会静默失效。
+        self._maybe_scan_completed(self._torrents)
+        if not self._has_inflight_downloads():
+            return
+        self.refreshTorrents()
+
+    def _has_inflight_downloads(self) -> bool:
+        """有没有"已经交给 qBittorrent、但结论还没落定"的记录。
+
+        判据取**两个条件同时成立**：
+          - 状态是 `pushed` / `downloading` —— 我们确实把种子交给 qB 了，
+            而且**还没看到它下完**。`pending`（还没下发）、`failed`（下发
+            失败）、`done`（已确认下完，见 `_maybe_scan_completed`）都不必问；
+          - `scanned_at` 为空 —— "下完自动扫描"还没处理过这条。
+
+        第二条是兜底：一条下完后扫过的记录会一直留在库里，只看状态的话
+        （万一状态没来得及落成 `done`）**按需连接会退化成永久轮询**。
+
+        读库失败时返回 True（保持旧行为）—— 宁可多连一次，也不要因为
+        读不到库就把"下完自动扫描"整个停掉。
+        """
+        try:
+            records = self._db.list_downloads()
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("读取下载记录失败（仍去查 qBittorrent）：%s", e)
+            return True
+        return any(r.status in ("pushed", "downloading") and not r.scanned_at
+                   for r in records)
+
+    @Slot()
     def refreshTorrents(self) -> None:
         """异步拉一次 qBittorrent 任务列表（订阅页显示 / 5 秒定时器调用）。
 
@@ -1335,17 +1408,19 @@ class RssBridge(QObject):
         没开时单次要等 3 秒超时），直接跳过本次 —— 否则会不断新建线程，
         超时叠加时线程数会滚起来。
 
-        **注意判据是 `isRunning()` 而不是 `is not None`**：worker 结束后
-        `_on_torrents` 里会把它置回 None，但 deleteLater 是排队执行的，
-        中间存在"引用还在、但已经跑完"的瞬间；只看非 None 会白白跳过一轮。
+        **注意判据是 `isRunning()` 而不是 `is not None`**：引用要留到
+        `finished` 才由 `retire_worker` 摘掉，中间存在"引用还在、但已经跑完"
+        的瞬间；只看非 None 会白白跳过一轮。
         """
         w = self._torrent_worker
         if w is not None and w.isRunning():
             return
-        self._torrent_worker = _TorrentStatusWorker(self._qb)
-        self._torrent_worker.done.connect(self._on_torrents)
-        self._torrent_worker.finished.connect(self._torrent_worker.deleteLater)
-        self._torrent_worker.start()
+        w = _TorrentStatusWorker(self._qb)
+        w.done.connect(self._on_torrents)
+        # 引用留到 `finished` 才摘（不能挂在 `done` 上，见 utils/qt_thread.py）
+        w.finished.connect(lambda: retire_worker(self, "_torrent_worker", w))
+        self._torrent_worker = w
+        w.start()
 
     #: 进度/状态变化的判定精度（百分点）。qBittorrent 的 `progress` 是
     #: 浮点，每 5 秒几乎一定在动（0.1701 → 0.1703），若按精确值比较，
@@ -1353,7 +1428,9 @@ class RssBridge(QObject):
     _PROGRESS_EPS = 0.01
 
     def _on_torrents(self, torrents: dict, error: str) -> None:
-        self._torrent_worker = None
+        # **这里不摘 `self._torrent_worker`**：`done` 是 run() 内部发的，
+        # 那时线程还在跑，此刻丢引用就是 Qt6 的 qFatal（进程当场没，
+        # 见 utils/qt_thread.py）。收尾统一交给 `retire_worker`（挂 finished）。
         new = torrents or {}
         # **只在"看得见的变化"时才通知 QML**（重要：5 秒定时器在调这里）。
         #
@@ -1446,6 +1523,26 @@ class RssBridge(QObject):
                 continue
             if str(info.get("state") or "").lower() == "moving":
                 continue
+
+            # ---- 到这一步：qBittorrent 已经确认这个任务下完了 ----
+            #
+            # 把它落库成 `done`。这不只是显示好看 —— 它是"**这条不用再盯着
+            # 了**"的持久结论，后台定时器的闸门（`_has_inflight_downloads`）
+            # 就靠它放行停机。
+            #
+            # **为什么不能只靠 `scanned_at`**：扫描未必发得出去 —— 扫描器
+            # 正忙（`_scan_subject_ok` 返回 False）或这个条目暂时读不到时，
+            # 下面的代码**故意不标记**，好留到下一轮重试。那种记录会一直
+            # 停在 `pushed`，把"按需连接"拖成永久轮询。
+            # 标记成 `done` 之后，扫描重试改由缓存驱动（见
+            # `_auto_refresh_torrents`），不再需要连 qBittorrent。
+            #
+            # 只在变化时写：这个方法每 5 秒被调一次，不能每轮都写库。
+            if rec.status != "done":
+                try:
+                    self._db.update_download_status(int(rec.id), "done")
+                except Exception as e:      # pragma: no cover - 防御性
+                    log.warning("标记下载记录 #%s 已完成失败：%s", rec.id, e)
 
             sid = int(rec.subject_id or 0)
             if not sid:
@@ -1569,10 +1666,12 @@ class RssBridge(QObject):
                               "AnimeMarker/1.0") if self._config else "AnimeMarker/1.0"
         log.info("「获取名称」开始：%s", url)
         # source_id 传 0：这一步还没入库，不需要 id
-        self._title_worker = _FeedTitleWorker(0, url, proxy=proxy, user_agent=ua)
-        self._title_worker.done.connect(self._on_title_suggested)
-        self._title_worker.finished.connect(self._title_worker.deleteLater)
-        self._title_worker.start()
+        w = _FeedTitleWorker(0, url, proxy=proxy, user_agent=ua)
+        w.done.connect(self._on_title_suggested)
+        # 引用留到 `finished` 才摘（不能挂在 `done` 上，见 utils/qt_thread.py）
+        w.finished.connect(lambda: retire_worker(self, "_title_worker", w))
+        self._title_worker = w
+        w.start()
         self.message.emit("正在获取订阅源标题…")
         return True
 
@@ -1582,8 +1681,11 @@ class RssBridge(QObject):
 
         每一步都写日志 —— 这个方法有三条出口（失败 / 推断为空 / 成功），
         以前**一条日志都没有**，用户只能看到状态栏一句话。
+
+        **不在这里摘 `_title_worker`**：`done` 是 run() 内部发的，那时线程
+        还在跑，此刻丢引用就是 Qt6 的 qFatal（见 utils/qt_thread.py）。
+        收尾交给 `retire_worker`（挂在 `finished` 上）。
         """
-        self._title_worker = None
         if error:
             log.warning("「获取名称」失败：%s —— %s", url or "(未知地址)", error)
             self.failed.emit(error)

@@ -18,12 +18,13 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Signal, Slot
 
 from app.core.bangumi_api import BangumiClient, BangumiError, extract_aliases
 from app.core.database import Database
 from app.core.matcher import SCORE_IRRELEVANT, SubjectMatcher
 from app.utils import bgm_log
+from app.utils.qt_thread import NamedThread
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ SEARCH_LIMIT = 20
 ACCEPT_SCORE = 60
 
 
-class _SearchWorker(QThread):
+class _SearchWorker(NamedThread):
     """后台搜索，避免阻塞 UI。"""
 
     finished_results = Signal(object)   # list[dict]

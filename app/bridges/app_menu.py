@@ -27,7 +27,7 @@ import logging
 import platform
 
 from PySide6.QtCore import (
-    Property, QObject, QThread, QTimer, QUrl, QUrlQuery, Signal, Slot,
+    Property, QObject, QTimer, QUrl, QUrlQuery, Signal, Slot,
 )
 from PySide6.QtGui import QDesktopServices
 
@@ -38,6 +38,7 @@ from app.core.update_check import (
     load_known_newer, mark_auto_checked, remember_latest,
 )
 from app.utils.paths import logs_dir, resource_path
+from app.utils.qt_thread import NamedThread, retire_worker
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ log = logging.getLogger(__name__)
 INITIAL_DELAY_MS = 8000
 
 
-class _UpdateWorker(QThread):
+class _UpdateWorker(NamedThread):
     """后台问一次 GitHub（见 update_check.fetch_latest）。"""
 
     done = Signal(object)          # UpdateInfo
@@ -228,14 +229,30 @@ class AppMenuBridge(QObject):
         self._set_checking(True)
         # 代理**每次现读**（与 Bangumi 客户端同一个键）：设置页改完不必重启，
         # 下一次检查就走新的。留空则空串 → fetch_latest 不指定代理、走系统代理。
-        self._worker = _UpdateWorker(
-            self._config.get("bangumi", "proxy", ""))
-        self._worker.done.connect(self._on_checked)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._worker.start()
+        w = _UpdateWorker(self._config.get("bangumi", "proxy", ""))
+        w.done.connect(self._on_checked)
+        # 引用留到 `finished` 才摘（不能挂在 `done` 上，见 utils/qt_thread.py）
+        w.finished.connect(lambda: self._retire_worker(w))
+        self._worker = w
+        w.start()
+
+    def _retire_worker(self, w: _UpdateWorker) -> None:
+        """线程**真正结束**后摘引用；期间攒下的手动请求在这里补做。
+
+        **为什么要补做**：`done` 与 `finished` 都是排队投递的，两者之间
+        用户完全可能又点一下「检查更新」。那一拍 `_start` 会看到 worker
+        还在跑而只记下 `_pending_manual` —— 而 `_on_checked` 已经消费过
+        这个标志了。不在这里补做，这一次点击就丢了。
+        """
+        if self._worker is not w:
+            return                  # 已被后来者顶替：别动别人的引用
+        retire_worker(self, "_worker", w)
+        if self._pending_manual:
+            self._pending_manual = False
+            self._start(manual=True)
 
     def _on_checked(self, info: UpdateInfo) -> None:
-        self._worker = None
+        # **这里不摘 `_worker`**：`done` 时线程还在跑，见 _retire_worker
         manual, self._pending_manual = self._pending_manual, False
         self._set_checking(False)
 

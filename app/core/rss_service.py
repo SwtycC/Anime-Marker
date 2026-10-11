@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 from app.core.bangumi_api import BangumiClient
 from app.core.config import Config
@@ -18,6 +18,7 @@ from app.core.database import Database, RssSource
 from app.core.qbittorrent_api import QbClient, QbError
 from app.core.rss_feed import RssError, fetch_and_parse
 from app.core.rss_matcher import RssMatcher
+from app.utils.qt_thread import NamedThread
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +51,7 @@ class PollSummary:
             self.errors = []
 
 
-class PollWorker(QThread):
+class PollWorker(NamedThread):
     """后台轮询所有启用的订阅源。"""
 
     progress = Signal(str)                    # 文本进度
@@ -145,6 +146,12 @@ class PollWorker(QThread):
 
             if not result.is_new:
                 summary.skipped += 1
+                # 被查重挡下的条目顺手收尾：这条 (订阅, 集号) 上可能还挂着
+                # 上一次下发的失败原因，而它现在已经被确认"不用下了"。
+                # 见 `_clear_stale_failure`。
+                if result.dedup_hit:
+                    self._clear_stale_failure(src.id, result.ep_index,
+                                              result.dedup_hit)
                 continue
             summary.new_entries += 1
 
@@ -202,7 +209,11 @@ class PollWorker(QThread):
             #
             # **只在"确实要下发"的路径上调用**（上面两个 continue 已排除
             # 不下载的情形）：没必要为了"仅记录"而启动外部程序。
-            # `ensure_running` 内部会先探测，已在运行就直接返回，开销很小；
+            # 反过来也成立 —— **没有需要下发的东西时不会启动 qBittorrent**。
+            #
+            # 这里不会白等一轮超时：查重第②层刚刚才探过一次（连不上时
+            # 会打开冷却窗口，见 `QbClient._note_failure`），所以
+            # `ensure_running` 的首次探测会立刻失败并直接落到启动分支。
             # 一轮里对每条都调也不会重复 Popen（内部有 `_start_attempted`）。
             note = ""
             if not self._qb_ready:
@@ -250,14 +261,54 @@ class PollWorker(QThread):
                             result.ep_index, entry.title, reason)
                 summary.errors.append(f"下发失败：{entry.title[:40]}（{reason}）")
 
+    def _clear_stale_failure(self, source_id: int, ep_index: float,
+                             where: str) -> None:
+        """把这条 (订阅, 集号) 上残留的失败记录收尾。
+
+        `download_history` 里的 `last_error` 只在**重新判新**时才会被清
+        （`add_download_record` 重写记录时顺手清空）。可一旦这集被判成
+        "本地已有 / qB 已有"，走的却是 `continue` 分支 —— **再也没人去碰
+        这条记录**。于是一条早就过时的失败原因永远挂在界面上：
+
+            EP1  ██████████ 100%  已完成
+                 ⚠ 连不上 qBittorrent —— 请确认它正在运行…
+
+        而那条 100% 的进度恰恰是从 qBittorrent 读回来的 —— 界面上自己
+        打自己。源卡片上的「失败 1」统计同样卡在旧值上。
+
+        **只在查重命中时收尾**（`where` 非空）：被"集数解析失败，需人工
+        确认"跳过的条目**不能**清 —— 那种情况是真的还需要人去处理。
+        """
+        try:
+            rec = next((r for r in self.db.list_downloads(source_id)
+                        if float(r.ep_index) == float(ep_index)), None)
+        except Exception as e:      # pragma: no cover - 防御性
+            log.warning("清理下载记录时读取失败：%s", e)
+            return
+        if rec is None or rec.status == STATUS_DONE:
+            return
+
+        # 状态跟着结论走：本地层命中说明文件已在硬盘上（完成），qB 层命中
+        # 只能说明"交给 qBittorrent 了"（已下发）—— 它下没下完由进度显示。
+        status = STATUS_DONE if where == "local" else STATUS_PUSHED
+        if rec.status == status and not (rec.last_error or ""):
+            return                  # 已经是这个状态且没有残留错误，不必写库
+        self.db.update_download_status(rec.id, status, last_error="")
+        log.info("下载记录 #%s（订阅 #%s 第 %sg 集）已确认无需下载，"
+                 "状态收尾为 %s 并清空旧错误",
+                 rec.id, source_id, f"{ep_index:g}", status)
+
     # ---------- 手动确认下发（「待确认」条目） ----------
     def push_pending(self, record_id: int) -> tuple[bool, str]:
         """把一条 pending 记录推送到 qBittorrent（由 UI 线程调用）。"""
         if self.qb is None:
             return False, "未配置 qBittorrent"
-        # 手动点「下发」时同样按需拉起（用户很可能是刚开机、qB 还没启动）
+        # 手动点「下发」时同样按需拉起（用户很可能是刚开机、qB 还没启动）。
+        #
+        # `force_probe=True`：**绕过「已知连不上」的冷却窗口**。用户点这个
+        # 按钮通常就是因为刚把 qBittorrent 打开，被缓存挡住会显得点了没反应。
         try:
-            self.qb.ensure_running()
+            self.qb.ensure_running(force_probe=True)
         except Exception as e:          # pragma: no cover - 防御性
             log.warning("按需启动 qBittorrent 异常：%s", e)
         records = {r.id: r for r in self.db.list_downloads()}
@@ -399,7 +450,7 @@ class RssService(QObject):
         `deleteLater` 销毁的是 **C++ 对象**，而 Python 侧的包装对象
         还在（`self._worker` 未及时置空时）。此时访问它的任何方法
         都会抛 `RuntimeError`，于是「立即检查」点了没反应、日志刷满
-        堆栈 —— 这正是实测反馈"点击立即检查，不会进入检查"的原因。
+        堆栈。
         把"对象已销毁"一律当作"没在跑"处理（语义上也确实如此）。
         """
         w = self._worker
@@ -426,12 +477,12 @@ class RssService(QObject):
         #    对象销毁后 `self._worker` 仍指向它，下一次 `is_running()`
         #    访问已销毁的 C++ 对象，抛 `RuntimeError: Internal C++ object
         #    (PollWorker) already deleted`，表现为「立即检查」点了完全
-        #    没反应、日志刷满堆栈（实测反馈）。
+        #    没反应、日志刷满堆栈。
         # ③ 改成"在 QThread `finished` 里置 None + deleteLater"，那个
         #    RuntimeError 没了，但**退出时**又出现 `Destroyed while
         #    thread is still running` —— 因为 `finished` 早于对象真正
         #    销毁，置 None 之后 `stop()` 就**找不到它去 wait** 了
-        #    （实测反馈）。所以才有 `_live_workers` 这个集合。
+        #    。所以才有 `_live_workers` 这个集合。
 
         # 不用同步 `wait()`：poll 从 UI 线程调用，`wait()` 会把界面卡住到
         # 整轮轮询结束（几秒到几十秒）。等待只发生在 `stop()`（退出时）。
@@ -551,6 +602,15 @@ def _explain_qb_error(exc: Exception, magnet: str = "",
                 "无法自动下载，请手动打开订阅页查看")
     if not magnet and not torrent_url:
         return "该条目没有可用的下载链接（RSS 未提供磁力链或 .torrent）"
+
+    # ①′ **拉种子文件失败** —— 与 qBittorrent 无关，是"去字幕站取 .torrent"
+    # 那一步失败了（链接失效 / 网络不通）。
+    #
+    # **必须排在连接类之前**：这个异常文本里同样带 "timed out"，落到 ② 就会被
+    # 误报成"连不上 qBittorrent" —— 让人去查一个根本没问题的东西。
+    if "下载种子文件失败" in text:
+        detail = text.split("下载种子文件失败：", 1)[-1]
+        return f"下载种子文件失败（字幕站链接可能已失效，或网络不通）：{detail}"
 
     # ② 连接类：qBittorrent 没开 / 地址端口不对 / Web UI 没启用
     if ("connection" in low or "refused" in low or "timed out" in low
