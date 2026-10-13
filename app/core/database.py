@@ -39,7 +39,6 @@ SCHEMA_VERSION = 15
 #: **别拿"本次同步的时刻"来比**：
 #: `local_at` 永远是过去的时刻、同步时刻永远是现在，比出来恒成立 ——
 #: 只有"本地写入恰好与同步落在同一个时钟秒内"才拦得住，等于形同虚设。
-#: 实测症状："本地刚标成「看过」，下一次同步又变回「在看」"。
 #: **也别拿 `updated_at` 来比**：那一列每次整表同步都被刷成"本次写入
 #: 时刻"，同样恒成立。
 #: 只有 `collection_updated_at` 是**跟着数据走**的：用户真在网页/手机上
@@ -71,7 +70,7 @@ UPDATE subjects
 #: 是刚拉下来的全量，所以"名单里没有"就是"服务端没有"这个判据成立。
 #: **不要拿它做启动对齐**（试过、已撤）：启动时的缓存可能是几天前的，
 #: 拿它去清会把用户刚在网站上新标的状态（详情页回查写进本地、缓存还没
-#: 同步到）一起清掉 —— 实测：魔女之旅重启后又被算回「未标记」。
+#: 同步到）一起清掉。
 #: 只动已匹配条目：未匹配条目的状态只可能来自用户手动标记。
 _COLLECT_TYPE_CLEAR_STALE_SQL = """
 UPDATE subjects
@@ -204,7 +203,7 @@ CREATE TABLE IF NOT EXISTS ep_sync_state (
 --   local_subject_id —— **本地 subjects.id**，订阅绑定条目的**权威标识**
 --   bangumi_id       —— 冗余存一份 Bangumi 条目 ID
 --
--- **为什么以 local_subject_id 为准**（踩坑，实测反馈）：早期只有
+-- **为什么以 local_subject_id 为准**：早期只有
 -- `bangumi_id`，于是**未匹配 Bangumi 的条目根本无法绑定** ——
 -- `linkSubject` 里有一道 `if not subj.bangumi_id: 拒绝`。而"没填 Token"
 -- 或"匹配没成功"的本地条目恰恰是最常见的，"全部下载 + 从订阅源新建条目"
@@ -253,8 +252,7 @@ CREATE TABLE IF NOT EXISTS rss_sources (
 --
 -- `last_error`（v11 起）记录**这一条为什么失败**。
 --
--- **为什么必须落库**（踩坑，实测反馈"下载失败了，可以增加日志判断为什么
--- 失败吗"）：早期失败原因只 append 到 `PollSummary.errors`（内存里的
+-- **为什么必须落库**：早期失败原因只 append 到 `PollSummary.errors`（内存里的
 -- 临时列表，轮询一结束就没了），界面只能看到一个「失败 10」的计数 ——
 -- 用户完全不知道是"qBittorrent 没开"、"密码错"还是"磁力链失效"。
 -- 落库后每条记录各自带原因，界面能直接显示（也能事后追溯）。
@@ -489,13 +487,9 @@ class Database:
         """增量迁移：只做加法（新增列），不破坏既有数据。
 
         **每个步骤都自己查列是否存在**，不依赖"版本号到了就跳过"。
-        原因（踩坑，实测）：早期只在方法开头做一次
+        原因：早期只在方法开头做一次
         `if old_version >= SCHEMA_VERSION: return`，于是**版本号一旦
-        领先于真实表结构，后面的迁移就永远不会执行** ——
-        实测遇到：`meta.schema_version` 已是 10，而 `rss_sources` 里
-        压根没有 v10 该加的 `local_subject_id` 列（那次先写了版本号、
-        迁移代码还没写完），此后每次启动都被这道 guard 挡掉，
-        列永远补不上、相关功能一直报 "no such column"。
+        领先于真实表结构，后面的迁移就永远不会执行**。
 
         现在 guard 只保留"完全没升级"的快路径，**每个步骤都按 PRAGMA
         自查**：列在就跳过该步。这样即使版本号错乱也能自愈，代价是每次
@@ -607,7 +601,7 @@ class Database:
                 "ALTER TABLE download_history ADD COLUMN last_error TEXT")
         # v10：rss_sources 新增 local_subject_id（订阅绑定本地条目）。
         #
-        # **为什么要加这一列**（踩坑，实测反馈）：早期订阅只存
+        # **为什么要加这一列**：早期订阅只存
         # `bangumi_id`，而未匹配 Bangumi 的条目根本没有这个值 ——
         # 于是"全部下载 + 从订阅源新建条目"（建出来的多是本地条目）
         # 这条链路上，新建成功了却**绑不上**（`linkSubject` 里有一道
@@ -659,8 +653,8 @@ class Database:
         #
         # 为什么需要：那一列早先只在用户点过选择器、或进过某条目详情页时
         # 才有值，而海报墙的「收藏状态」筛选（尤其"未标记"）是按这一列筛的
-        # —— 于是**明明在 Bangumi 上收藏过的番，在"未标记"里一大堆**
-        # （用户实测反馈）。缓存表里本来就有全量收藏状态，回填一次即可。
+        # —— 于是**明明在 Bangumi 上收藏过的番，在"未标记"里一大堆**。
+        # 缓存表里本来就有全量收藏状态，回填一次即可。
         #
         # 之后由 replace_inprogress_cache 在每次同步时自动保持对齐，
         # 所以这一条只在旧库上跑一次。
@@ -889,8 +883,7 @@ class Database:
 
         海报墙的筛选要用它：那张墙的条目列表是**长生命周期的缓存**（重取会
         重建全部卡片），收藏状态变了它不一定跟着更新 —— 用这份只有两列的
-        小映射做筛选，既实时又不用重建卡片（用户实测：详情页已显示「看过」、
-        筛选里却还算「未标记」，要重扫才好）。
+        小映射做筛选，既实时又不用重建卡片。
         """
         with self._cursor() as cur:
             rows = cur.execute(
@@ -904,8 +897,7 @@ class Database:
         与 `subjects.collect_type` 的分工：那一列是自己写的快照（可能为空），
         这张表是最近一次全量同步拿到的**服务端收藏**（含 1~5 全部状态，
         见 `InProgressBridge`）。详情页状态选择器优先用它 —— 查得到就能
-        **同步**给出选中态，不必等一个网络往返（用户实测反馈"最好跟展示图
-        出现的时间一样快"：海报是立刻出现的，选中态不该慢半拍）。
+        **同步**给出选中态，不必等一个网络往返。
 
         **0 的含义是"不知道"，不是"未收藏"**：表里只存用户**已收藏**的条目，
         没有行可能是"未收藏"，也可能是"还没同步过"。所以调用方拿到 0 必须
@@ -1000,7 +992,7 @@ class Database:
     #
     # 存储形态：**换行分隔的纯文本**，而不是 JSON。
     #
-    # 理由：别名里可能含 `,` `"` `[` 等字符（实测有
+    # 理由：别名里可能含 `,` `"` `[` 等字符（有
     # "Anohana: The Flower We Saw That Day" 这类带冒号的，也有含逗号的
     # 罗马音副标题）。JSON 需要转义、读取方还要 try/except 兜住脏数据；
     # 而别名**本身不可能含换行符**（Bangumi 的 infobox 值是单行文本），
@@ -1047,9 +1039,7 @@ class Database:
     def tags_from_subject(subj: dict) -> list[tuple[str, int]]:
         """从 Bangumi subject 响应提取**前 10 个** tag，供入库。
 
-        接口的 `tags` 已按 `count`（打此 tag 的人数）降序排列（实测多部
-        条目全部严格降序，文档虽未明说但搜索接口的 SlimSubject.tags
-        注明"前 10 个 tag"，佐证有序），直接截取即可，无需再排。
+        接口的 `tags` 已按 `count`（打此 tag 的人数）降序排列，直接截取即可，无需再排。
         """
         out: list[tuple[str, int]] = []
         for i, t in enumerate(subj.get("tags") or []):
@@ -1311,7 +1301,7 @@ class Database:
     def find_manual_subject_by_folder(self, folder_path: str) -> Optional[Subject]:
         """查该目录下**用户手动指定过 Bangumi 条目**的记录（重扫时保护，不覆盖）。
 
-        **必须排除 bangumi_id 为空的行**（踩坑，实测）：`match_state='manual'`
+        **必须排除 bangumi_id 为空的行**：`match_state='manual'`
         有两种来源 ——
             ① 用户在「重新匹配」里手选了一部（`set_manual_match`，有 bangumi_id）
             ② 「添加动漫」在没填 Token / 主动不选匹配时建的**纯本地条目**
@@ -1461,13 +1451,38 @@ class Database:
         所以这里**显式逐表清理**：
             episodes      —— 集数（详情页左列的数据源）
             subject_tags  —— 接口/用户标签（海报墙 tag 筛选的数据源）
+            download_history.subject_id —— 见下
+            rss_sources.local_subject_id / save_subject_id —— 见下
 
         说明：`watched_episodes` 按 **bangumi_id** 存的是 Bangumi 侧记录，
         不属于本条的从属数据（同一部番重扫回来后仍要用），故**不删**。
+
+        **下载记录与订阅绑定是"置 NULL"而不是删行**：
+        `download_history.subject_id` **没有声明外键**（表里只有
+        `source_id REFERENCES rss_sources(id)`，那条有 CASCADE），所以删掉
+        条目不清理它就会留下指向虚空的记录。而 `download_history` 是**下载历史，不能删行**
+        （清库功能也保留它，见技术文档 §6.7），所以只把指向断开：
+        NULL 正是"没有绑定"的哨兵（`delete`/解除绑定写的就是 `None`）。
+        订阅源那两个字段同理：不清的话订阅卡片还显示「→ 某个已删条目」，
+        「下载器」的"保存到"也指着一个不存在的条目。
         """
         with self._cursor() as cur:
             cur.execute("DELETE FROM episodes WHERE subject_id=?", (subject_id,))
             cur.execute("DELETE FROM subject_tags WHERE subject_id=?", (subject_id,))
+            cur.execute(
+                "UPDATE download_history SET subject_id=NULL WHERE subject_id=?",
+                (subject_id,),
+            )
+            cur.execute(
+                "UPDATE rss_sources SET local_subject_id=NULL"
+                " WHERE local_subject_id=?",
+                (subject_id,),
+            )
+            cur.execute(
+                "UPDATE rss_sources SET save_subject_id=NULL"
+                " WHERE save_subject_id=?",
+                (subject_id,),
+            )
             cur.execute("DELETE FROM subjects WHERE id=?", (subject_id,))
 
     # ---------- 聚合展示 ----------
@@ -1494,8 +1509,7 @@ class Database:
         **与 `count_locally_watched_eps()` 的区别很重要**（这是一个踩过的坑）：
             count  —— 已看**条数**（看了 1 集 → 1）
             max    —— 已看的**最大集号**（看了第 9 集 → 9）
-        只有"从第 1 集一集不落看下来"时两者才相等。中间的漏看（或像本次
-        实测那样只看了第 9 集）会让 count 远小于真实进度。
+        只有"从第 1 集一集不落看下来"时两者才相等。中间的漏看会让 count 远小于真实进度。
 
         详情页/在看页的「进度」语义是 Bangumi 的 `ep_status` = **看到第 N 集**，
         所以必须用这个 `max` 版本；拿 count 去比会把"第 9 集已看"算成
@@ -1595,8 +1609,7 @@ class Database:
     def subject_all_watched(self, subject_id: int) -> bool:
         """是否**每一集**都看过：已看过集数 ≥ 官方正片数（`total_eps`）。
 
-        **判据是"集数 vs 集数"，不能拿集号去比**（踩坑，实测："在看页没有
-        史莱姆第四季了"）：
+        **判据是"集数 vs 集数"，不能拿集号去比**：
             史莱姆第四季是跨季连续编号 —— 本地文件 `[S4][01_73]`…`[21_93]`、
             Bangumi 集列表同样是 73~96，而 `total_eps` 是**本季 24 集**。
             用户看到第 89 集（= 本季第 17 集）时，旧判据"最大集号 ≥
@@ -1862,7 +1875,7 @@ class Database:
     def list_watched_episodes(self, limit: int = 5000) -> list[dict]:
         """按标记时间倒序列出集级观看记录。
 
-        默认上限 5000：全量同步后本表约 1000+ 行（实测密度 ≈6 条/部 × 160 部），
+        默认上限 5000：全量同步后本表约 1000+ 行，
         旧默认 500 会静默截断掉历史。动态页的分页在 QML 侧做，这里给足。
         """
         with self._cursor() as cur:
@@ -1931,9 +1944,6 @@ class Database:
         self, subject_ids: Optional[list[int]] = None
     ) -> dict[int, int]:
         """`{subject_id: 本地看过但没有集号、无法补传的集数}`。
-
-        实测本机 1446 集里有 455 集是这个情况（扫描时没拿到集数元数据）——
-        它们必须**被明确告知跳过**，不能静默 ✗。
         """
         where, params = "", []
         if subject_ids:
@@ -2117,10 +2127,8 @@ class Database:
     # ---------- F19：下载记录 ----------
     # 视为"已下载过、不必重试"的状态。
     #
-    # **为什么要把 failed 排除在外**（踩坑，实测）：查询原先只看"有没有这一行"，
-    # 于是**失败过的集永远不再重试**。实测遇到：comicat 订阅因为解析 bug
-    # 全部下发失败（10 条 failed），修好解析之后重新检查 —— 判新仍然报
-    # "下载历史中已存在"，那些集再也不会被处理，用户只能手动删库。
+    # **为什么要把 failed 排除在外**：查询原先只看"有没有这一行"，
+    # 于是**失败过的集永远不再重试**。
     # 失败是**过程状态**、不是终态：修好配置/代码后应当能自动重试。
     #
     # 反过来 `skipped` 要算"已处理"（那是"本地已有该集、故意不下"的正常结果），

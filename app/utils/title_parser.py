@@ -2,7 +2,8 @@
 
 - parse_progress：解析 PotPlayer 窗口标题里的播放进度
 - extract_episode_index / clean_anime_title：供 F19 RSS 判新使用
-- guess_anime_name：清洗的加强版，供「获取名称」预填输入框用
+- guess_anime_name / guess_anime_names：清洗的加强版，供「获取名称」预填输入框、
+  以及新建条目时的 Bangumi 匹配用（后者会把「中文名 / 原名」拆成多个候选）
 """
 
 from __future__ import annotations
@@ -196,8 +197,86 @@ def clean_anime_title(name: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def guess_anime_name(title: str) -> str:
-    """从资源标题里猜番名 —— 清洗结果为空时，改从**括号里**挑。
+def _ep_remover(s: str):
+    """生成替换函数：只把**确实是集号**的匹配删掉，其余原样留着。
+
+    判据两条，与 `_scan_episodes` 同一口径：
+
+      * `_is_season()` —— `Season 2` / `S 2` 里的那个数字是**季号**，删掉
+        不是"清噪声"，是把季号从番名里抹了，拿去搜 Bangumi 会命中**错的
+        那一季**。
+      * `_EP_MAX` —— 超过 199.5 的不是集号，是年份 `(2021)` 或画质 `- 1080`。
+    """
+    def repl(m: "re.Match[str]") -> str:
+        raw = m.group(1)
+        try:
+            if float(raw) > _EP_MAX:
+                return m.group(0)
+        except (TypeError, ValueError):
+            return m.group(0)
+        return m.group(0) if _is_season(s, m) else " "
+
+    return repl
+
+
+def _clean_for_name(title: str) -> str:
+    """「获取名称」专用清洗：与 `clean_anime_title` 同一张表，三处**故意不同**。
+
+    ① **只剥已知媒体扩展名**（`_stem`），不用 `Path(name).stem`。
+       RSS 给的是**标题**不是文件名，`Path('Tantei wa Mou, Shindeiru. S2 - 01').stem`
+       会把最后一个点之后**整段**当扩展名砍掉 —— 「S2 - 01」一起没了（`_stem`
+       的注释里记着这个坑）。`clean_anime_title` 那条老路还留着它：它兼着
+       RSS 判新的模糊匹配，动它要整库回放核对，不值当，所以这里绕开。
+
+    ② **只删"确实是集号"的数字**（见 `_ep_remover`），不吃季号、不吃年份。
+
+    ③ **不用兜底那一层**（`_EP_PATTERNS[3]`，"任意独立数字"）。扫描侧
+       （`episode_candidates`）也只把它当最低可信度、刻意不收，理由是
+       "连季号都可能收进来"；在番名上更是灾难 —— 「86 -不存在的战区-」
+       的 `86` 会被当成第 86 集删掉，番名直接变成 `-不存在的战区-`。
+    """
+    s = _stem(title)
+    remover = _ep_remover(s)
+    # 写法明确的集号：第X话 / EP01 / 分隔符后的 01 / 结尾的 01 / [01]
+    for rx in (_EP_PATTERNS[0], _EP_PATTERNS[1], _EP_SEP_RE,
+               _EP_PATTERNS[2], _EP_BRACKET_RE):
+        s = rx.sub(remover, s)
+    for pat in _NOISE_PATTERNS:
+        s = re.sub(pat, " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+#: 「中文名 / 原名」之间的分隔符 —— **要求两侧带空白**才算分隔符。
+#: 反例：`Fate/strange Fake`、`Re:Zero`，斜杠/冒号是名字自己的一部分，
+#: 无脑按 `/` 拆会把一个番名拆成两半（海报墙上就有 `Fate/strange Fake`）。
+_NAME_SPLIT_RE = re.compile(r"\s+[/／|｜]\s+")
+
+#: 候选两端**悬空**的分隔符（`青之芦苇 第二季 / Ao Ashi Season 2 -` 的尾巴）。
+#:
+#: **必须"分隔符紧挨着空白"才算悬空**：`86 -不存在的战区-` 这类名字自带的
+#: 破折号是番名的一部分（它两侧没有空白），削掉就把名字改了。
+_DANGLING_TAIL_RE = re.compile(r"(?:\s+[-–—|｜/／,，、])+\s*$")
+_DANGLING_HEAD_RE = re.compile(r"^[-–—|｜/／,，、]+\s+")
+
+
+def _split_candidates(cleaned: str) -> list[str]:
+    """把清洗结果按「中文名 / 原名」拆成候选，去掉悬空分隔符与重复。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in _NAME_SPLIT_RE.split(cleaned or ""):
+        cand = _DANGLING_HEAD_RE.sub("", part)
+        cand = _DANGLING_TAIL_RE.sub("", cand)
+        cand = re.sub(r"\s+", " ", cand).strip()
+        # 短于 2 个字符的（`-`、`01` 的残渣）不成名字
+        if len(cand) < 2 or cand in seen:
+            continue
+        seen.add(cand)
+        out.append(cand)
+    return out
+
+
+def _pick_from_blocks(title: str) -> str:
+    """清洗结果为空时，回头从**括号块**里挑番名。
 
     comicat / 蜜柑这类站点的标题 **连番名都包在
     【】里**，而 `clean_anime_title` 把括号块一律当噪声丢掉，于是整条标题
@@ -211,24 +290,56 @@ def guess_anime_name(title: str) -> str:
         这条同时保证了"不会把原来能用的源搞坏"：非中文名的源本来就返回空。
       - 排除「XX组」这种一眼是发布组的块。
       - 复合语言标记（`简繁日双语`）先剔掉再比长度 —— 否则它比许多番名还长。
-
-    **和 `clean_anime_title` 分开**：那个还兼着 RSS 判新的模糊匹配
-    （rss_matcher），改它的语义要整库回放核对；这里只服务「获取名称」。
     """
-    cleaned = clean_anime_title(title)
-    if cleaned:
-        return cleaned
-
     best = ""
     for m in _STRIPPED_BLOCK_RE.finditer(title):
         inner = next((g for g in m.groups() if g is not None), "").strip()
         if not _CJK_RE.search(inner) or _GROUP_SUFFIX_RE.search(inner):
             continue
-        cand = _BLOCK_NOISE_RE.sub(" ", clean_anime_title(inner))
+        cand = _BLOCK_NOISE_RE.sub(" ", _clean_for_name(inner))
         cand = re.sub(r"\s+", " ", cand).strip()
         if len(cand) > len(best):
             best = cand
     return best
+
+
+def guess_anime_names(title: str, limit: int = 3) -> list[str]:
+    """从资源标题里猜番名，**多个候选**（按可信度从高到低）。
+
+    为什么要多个：RSS 标题常把两个名字并排写在一起
+
+        [黒ネズミたち] 青之芦苇 第二季 / Ao Ashi Season 2 - 09 (Baha 1920x1080 MP4)
+
+    整串丢给 Bangumi 搜**什么都搜不到**，而两个名字**各自**都能
+    精确命中；Bangumi 的搜索索引本身也认别名与原名（扫描侧就是靠罗马音
+    目录名命中别名的，见 `scanner._build_keywords`）。拆开交给
+    `SubjectMatcher.search_best` 逐个搜，命中率立刻不一样。
+
+    顺序：**含汉字的候选排在前面**。库里的显示口径是"中文名优先"
+    （`_subject_to_dict`），中文名拿去搜也更准（`season_mode="cn"`）。
+
+    **和 `clean_anime_title` 分开**：那个还兼着 RSS 判新的模糊匹配
+    （rss_matcher），改它的语义要整库回放核对；这里只服务「获取名称」
+    与"新建条目时的匹配"。
+    """
+    cands = _split_candidates(_clean_for_name(title))
+    if not cands:
+        # 标题通篇是括号时，番名也在被丢掉的那堆里（见 `_pick_from_blocks`）
+        cands = _split_candidates(_pick_from_blocks(title))
+    # 中文名优先，其余保持原顺序（`sorted` 稳定）
+    cands.sort(key=lambda c: 0 if _CJK_RE.search(c) else 1)
+    return cands[:limit]
+
+
+def guess_anime_name(title: str) -> str:
+    """单个名字（多候选里的第一个）。只想要一个字符串填进输入框时用它。
+
+    **只认含汉字的候选**：多候选排序把中文名放在最前，但整条标题都是
+    罗马音时，第一个候选就是罗马音 —— 那仍然比"整串带 `/` 的脏名字"好，
+    所以照常返回它。
+    """
+    names = guess_anime_names(title, limit=1)
+    return names[0] if names else ""
 
 
 def _to_seconds(t: str) -> int:

@@ -136,7 +136,7 @@ class QmlApp:
         #
         # 用 `reloadInProgress()` 而不是 `reload()`：前者只失效在看列表
         # 那份缓存（一条 SQL 级别），后者还会发 `subjectsChanged` ——
-        # 那会**重建海报墙的全部卡片**（每张重新解码封面，实测卡 1~2 秒）。
+        # 那会**重建海报墙的全部卡片**。
         # 播放结束是个高频动作，绝不能挂上那样的代价。
         self.player_bridge.playbackStopped.connect(self._on_playback_stopped)
         self.match_bridge = MatchBridge(self.db, self.api)
@@ -182,6 +182,8 @@ class QmlApp:
         # 搜不到，用户只能选错条目或选不上，`save_subject_id` 随之失效。
         self.rss_bridge.subjectCreated.connect(
             lambda sid, name: self.library_bridge.reload())
+        # 条目变了 → 通知订阅页（反方向）。
+        self.library_bridge.subjectsChanged.connect(self.rss_bridge.reload)
         # 桥接层的「立即检查」→ 服务层轮询
         self.rss_bridge.pollRequested.connect(self._on_poll_requested)
         # 桥接层的「下发」→ 服务层推送
@@ -232,7 +234,7 @@ class QmlApp:
             category=self.config.get("qbittorrent", "category", "Bangumi"),
             save_path=self.config.get("qbittorrent", "save_path", ""),
             webui_url=self.config.get("qbittorrent", "webui_url", ""),
-            # 按需启动 qBittorrent（实测诉求："在其退出但需要时打开"）。
+            # 按需启动 qBittorrent。
             # 路径留空时不生效（保持旧行为）。
             exe_path=self.config.get("qbittorrent", "exe_path", ""),
             auto_start=self.config.getbool("qbittorrent", "auto_start", False),
@@ -469,9 +471,6 @@ class QmlApp:
         #
         # Theme 单例在创建时（Main.qml 实例化的那一瞬间，早于首帧渲染）就会
         # 读这个属性并初始化，因此首帧就是配置里的主题色。
-        # 早期只在界面加载完之后才调 _apply_saved_theme()，结果是首帧先按
-        # Theme.qml 的默认色（蓝 #2F6FEB）画出来、下一帧才跳成配置色 ——
-        # 肉眼就是"打开软件的一瞬间搜索按钮是蓝的，然后才变主题色"（实测反馈）。
         is_dark, accent = self._saved_theme()
         ctx.setContextProperty("themeStartup", {
             "dark": is_dark, "accent": accent,

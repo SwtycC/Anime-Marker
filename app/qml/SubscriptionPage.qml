@@ -366,8 +366,11 @@ Item {
                                         root.bindQuery = ""
                                         bindSearch.text = ""
                                         // 新建条目那一栏也清空：否则会带着
-                                        // 上一个订阅输入的名字
+                                        // 上一个订阅输入的名字；
+                                        // 上一次「获取」的回显同理（换个订阅了，
+                                        // 那条识别结果与它无关）
                                         newSubjectField.text = ""
+                                        bindDialog.clearMatchInfo()
                                         bindDialog.open()
                                     }
                                 }
@@ -639,6 +642,34 @@ Item {
         /// 方法体在 Dialog 内部求值，那里能看到 `newSubjectField`。
         function setName(value) {
             newSubjectField.text = value || ""
+            filledName = value || ""
+        }
+
+        /// 「获取」识别出什么了 —— 「新建并绑定」那行下面的一句回显。
+        ///
+        /// **为什么要有**：RSS 标题给的常是简称/罗马音，而识别是"猜"出来的。
+        /// 从前要等条目都写进库、弹窗也关了，才从状态栏看到匹配结果；
+        /// 现在是**在点「新建并绑定」之前**就看到"匹配到哪一部、原名是什么、
+        /// 别名有几个"，认错了当场改名字再建。
+        ///
+        /// 只读属性，由 `rss.matchPreviewed` 写入（见文件末尾的 Connections）。
+        property string matchInfo: ""
+        property bool matchOk: false
+        /// 「获取」往输入框里填的那个名字。
+        ///
+        /// 回显只在**输入框仍然等于它**时显示 —— 用户改了名字，那次识别
+        /// 就作废了（后端 `createSubjectFromSource` 用的是同一条判据：
+        /// 名字对不上就重新搜，免得"改了名字却仍绑到原来那一部"）。
+        property string filledName: ""
+
+        function setMatchInfo(ok, text) {
+            matchOk = ok
+            matchInfo = text || ""
+        }
+
+        function clearMatchInfo() {
+            matchInfo = ""
+            filledName = ""
         }
 
         background: Rectangle {
@@ -787,6 +818,9 @@ Item {
                             root.statusMessage("该订阅还没填地址，请先编辑补充")
                             return
                         }
+                        // 抓订阅源 + 匹配 Bangumi 是两次网络请求，得让用户
+                        // 知道"正在跑"，否则会以为按钮没反应又点一次
+                        bindDialog.setMatchInfo(true, "正在识别（抓订阅源 + 匹配 Bangumi）…")
                         rss.suggestSubjectName(src.url)
                     }
                 }
@@ -816,6 +850,24 @@ Item {
                         bindDialog.close()
                     }
                 }
+            }
+
+            // ---- 「获取」识别 + 预匹配的回显 ----
+            //
+            // 两件事一次说清：认出的是什么名字、匹配到了哪一部（含**原名**与
+            // 别名个数）。用户据此决定"直接新建"还是"改个名字再新建" ——
+            // 改过名字后这行自动消失（判据见 bindDialog.filledName），
+            // 因为那次识别已经不成立了。
+            Text {
+                objectName: "bindMatchInfo"
+                width: parent.width
+                visible: bindDialog.matchInfo !== ""
+                         && newSubjectField.text.trim() === bindDialog.filledName
+                text: bindDialog.matchInfo
+                // 匹配到 = 强调色（"认对了"），没匹配/失败 = 次要色（别当成错误）
+                color: bindDialog.matchOk ? Theme.accent : Theme.textTertiary
+                font.pixelSize: Theme.fontSm
+                wrapMode: Text.WordWrap
             }
 
             CheckBoxLine {
@@ -1007,6 +1059,12 @@ Item {
             // 必须走 bindDialog.setName()，不能直接写 `newSubjectField.text`
             // —— 那个 id 对根作用域不可见（见 bindDialog 里的说明）。
             try { bindDialog.setName(name) } catch (e) { /* 同上 */ }
+        }
+        // 「获取」的预匹配结果（含原名/别名）→ 弹窗里那行小字。
+        // 弹窗没打开时这条也会到（在"添加订阅"表单里点的「获取」），
+        // 写进去没有副作用：下次打开绑定弹窗会 `clearMatchInfo()` 清掉。
+        function onMatchPreviewed(ok, text) {
+            try { bindDialog.setMatchInfo(ok, text) } catch (e) { /* 同上 */ }
         }
     }
 

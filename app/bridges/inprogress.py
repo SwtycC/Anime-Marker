@@ -1115,8 +1115,14 @@ class InProgressBridge(QObject):
         """
         parts: list[str] = []
         for _bid, eps in tasks:
-            sid = int((self._upload_meta.get(int(e["bangumi_ep_id"])) or {})
-                      .get("subject_id") or 0) if eps else 0
+            # 同一个 task 里的集都来自同一个本地条目，取第一集的
+            # `subject_id` 就够（`_upload_meta` 是 uploadEpisodes() 按集填的）
+            sid = 0
+            for e in eps or []:
+                meta = self._upload_meta.get(int(e["bangumi_ep_id"])) or {}
+                if meta.get("subject_id"):
+                    sid = int(meta["subject_id"])
+                    break
             name = self._subject_display_name(sid)
             parts.append(f"{name}（{len(eps)} 集）")
         if len(parts) > 5:

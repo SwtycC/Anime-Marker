@@ -24,12 +24,13 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Property, QTimer, Signal, Slot
 
+from app.core.bangumi_api import extract_aliases
 from app.core.config import Config
 from app.core.database import Database, RssSource
 from app.core.matcher import SubjectMatcher
 from app.core.rss_feed import RssError, fetch_and_parse
 from app.core.rss_matcher import RssMatcher
-from app.utils.title_parser import guess_anime_name
+from app.utils.title_parser import guess_anime_names
 from app.utils.qt_thread import NamedThread, retire_worker
 
 log = logging.getLogger(__name__)
@@ -112,40 +113,62 @@ _QB_STATE_LABELS = {
 
 
 class _FeedTitleWorker(NamedThread):
-    """抓取订阅源，从最近几条条目里推断出**动漫名**，交给界面预填。
+    """抓取订阅源，从最近几条条目里推断出**动漫名**，并顺手预匹配 Bangumi。
 
-    为什么要线程：抓 RSS 是网络请求（超时 15s），同步做会把界面卡住。
+    为什么要线程：抓 RSS 是网络请求（超时 15s），同步做会把界面卡住；
+    加了预匹配之后还多一次 Bangumi 搜索，更不能放主线程。
 
     **为什么是"推断"而不是"取第一条标题"**：RSS 的条目标题是**资源标题**，
     形如 `[Nekomoe kissaten&LoliHouse] 碧蓝之海 第三季 [09][WebRip 1080p]` ——
     带字幕组、集数、画质参数。直接拿去搜 Bangumi 基本搜不到，必须先清洗
-    （`guess_anime_name` 会去掉方括号块、集数、画质词）。
+    （`guess_anime_names` 会去掉方括号块、集数、画质词）。
 
     推断策略：
-      ① 最近几条 item 标题各自清洗后，**取最长的一条** —— 最长的那条
-         通常信息最全（最短的可能是"第 10 集"这种只有集号的）；
-         清洗用 `guess_anime_name`：标题通篇是括号时（`【组名】【番名】
+      ① 最近几条 item 标题各自清洗+**拆候选**，取"候选合起来最长"的那条 ——
+         最长的那条通常信息最全（最短的可能是"第 10 集"这种只有集号的）；
+         清洗用 `guess_anime_names`：标题通篇是括号时（`【组名】【番名】
          [01][1080p]`，comicat 等站点整源如此），它会回头从括号里挑番名，
          否则这一步会全军覆没；
-      ② 全失败 → 返回空串，让用户手填。
+      ② 有 Token 时拿**整组候选**搜一次 Bangumi（预匹配）——
+         候选之间是独立关键词，`青之芦苇 第二季 / Ao Ashi Season 2`
+         整串搜不到、拆开各自都能命中，见 `guess_anime_names`；
+      ③ 全失败 → 返回空串，让用户手填。
+
+    **预匹配为什么要在这里做**：做完之后"认成了哪一部"就能在弹窗里显示，
+    用户看着原名/别名决定要不要改名字，再点「新建并绑定」——
+    否则要等条目都写进库了才知道匹配错了。`createSubjectFromSource`
+    会复用这一步的结果，**不再搜第二次**，"看到的"与"建出来的"必然同一部。
     """
 
-    #: (来源 id, 推断出的名字, 错误信息, **请求用的地址**)
+    #: (来源 id, 推断出的名字, 错误信息, **请求用的地址**,
+    #:  多候选关键词, 预匹配结果 dict)
     #:
     #: **地址要原样带回来**：这一步的 `source_id` 恒为 0（订阅还没入库），
     #: 拿不到 id 就无从反查地址 —— 不给地址的话，日志与提示里只能说
     #: "没能推断出名称"，用户不知道是哪个订阅、更不知道是网络问题还是
     #: 地址填错了。
-    done = Signal(int, str, str, str)
+    #:
+    #: 预匹配结果 dict 的字段：
+    #:   matched/subject —— 是否匹配上、匹配到的 Bangumi 条目（原样响应）
+    #:   reason          —— `MatchResult.reason`（打印用）
+    #:   network_failed/network_error —— 是"搜不到"还是"根本没搜成"（要分开说）
+    #:   skipped         —— 没 Token/没开匹配，这一步被跳过
+    #: 用 `object` 而不是 `dict`：PySide 会把 `dict` 当 QVariantMap 深拷贝，
+    #: 而我们要原样把 Bangumi 响应（含 infobox 列表）带回主线程。
+    done = Signal(int, str, str, str, list, object)
 
     def __init__(self, source_id: int, url: str, proxy: str = "",
                  user_agent: str = "AnimeMarker/1.0",
+                 api=None, accept_score: int = 60, accept_gap: int = 20,
                  parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._source_id = source_id
         self._url = url
         self._proxy = proxy
         self._ua = user_agent
+        self._api = api                      # None = 没 Token，跳过预匹配
+        self._accept_score = accept_score
+        self._accept_gap = accept_gap
 
     def run(self) -> None:
         # 开工先记一行：把**实际要抓的地址**、代理写下来。
@@ -157,44 +180,79 @@ class _FeedTitleWorker(NamedThread):
                                       user_agent=self._ua)
         except RssError as e:
             log.warning("「获取名称」抓取订阅源失败：%s —— %s", self._url, e)
-            self.done.emit(self._source_id, "", str(e), self._url)
+            self.done.emit(self._source_id, "", str(e), self._url, [], {})
             return
         except Exception as e:              # pragma: no cover - 防御性
             log.exception("「获取名称」抓取订阅源异常：%s", self._url)
-            self.done.emit(self._source_id, "", f"抓取失败：{e}", self._url)
+            self.done.emit(self._source_id, "", f"抓取失败：{e}", self._url, [], {})
             return
 
         if not entries:
             log.warning("「获取名称」订阅源没有条目：%s", self._url)
-            self.done.emit(self._source_id, "", "该订阅源没有条目", self._url)
+            self.done.emit(self._source_id, "", "该订阅源没有条目", self._url, [], {})
             return
 
-        # 最近若干条（新的通常在前）清洗后比长度，取最长的那条作番名。
+        # 最近若干条（新的通常在前）拆出候选后比长度，取候选最全的那条。
         # 只取前 10 条：更早的多半是同一部番的历史集，长度不提供新信息。
         #
-        # 用 `guess_anime_name` 而不是 `clean_anime_title`：后者对
+        # 用 `guess_anime_names` 而不是 `clean_anime_title`：后者对
         # 「【组名】【番名】[85][1080p]」这种通篇括号的标题会清成一个字都不剩
         # ，前者会回头从括号里挑出番名。
-        best = ""
+        best: list[str] = []
         best_raw = ""
         for e in entries[:10]:
             raw = (e.title or "").strip()
-            cleaned = guess_anime_name(raw)
-            if len(cleaned) > len(best):
-                best, best_raw = cleaned, raw
+            names = guess_anime_names(raw)
+            if sum(len(n) for n in names) > sum(len(n) for n in best):
+                best, best_raw = names, raw
         # 采样与结果都记下来：清洗结果为空时，光看"没推断出来"无从判断
         # 是标题格式变了、还是这个源本身没有可用标题。
         # **认不出时必须把原样标题写进日志**：早期这里只记"取自标题 ''"，
         # 于是日志看不出源长什么样、还得再联网抓一次才知道是括号的问题。
         if best:
-            log.info("「获取名称」抓取成功：%s（共 %d 条）；取名 %r（取自标题 %r）",
+            log.info("「获取名称」抓取成功：%s（共 %d 条）；候选 %s（取自标题 %r）",
                      self._url, len(entries), best, best_raw[:80])
         else:
             log.warning("「获取名称」抓取成功：%s（共 %d 条）但推不出名字；"
                         "前几条标题原样：%s",
                         self._url, len(entries),
                         [e.title for e in entries[:3]])
-        self.done.emit(self._source_id, best, "", self._url)
+
+        preview = self._match(best)
+        self.done.emit(self._source_id, best[0] if best else "", "", self._url,
+                       best, preview)
+
+    def _match(self, names: list[str]) -> dict:
+        """拿候选搜一次 Bangumi（预匹配）。任何失败都只记日志、不打断"获取"。"""
+        if not names:
+            return {}
+        if self._api is None:
+            # 没 Token 就跳过 —— 与「新建并绑定」的取舍一致：核心诉求是
+            # "把订阅和条目对应起来"，匹配是加分项，不能因此让「获取」失效。
+            log.info("「获取名称」跳过预匹配（未配置 Token）")
+            return {"matched": False, "subject": None, "skipped": True}
+        try:
+            matcher = SubjectMatcher(
+                self._api, season_mode="cn",
+                accept_score=self._accept_score, accept_gap=self._accept_gap,
+            )
+            result = matcher.search_best(names, 0)
+        except Exception as e:
+            # 匹配失败不影响"名字已经拿到了"这件事，界面照样预填
+            log.warning("「获取名称」预匹配异常（名字仍会填入）：%s", e)
+            return {"matched": False, "subject": None,
+                    "network_failed": True, "network_error": str(e)}
+        log.info("「获取名称」预匹配：候选 %s → %s（%s）",
+                 names, (result.subject or {}).get("name_cn")
+                 or (result.subject or {}).get("name") or "未匹配",
+                 result.reason)
+        return {
+            "matched": result.subject is not None,
+            "subject": result.subject,
+            "reason": result.reason,
+            "network_failed": result.network_failed,
+            "network_error": result.network_error,
+        }
 
 
 class _CreateSubjectWorker(NamedThread):
@@ -208,6 +266,15 @@ class _CreateSubjectWorker(NamedThread):
          tag 入库**（与扫描入库同一套字段），没匹配上则退化为本地条目；
       ② 没 Token → **跳过匹配**，直接建本地条目（match_state='manual'）。
 
+    **`keywords` 是整组候选**（`guess_anime_names` 拆出来的"中文名 / 原名"），
+    不是只有输入框里那一个 —— RSS 标题常把两个名字并排写在一起，整串搜
+    什么都搜不到，拆开逐个搜才命中（见 `guess_anime_names`）。
+    输入框里的名字按用户意图排在最前。
+
+    **`pre_matched` 是「获取」时已经搜好的结果**：给了它就**不再搜第二次**。
+    这样"弹窗里显示的匹配"与"实际入库的条目"必然是同一部 ——
+    否则用户看到的是 A、两次搜索之间结果浮动到 B，差异不可解释。
+
     **复用 `upsert_local_subject`**（而不是 `upsert_subject`）：那个方法
     专门处理"没有 bangumi_id"的条目 —— 未匹配时 bangumi_id 必须写 NULL，
     因为该列有 UNIQUE 约束，用 0 当哨兵会让第二条未匹配番覆盖第一条
@@ -220,6 +287,8 @@ class _CreateSubjectWorker(NamedThread):
     def __init__(self, db: Database, api, source_id: int, name: str,
                  do_match: bool = True,
                  accept_score: int = 60, accept_gap: int = 20,
+                 keywords: Optional[list] = None,
+                 pre_matched: Optional[dict] = None,
                  parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._db = db
@@ -229,6 +298,8 @@ class _CreateSubjectWorker(NamedThread):
         self._do_match = do_match
         self._accept_score = accept_score
         self._accept_gap = accept_gap
+        self._keywords = list(keywords or [])
+        self._pre_matched = pre_matched
 
     def run(self) -> None:
         name = (self._name or "").strip()
@@ -237,18 +308,26 @@ class _CreateSubjectWorker(NamedThread):
             return
 
         subj = None
-        if self._do_match and self._api is not None:
+        if self._pre_matched is not None:
+            # 「获取」已经搜过并显示给用户了，直接用 —— 保证"看到的=建出来的"
+            subj = self._pre_matched
+            log.info("从订阅源新建条目：沿用「获取」时的预匹配结果（%s）",
+                     subj.get("name_cn") or subj.get("name") or name)
+        elif self._do_match and self._api is not None:
             try:
                 matcher = SubjectMatcher(
                     self._api, season_mode="cn",
                     accept_score=self._accept_score,
                     accept_gap=self._accept_gap,
                 )
-                result = matcher.search_best([name], 0)
+                keywords = self._keywords or [name]
+                if name not in keywords:
+                    keywords = [name] + keywords
+                result = matcher.search_best(keywords, 0)
                 subj = result.subject
                 if subj is None:
-                    log.info("从订阅源新建条目：未匹配到 Bangumi（%s），"
-                             "按本地条目入库", result.reason)
+                    log.info("从订阅源新建条目：未匹配到 Bangumi（%s，候选=%s），"
+                             "按本地条目入库", result.reason, keywords)
             except Exception as e:
                 # 匹配失败不阻断入库：用户要的是"把这个订阅对应起来"，
                 # 匹配只是锦上添花（拿封面/集数）。退化成本地条目即可。
@@ -531,6 +610,17 @@ class RssBridge(QObject):
     message = Signal(str)
     #: 推断出订阅源的动漫名（参数：来源 id, 名字）—— 界面据此预填输入框
     titleSuggested = Signal(int, str)
+    #: 「获取」的**预匹配**结果（参数：是否匹配成功, 回显文案）。
+    #:
+    #: 「获取」抓完订阅源后会顺手搜一次 Bangumi（有 Token 时），把"认成了
+    #: 哪一部"当场告诉用户 —— 否则要等点了「新建并绑定」，参数都写库了才
+    #: 知道匹配错了。文案里带**原名与别名**，因为 RSS 标题给的常常是简称，
+    #: 只看中文名分不出是哪一季/哪一部。
+    #:
+    #: 弹窗没打开时（在"添加订阅"表单里点的「获取」）这条也会发，
+    #: 界面侧忽略即可 —— 与 `titleSuggested` 同一取舍，见
+    #: `SubscriptionPage.onTitleSuggested` 的说明。
+    matchPreviewed = Signal(bool, str)
     #: 「从订阅源新建条目」完成（参数：新条目本地 id, 名称）。
     #:
     #: 媒体库桥接的`subjects` 是缓存，新建后必须让 QML 侧知道"条目变了" —— 既要刷新
@@ -579,6 +669,16 @@ class RssBridge(QObject):
         self._sources_dirty = True
         # 推断标题的 worker（同一时刻只允许一个，防连点重复抓取）
         self._title_worker: Optional[_FeedTitleWorker] = None
+        # ---- 上一次「获取」的结果（供「新建并绑定」复用）----
+        #
+        # `_suggest_name` 是**填进输入框的那个名字**（匹配成功时是 Bangumi
+        # 中文名）：只有当用户没改过输入框（`name == _suggest_name`）时，
+        # 下面两项才成立 —— 用户改了名字，就等于放弃了这次预匹配。
+        self._suggest_name = ""
+        #: 「获取」拆出的整组候选（中文名 / 原名），按用户意图排序
+        self._suggest_keywords: list[str] = []
+        #: 「获取」预匹配到的 Bangumi 条目（None = 没匹配上）
+        self._suggest_subject: Optional[dict] = None
         # 新建条目的 worker 列表（与 library 的收藏状态 worker 同一套做法）
         self._create_workers: list["_CreateSubjectWorker"] = []
         # ---- 轮询状态（订阅页顶部展示）----
@@ -598,6 +698,15 @@ class RssBridge(QObject):
         self._preview_running = False
         self._preview_hint = ""
         self._preview_worker: Optional[_PreviewWorker] = None
+        #: 界面**最新一次**的预览请求：`(订阅 id, 必须包含, 必须不包含)`。
+        #:
+        #: 为什么单独立一份（而不是"调用了就直接开工"）：抓一次订阅源要 2~4 秒，
+        #: 而界面的防抖只有 0.7 秒 —— worker 在跑时后来的请求**不能丢**，
+        #: 见 `requestPreview`。
+        self._preview_want: Optional[tuple[int, str, str]] = None
+        #: 正在跑（或刚跑完）的那个 worker 用的是哪一组参数。
+        #: `_on_preview` 靠它与 `_preview_want` 比对，判断结果是否已过时。
+        self._preview_key: Optional[tuple[int, str, str]] = None
         # ---- 「下载完自动扫描」----
         #
         # 记"已经因为下完而请求过扫描"的 download_history.id（**不是**
@@ -1083,15 +1192,38 @@ class RssBridge(QObject):
         """抓一次订阅源并跑判新，把"会下载哪些集"回传给界面。
 
         **由界面在过滤词变化后调用（带防抖）** —— 用户要求"填完过滤词
-        实时出现"。防抖在 QML 侧做（600ms），这里只保证同一时刻只有一个
-        worker（重复触发直接忽略）。
+        实时出现"。防抖在 QML 侧做（700ms）。
+
+        **同一时刻只跑一个 worker，但后来的请求一个都不丢**：
+        抓一次订阅源要 2~4 秒，而防抖只有 0.7 秒 —— 用户删掉过滤词
+        时，上一次抓取多半**还在飞**。早先这里遇到"正在跑"就直接 `return`，
+        那次请求于是永久消失（没有任何补跑）：界面从此停在上一次的结论上。
+        所以改成**合并**：最新一组参数记进 `_preview_want`，正在跑的那个
+        结束了由 `_finish_preview` 补跑一次。
+        """
+        self._preview_want = (int(source_id), must_include or "",
+                              must_exclude or "")
+        self._start_preview()
+
+    def _start_preview(self) -> None:
+        """按 `_preview_want` 起一次抓取；有 worker 在跑就先不打搅它。
+
+        **被"正在跑"挡下不算丢弃**：参数还留在 `_preview_want` 里，
+        `_finish_preview`（挂 `finished`）会拿它补跑。
         """
         w = self._preview_worker
         if w is not None and w.isRunning():
+            log.debug("预览请求排队（上一次仍在抓取）：%s", self._preview_want)
             return
+        want = self._preview_want
+        if want is None:
+            return
+        source_id, must_include, must_exclude = want
+        # 这一轮用的就是 `want` —— 先记下来：`_on_preview` 靠它判"结果过没过时"
+        self._preview_key = want
         try:
             src = next((s for s in self._db.list_rss_sources()
-                        if s.id == int(source_id)), None)
+                        if s.id == source_id), None)
         except Exception as e:
             log.exception("预览读取订阅失败: %s", e)
             src = None
@@ -1109,17 +1241,41 @@ class RssBridge(QObject):
         self._preview_running = True
         self._preview_hint = ""
         self.previewChanged.emit()
+        log.info("预览抓取开始：订阅 #%s 必须包含=%r 必须不包含=%r",
+                 source_id, must_include, must_exclude)
         w = _PreviewWorker(self._db, self._config, src,
                            must_include, must_exclude)
         w.done.connect(self._on_preview)
         # 引用留到 `finished` 才摘（不能挂在 `done` 上，见 utils/qt_thread.py）
-        w.finished.connect(lambda: retire_worker(self, "_preview_worker", w))
+        w.finished.connect(lambda: self._finish_preview(w))
         self._preview_worker = w
         w.start()
+
+    def _finish_preview(self, worker: "_PreviewWorker") -> None:
+        """线程**真正结束**后摘引用；期间改过过滤词就在这里补跑一次。
+
+        **补跑只能挂 `finished`，不能挂 `done`**：`done` 是 `run()` 内部发的，
+        那时线程还在跑 —— 此时新建 worker 覆盖 `_preview_worker`，等于把唯一
+        引用从运行中的旧线程上摘掉，撞上 Qt 6 的 `qFatal` 当场退出
+        （见 utils/qt_thread.py 的模块说明②）。
+        """
+        retire_worker(self, "_preview_worker", worker)
+        if (self._preview_want is not None
+                and self._preview_want != self._preview_key):
+            log.info("预览：抓取期间过滤词又改过，补跑一次 %s", self._preview_want)
+            self._start_preview()
 
     def _on_preview(self, source_id: int, items: list, error: str) -> None:
         # 不在这里摘 `_preview_worker`：`done` 时线程还在跑，见 utils/qt_thread.py
         self._preview_running = False
+        # 这份结果是不是**当前**这组过滤词的？不是就别发布 ——
+        # 发了就是"预览停在旧过滤词上"（用户报的那个现象）。
+        # 补跑的那次马上开始（见 `_finish_preview`）。
+        if self._preview_want is None or self._preview_key != self._preview_want:
+            log.info("预览结果已过时（期间过滤词改过 / 弹窗已关），丢弃：%s",
+                     self._preview_key)
+            self.previewChanged.emit()      # running 状态要跟着变
+            return
         if error:
             self._preview_items = []
             self._preview_hint = f"抓取失败：{error}"
@@ -1134,6 +1290,11 @@ class RssBridge(QObject):
         self._preview_items = []
         self._preview_hint = ""
         self._preview_running = False
+        # **连"待补跑的那次"一起作废**：弹窗已经关了，再抓一次订阅源纯属浪费，
+        # 抓回来的结果也只会在关窗之后落到界面上（`_on_preview` 见
+        # `_preview_want is None` 会丢弃）。
+        self._preview_want = None
+        self._preview_key = None
         self.previewChanged.emit()
 
     @Slot(int, bool)
@@ -1665,8 +1826,19 @@ class RssBridge(QObject):
         ua = self._config.get("bangumi", "user_agent",
                               "AnimeMarker/1.0") if self._config else "AnimeMarker/1.0"
         log.info("「获取名称」开始：%s", url)
+        # 上一次的预匹配结果就此作废：本次抓的是另一个地址，
+        # 若这次没匹配上而旧结果还留着，「新建并绑定」会绑到上一部去。
+        self._suggest_name = ""
+        self._suggest_keywords = []
+        self._suggest_subject = None
+        # 没有 Token 就不做预匹配（`_api is None` 让 worker 直接跳过）——
+        # 「获取名称」本身不依赖 Token，没配也能用
+        api = self._api if self._can_match() else None
+        score = self._config.getint("scanner", "accept_score", 60) if self._config else 60
+        gap = self._config.getint("scanner", "accept_gap", 20) if self._config else 20
         # source_id 传 0：这一步还没入库，不需要 id
-        w = _FeedTitleWorker(0, url, proxy=proxy, user_agent=ua)
+        w = _FeedTitleWorker(0, url, proxy=proxy, user_agent=ua,
+                             api=api, accept_score=score, accept_gap=gap)
         w.done.connect(self._on_title_suggested)
         # 引用留到 `finished` 才摘（不能挂在 `done` 上，见 utils/qt_thread.py）
         w.finished.connect(lambda: retire_worker(self, "_title_worker", w))
@@ -1676,7 +1848,8 @@ class RssBridge(QObject):
         return True
 
     def _on_title_suggested(self, source_id: int, name: str, error: str,
-                            url: str = "") -> None:
+                            url: str = "", keywords: Optional[list] = None,
+                            preview: Optional[dict] = None) -> None:
         """「获取名称」收尾。`url` 是本次**实际抓取的地址**（见信号定义）。
 
         每一步都写日志 —— 这个方法有三条出口（失败 / 推断为空 / 成功），
@@ -1697,9 +1870,85 @@ class RssBridge(QObject):
                         "（标题清洗后为空）：%s", url or "(未知地址)")
             self.message.emit("没能从订阅源推断出名称，请手动填写")
             return
-        log.info("「获取名称」成功：%s → %r", url or "(未知地址)", name)
-        self.titleSuggested.emit(int(source_id), name)
-        self.message.emit(f"已获取名称：{name}")
+        log.info("「获取名称」成功：%s → 候选 %s", url or "(未知地址)",
+                 list(keywords or [name]))
+        self._on_title_ready(int(source_id), name, list(keywords or []),
+                             dict(preview or {}))
+
+    def _on_title_ready(self, source_id: int, name: str, keywords: list,
+                        preview: dict) -> None:
+        """名字与预匹配都已到手 → 缓存下来、通知界面。
+
+        **为什么输入框填的不一定是 `name`**：匹配成功时改填 Bangumi 的
+        中文名。RSS 标题给的是资源写法（`青之芦苇 第二季 / Ao Ashi Season -`），
+        而库里"中文名优先"的口径以 Bangumi 正名为准；用户看到回显后照样能改。
+
+        **缓存是为了「新建并绑定」复用**：见 `createSubjectFromSource`。
+        """
+        subj = preview.get("subject") or None
+        display = name
+        if subj is not None:
+            display = (subj.get("name_cn") or subj.get("name") or name).strip() or name
+
+        # 输入框里那个名字排最前（用户可能已经改过），其余候选跟着
+        cands = [c for c in keywords if c and c != display]
+        if display:
+            cands.insert(0, display)
+
+        self._suggest_name = display
+        self._suggest_keywords = cands
+        self._suggest_subject = subj
+
+        self.titleSuggested.emit(int(source_id), display)
+
+        # 状态栏也带上原名：弹窗没打开时（在"添加/编辑订阅"表单里点的「获取」）
+        # 这是用户唯一能看到"认成了哪一部"的地方。
+        msg = f"已获取名称：{display}"
+        if subj is not None:
+            origin = (subj.get("name") or "").strip()
+            if origin and origin != display:
+                msg += f"（原名：{origin}）"
+        self.message.emit(msg)
+        self.matchPreviewed.emit(subj is not None,
+                                 self._preview_text(preview, display))
+
+    @staticmethod
+    def _preview_parts(subj: dict, display: str) -> list[str]:
+        """预匹配回显里的细节：原名 / 别名个数 / 集数。
+
+        **别名个数要显示**：RSS 标题给的常是俗称或罗马音，只看中文名
+        仍可能认错；别名列表是"这一部到底是不是我要的"最直接的证据。
+        别名就在本次搜索响应里（`extract_aliases` 读的是 infobox），
+        零额外请求。
+        """
+        parts: list[str] = []
+        origin = (subj.get("name") or "").strip()
+        if origin and origin != display:
+            parts.append(f"原名：{origin}")
+        count = len(extract_aliases(subj))
+        if count:
+            parts.append(f"别名 {count} 个")
+        eps = subj.get("total_episodes") or subj.get("eps_count") or 0
+        if eps:
+            parts.append(f"{int(eps)} 集")
+        return parts
+
+    def _preview_text(self, preview: dict, display: str) -> str:
+        """预匹配结果的一句话回显（弹窗里那行小字）。"""
+        subj = preview.get("subject") or None
+        if subj is not None:
+            tail = "、".join(self._preview_parts(subj, display))
+            return (f"匹配到「{display}」" + (f"（{tail}）" if tail else "")
+                    + "；点「新建并绑定」就会用它")
+        if preview.get("skipped"):
+            return "未配置 Token，跳过预匹配（不影响新建条目）"
+        if preview.get("network_failed"):
+            return (f"预匹配失败：{preview.get('network_error') or '网络不通'}"
+                    "；名字已填入，可手动改")
+        reason = preview.get("reason") or ""
+        return ("没能匹配到 Bangumi 条目"
+                + (f"（{reason}）" if reason else "")
+                + "，将按本地条目新建")
 
     @Slot(int, str, bool, result=bool)
     def createSubjectFromSource(self, source_id: int, name: str,
@@ -1734,13 +1983,28 @@ class RssBridge(QObject):
 
         score = self._config.getint("scanner", "accept_score", 60) if self._config else 60
         gap = self._config.getint("scanner", "accept_gap", 20) if self._config else 20
+        # ---- 复用「获取」的结果（只对**它当时填进去的那个名字**有效）----
+        #
+        # 用户改过输入框就说明他不认可那次识别，**必须重新搜** ——
+        # 否则"改了名字却仍绑到原来那一部"，比不匹配更让人困惑。
+        reuse = bool(name) and name == self._suggest_name
+        confirmed = self._suggest_subject if (do_match and reuse) else None
+        keywords = list(self._suggest_keywords) if reuse else []
+        if confirmed is not None:
+            log.info("「新建并绑定」沿用「获取」时的预匹配（不再搜第二次）：%s", name)
         w = _CreateSubjectWorker(self._db, self._api, source_id, name,
                                  do_match=do_match,
-                                 accept_score=score, accept_gap=gap)
+                                 accept_score=score, accept_gap=gap,
+                                 keywords=keywords, pre_matched=confirmed)
         self._create_workers.append(w)
         w.done.connect(self._on_subject_created)
         w.finished.connect(lambda: self._drop_create_worker(w))
         w.start()
+        # 只用一次：留着的话，下次给别的订阅建条目时名字恰好相同，
+        # 就会莫名其妙地复用到上一部
+        self._suggest_name = ""
+        self._suggest_keywords = []
+        self._suggest_subject = None
         return True
 
     def _can_match(self) -> bool:
@@ -1769,7 +2033,8 @@ class RssBridge(QObject):
         if subj is not None and not subj.bangumi_id:
             self.message.emit(f"已新建并绑定条目「{label}」（未匹配 Bangumi）")
         else:
-            self.message.emit(f"已新建并绑定条目「{label}」")
+            self.message.emit(f"已新建并绑定条目「{label}」"
+                              + self._created_detail(subj, label))
 
         # ---- 通知媒体库刷新----
         #
@@ -1777,6 +2042,28 @@ class RssBridge(QObject):
         # 「→ 番名」的小标签，不刷新就会一直空着。
         self.reload()
         self.subjectCreated.emit(int(subject_id), label)
+
+    @staticmethod
+    def _created_detail(subj, label: str) -> str:
+        """新建成功后的补充说明（原名 / 别名个数 / 集数）。
+
+        弹窗一点「新建并绑定」就关了，这行是**唯一**的事后反馈，
+        所以要把"连到哪一部"说全：RSS 标题给的多半是简称或罗马音，
+        只报中文名用户认不出是哪一部，**原名**才是他心里的那一个。
+        未匹配到 Bangumi 时不加 —— 那些数据本来就没有。
+        """
+        if subj is None or not subj.bangumi_id:
+            return ""
+        aliases = Database.aliases_from_text(getattr(subj, "aliases", "") or "")
+        parts: list[str] = []
+        name = (subj.name or "").strip()
+        if name and name != (label or "").strip():
+            parts.append(f"原名：{name}")
+        if aliases:
+            parts.append(f"别名 {len(aliases)} 个")
+        if subj.total_eps:
+            parts.append(f"{int(subj.total_eps)} 集")
+        return f"（{'，'.join(parts)}）" if parts else ""
 
     def waitWorkers(self, ms: int = 3000) -> None:
         """退出时等待进行中的网络线程（QmlApp.shutdown 调用）。"""

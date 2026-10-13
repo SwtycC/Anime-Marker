@@ -192,6 +192,18 @@ class RssMatcher:
         #: "自动下载已关闭"两个闸门），但仍然真跑查重。
         self.assume_enabled = assume_enabled
 
+        #: 本轮已经为哪些订阅报过"算不出保存路径"。
+        #:
+        #: `resolve_save_path` 是**按条目**调的（每条新集各算一次保存路径），
+        #: 而"算不出"是**每个订阅一件事** —— 一个 rule=all 的源一次轮询有
+        #: 十几条新集，同一句话就刷十几行，把真正有用的那几行淹了。
+        #:
+        #: 放在实例上就够：`RssMatcher` 由 `PollWorker.run()` **每轮新建一个**
+        #: （`rss_service.py:85`），所以这个集合天然是"每轮清空"。
+        #: 不用给跨模块传"轮次"，也不会变成"一辈子只报一次"（那样用户
+        #: 后来解绑了就再也看不到告警）。
+        self._path_warned: set[int] = set()
+
     # ---------- 标题过滤（纯过滤，与判新无关）----------
     def title_filtered(self, title: str, source: RssSource) -> str:
         """标题是否被"必须包含 / 必须不包含"筛掉；返回非空 = 被筛掉的原因。
@@ -452,9 +464,18 @@ class RssMatcher:
         """
         path, note, exists = self.plan_save_path(source)
         if not path:
-            # 推算不出：说清是"哪个原因"掉进默认路径的，便于排查
-            log.warning("订阅 #%s 算不出保存路径，用 qBittorrent 默认设置",
-                        source.id)
+            # 推算不出：说清是"哪个原因"掉进默认路径的，便于排查。
+            #
+            # **同一轮里同一订阅只报一次**（第一次 warning，之后 debug）：
+            # 本方法是按条目调的，一个源十几条新集就会刷十几行一模一样的话。
+            # 事实本身没变，只是不再重复说。
+            sid = int(getattr(source, "id", 0) or 0)
+            if sid not in self._path_warned:
+                self._path_warned.add(sid)
+                log.warning("订阅 #%s 算不出保存路径，用 qBittorrent 默认设置"
+                            "（本轮后续同样的条目不再重复记录）", sid)
+            else:
+                log.debug("订阅 #%s 仍算不出保存路径（本轮已记录过）", sid)
             return ""
 
         if not exists:
