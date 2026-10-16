@@ -18,8 +18,10 @@ RSS 解析器（feedparser 或 xml.etree）配合，且需要「三层判新」�
 from __future__ import annotations
 
 import copy
+import difflib
 import logging
 import re
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QObject, Property, QTimer, Signal, Slot
@@ -560,6 +562,20 @@ def _title_similar(a: str, b: str) -> float:
     return hit / len(short)
 
 
+def _release_similar(a: str, b: str) -> float:
+    """**对称**的发布名相似度（0~1）—— 专门给"拿文件名去认条目"用。
+
+    `_match_torrent` 那边不显这个毛病：它比的是两个**完整种子名**，
+    短串不会短到没有信息量，所以那边保持原样、不动。
+    """
+    if not a or not b:
+        return 0.0
+    sa, sb = _norm_title(a), _norm_title(b)
+    if not sa or not sb:
+        return 0.0
+    return difflib.SequenceMatcher(None, sa, sb).ratio()
+
+
 def _match_torrent(rec_title: str, torrents: dict) -> Optional[dict]:
     """把一条下载记录匹配到 qBittorrent 里的任务（拿不到返回 None）。
 
@@ -599,6 +615,44 @@ def _match_torrent(rec_title: str, torrents: dict) -> Optional[dict]:
     if len(同集) == 1:
         return 同集[0]
     return best if best is not None and best_score > 0 else None
+
+
+#: "按目录/已有集认条目"时要求的最低标题重合度（与 `_match_torrent` 的
+#: 第一级同一个阈值）—— 宁可少认，也不要把集归到错的条目上。
+_FOLDER_MATCH_MIN = 0.5
+
+#: 启动补偿那一趟的延迟（毫秒）：等首帧渲染完再动扫描。
+#:
+#: 扫描是"读目录 + 匹配 + 写库 + 联网"的重操作，而启动补偿可能**立刻**
+#: 就发起一次；与窗口首帧抢资源会让用户看到窗口"卡一下才出来"。
+START_SCAN_DELAY_MS = 2000
+
+
+def _ever_bound(rec, source) -> bool:
+    """这条下载记录**曾经**绑定过本地条目吗（哪怕那个条目现在已经被删）。
+
+    **为什么要区分"从没绑过"与"绑过但死了"**：两者的处置完全不同 ——
+      - 从没绑过（用户在试订阅源而已）：扫也扫不出对应关系，照旧静默标记，
+        每次轮询替它重匹配一遍标题没有任何意义；
+      - 绑过但死了（条目被删 / 记录指向陈旧 id）：这是**要用户出手**的情况
+        （重新绑定该订阅），必须留日志、并在界面上提示，不能像旧代码那样
+        一声不吭地每 5 秒重试到天荒地老。
+
+    判据取"任何一个绑定字段曾经有值"，包括已经失效的值 —— 失效本身
+    正是我们要识别的信号。
+    """
+    if int(getattr(rec, "subject_id", 0) or 0):
+        return True
+    if source is None:
+        return False
+    return any(int(getattr(source, f, 0) or 0)
+               for f in ("local_subject_id", "save_subject_id", "bangumi_id"))
+
+
+#: `_scan_subject_ok` 的三种结论 —— **必须区分"暂时"与"永久"**。
+_SCAN_OK = "ok"        # 可以发
+_SCAN_BUSY = "busy"    # 扫描器正忙 / 读库抖动 —— 暂时，下一轮再来
+_SCAN_GONE = "gone"    # 解析不出活着的条目 —— 永久，上层记一笔后跳过
 
 
 class RssBridge(QObject):
@@ -655,6 +709,14 @@ class RssBridge(QObject):
     #: 媒体库，查重第①层从此稳定命中。扫描复用详情页「重新扫描」那套
     #: （`RssBridge` 不该认识 `ScannerBridge`，跨桥连线放在 qml_app）。
     scanRequested = Signal(int)
+    #: 「有下载记录找不到对应本地条目」发生变化（订阅页据此显示重新绑定提示）。
+    #:
+    #: **为什么需要这个信号**：解析不出条目时，那条记录会**永久**卡在
+    #: "下完了却扫不进库"，而唯一的自愈手段是**用户重新绑定那个订阅**
+    #: （代码不会自动改绑定 —— 绑定决定 `plan_save_path` 的落点，猜错会把
+    #: 以后的新集下进别的番的目录）。既然要靠用户，就必须让他看得见，
+    #: 不能只写日志。用**被动提示**而不是弹窗：这发生在后台轮询里，弹窗会成灾。
+    unresolvedChanged = Signal()
 
     def __init__(self, db: Database, config: Optional[Config] = None,
                  api=None, parent: Optional[QObject] = None) -> None:
@@ -735,6 +797,17 @@ class RssBridge(QObject):
         #: 现在发起扫描"必须提前知道 —— 被拒绝时不能标记为已扫过，否则
         #: 那一条就永远漏扫了（见 _scan_subject_ok）。没注入时按"不忙"处理。
         self._scan_busy = None
+        #: 本会话已**断定扫不成**的 download_history.id（解析不出活着的条目）。
+        #:
+        #: 与 `_scan_triggered` 的区别：那个是"真的发出去了"，这个是"放弃了"
+        #: —— 两者都不该在同一会话里重复尝试，但**只有前者配写 `scanned_at`**。
+        #: `scanned_at` 是**跨会话**的永久标记，一旦写上就把"用户重新绑定后
+        #: 补扫"这条路堵死了（那正是要修的病），所以这里只做会话级：
+        #: 每次启动重试一次，是"不刷屏"与"能自愈"之间的折中。
+        self._scan_skipped: set[int] = set()
+        #: 解析不出条目的记录数，按订阅聚合 `{source_id: 条数}`。
+        #: 订阅页据此提示"请重新绑定"（见 unresolvedChanged）。
+        self._unresolved: dict[int, int] = {}
 
     def set_scan_busy_hook(self, hook) -> None:
         """注入「扫描是否正在进行」的查询函数（QmlApp 调用）。"""
@@ -754,21 +827,26 @@ class RssBridge(QObject):
         self._qb = qb
 
     def startScanWatch(self) -> None:
-        """启动"下完自动扫描"的后台轮询（QmlApp 在界面加载完成后调用）。
+        """启动"下完自动扫描"：**先补扫一趟历史记录，再挂定时器**
+        （QmlApp 在界面加载完成后调用）。
 
-        没配 qBittorrent 时不启动：`refreshTorrents` 会每 30 秒白跑一次
-        "读不到任务"（qb=None → `_TorrentStatusWorker` 直接回空），
-        不仅没意义，还会在日志里留下噪声。
+        **为什么不再"没配 qBittorrent 就整个不启动"**：补偿那一趟
+        （`scanPendingOnStart`）**不需要 qBittorrent** —— 它靠库里已经落成
+        `done` 的记录判断"下完了"。而没配 qB 的用户恰恰最需要它：那种情况下
+        永远不会有第一轮 qB 轮询来补扫，历史记录就一直躺在那里。
 
-        配了也不是每 30 秒真连 —— 定时器接的是 `_auto_refresh_torrents`，
-        它会先看有没有在途任务，没有就整轮跳过（见那里的说明）。
+        定时器也照挂：`_auto_refresh_torrents` 会**先判 `_qb`、再判有没有
+        在途任务**，所以没配 qB 时它只跑扫描、一次网都不连。它的第二个职责
+        是**重试**那些"当时扫描器正忙 / 条目解析不出"的记录 —— 早前
+        `_qb is None` 直接 return，连这个重试机会都没有，等于回到旧毛病。
         """
-        if self._qb is None:
-            log.info("未配置 qBittorrent，跳过「下载完自动扫描」的后台轮询")
-            return
+        # 延后一点执行：见 START_SCAN_DELAY_MS 的说明（别和窗口首帧抢资源）
+        QTimer.singleShot(START_SCAN_DELAY_MS, self.scanPendingOnStart)
         self._scan_timer.start()
-        log.info("「下载完自动扫描」已启动（每 %s 秒检查一次）",
-                 self._scan_timer.interval() // 1000)
+        log.info("「下载完自动扫描」已启动（每 %s 秒检查一次%s）",
+                 self._scan_timer.interval() // 1000,
+                 "" if self._qb is not None
+                 else "；未配置 qBittorrent，只补扫已完成的记录")
 
     def stopScanWatch(self) -> None:
         """停止后台轮询（退出时调用）。"""
@@ -1186,6 +1264,22 @@ class RssBridge(QObject):
             seg.append(f"被过滤 {n_filt}")
         return "，".join(seg)
 
+    @Property("QVariantList", notify=unresolvedChanged)
+    def unresolvedDownloads(self) -> list[dict]:
+        """哪些订阅有"找不到对应条目"的下载记录（订阅页据此提示重新绑定）。
+
+        返回 `[{"sourceId": int, "count": int}]`，条数多的在前。
+        空列表 = 一切正常（绝大多数时候）。
+
+        **这是"下载完自动扫描"唯一的自愈入口**：记录解析不出条目时，代码
+        不会自动改绑定（绑定决定 `plan_save_path` 的落点，猜错会把以后的新集
+        下进别的番的目录），只能请用户重新绑定。所以必须让它可见。
+        """
+        return [{"sourceId": sid, "count": n}
+                for sid, n in sorted(self._unresolved.items(),
+                                     key=lambda kv: (-kv[1], kv[0]))
+                if n > 0]
+
     @Slot(int, str, str)
     def requestPreview(self, source_id: int, must_include: str,
                        must_exclude: str) -> None:
@@ -1360,6 +1454,14 @@ class RssBridge(QObject):
                 )
                 self.message.emit(
                     f"已绑定到「{subj.name_cn or subj.name}」")
+            # ---- 绑定一变，"解析不出条目"的旧判定立刻作废 ----
+            #
+            # 这是"下载完自动扫描"的自愈闭环：那些因为**绑定条目被删**而
+            # 解析不出的记录，本来要等重启才会重试一次（`_scan_skipped` 是
+            # 会话级的）。用户重新绑定的这一刻就把闸门清掉，下一轮 5 秒/
+            # 30 秒定时器立刻能解析出条目并补扫 —— **不必重启**。
+            self._scan_skipped.clear()
+            self._clear_unresolved(source_id)
         except Exception as e:
             log.exception("绑定订阅 %s 失败: %s", source_id, e)
             self.failed.emit(f"绑定失败：{e}")
@@ -1502,6 +1604,37 @@ class RssBridge(QObject):
         return out
 
     @Slot()
+    def scanPendingOnStart(self) -> None:
+        """启动补偿：**不依赖 qBittorrent**，把"已确认下完、但没扫成"的补一遍。
+
+        **为什么必须有不依赖 qB 的这一趟**：『软件关着的时候下完了』——
+        关软件那一刻 qB 还在下、记录停在 `pushed`；等它真下完时进程早就不在
+        了，没有任何人去写 `done`、更没人触发扫描。下次启动时 `self._torrents`
+        还是空的（要等第一轮轮询），而**没配 qBittorrent 的用户根本就不会有
+        第一轮轮询**。于是这些集永远不入库、永远被 `new_only` 当成新集重复下。
+
+        它就是 `_maybe_scan_completed` 拿**空任务列表**跑一趟 —— 判据会自动
+        落到"库里已经是 `done`"那条分支（见那里的 finished 说明）。
+        单独包一层是为了：① 日志能一眼看出这是启动那一趟；② 给自动化验证
+        一个稳定入口（无头环境下不用真连 qBittorrent）。
+        """
+        log.info("启动补偿：检查「已确认下完但未扫描」的记录")
+        # **把"其实没事可干"也说出来**：`_maybe_scan_completed` 在没什么可扫时
+        # 是**完全静默**的（每个分支都只是 continue），于是"启动补偿：…"后面
+        # 空无一物 —— 看起来像功能坏了，实际是正常。
+        try:
+            pending = [r for r in self._db.list_downloads()
+                       if not r.scanned_at and r.status == "done"]
+        except Exception:               # pragma: no cover - 防御性
+            pending = []
+        if not pending:
+            log.info("启动补偿：没有需要补扫的记录（下完的都扫过了）")
+            return
+        log.info("启动补偿：发现 %s 条「已确认下完但未扫描」的记录，开始补扫",
+                 len(pending))
+        self._maybe_scan_completed({})
+
+    @Slot()
     def _auto_refresh_torrents(self) -> None:
         """后台 30 秒定时器的入口：**没有在途任务就不去碰 qBittorrent**。
 
@@ -1533,6 +1666,13 @@ class RssBridge(QObject):
         # 少了这一步，那些记录就永远等着"下一次轮询" —— 可轮询恰恰被
         # 闸门停掉了，于是"下完自动扫描"会静默失效。
         self._maybe_scan_completed(self._torrents)
+
+        # **先判 `_qb`、再判在途任务**（顺序与早前相反）：没配 qBittorrent 时
+        # 也必须每 30 秒进来一次 —— 上面的 `_maybe_scan_completed` 承担了
+        # 不依赖 qB 的补扫与**重试**（"当时扫描器正忙 / 条目解析不出"的记录
+        # 靠它重来）。早退在这之后，那些记录就再没有第二次机会。
+        if self._qb is None:
+            return
         if not self._has_inflight_downloads():
             return
         self.refreshTorrents()
@@ -1643,18 +1783,24 @@ class RssBridge(QObject):
         `pushed`（我们只是把种子交给了 qB，"下完没有"它并不知道，见
         `_load_downloads` 里那段"有真实进度时以它为准"）。
 
-        **流程**：qB 任务（progress ≥ 1）→ 反查 download_history 记录
-        （`_match_torrent` 那套"集号 + 标题重合度"）→ 拿到 `subject_id`
-        → `scanRequested`。
+        **流程**：判断"下完了没有" → 反查记录该归哪个条目
+        （`_resolve_subject_id`）→ `scanRequested`。
+
+        **"下完了没有"有两套判据**（缺一不可）：
+          - 有 qB 任务可比 → `progress ≥ 1` 且不是 `moving`（权威口径）；
+          - 没有 qB 任务可比（没配 qB / 任务已被清理 / 启动补偿那一趟）→
+            **只有库里已经落成 `done` 的才算**。`pushed`/`downloading` 在途时
+            没有任何东西能证实它下完了，贸然扫会读到下到一半的目录。
+            这条判据正是"**软件关着的时候下完了**"能补回来的前提
+            （见 `scanPendingOnStart`）。
 
         **去重依据是库里的 `scanned_at`，不是内存集合**：内存集合一重启就没了，
         而已下完的 qB 任务还在，于是每次启动都重扫一遍。见迁移 v14。
-
-        **匹配失败是正常的**（用户手动删过记录、或标题差异太大）：静默
-        跳过即可 —— 退化成"这一集下次还会被当成新集"。
         """
-        if not torrents:
-            return
+        # **没有 qBittorrent 任务列表也要往下走**（早前这里直接 return）：
+        # 启动补偿那一趟就是拿空列表进来的（见 scanPendingOnStart），
+        # 它靠"库里已经落成 `done`"判断下完了 —— 那正是"软件关着的时候
+        # 下完了"唯一能补回来的依据。
         try:
             records = self._db.list_downloads()
         except Exception as e:          # pragma: no cover - 防御性
@@ -1663,40 +1809,68 @@ class RssBridge(QObject):
         if not records:
             return
 
+        # 订阅表**按需取一次**：重解析要用它的权威绑定，而同一轮里多条记录
+        # 常常属于同一个订阅 —— 逐条查是白跑 N 遍 LIST。
+        sources = None
+        #: 本轮**已经发过扫描**的条目：同一 subject 只发一次。
+        #:
+        #: 为什么要去重：`scanRequested` 是**直连**（见 qml_app 的连线），
+        #: emit 返回时 `scanner_bridge.running` 已置真 —— 同一条目的第二条
+        #: 记录会在 `_scan_subject_ok` 那里撞上"扫描器忙"而被推迟到下一轮
+        #: （白等 30 秒）。一次扫描本来就覆盖该条目下所有记录，直接记账更利落。
+        seen_sids: set[int] = set()
+
         for rec in records:
-            # 已扫过（跨会话）→ 不再重复；内存里那个集合是**本会话的**
+            # 已扫过（跨会话）→ 不再重复；内存里那两个集合是**本会话的**
             # 补充闸门：`scanned_at` 写库是异步排队生效的，同一秒内的
             # 多次轮询（QML 5 秒定时器 + 后台 30 秒定时器可能重叠）
             # 会看到同一份旧数据，靠它挡住。
-            if rec.scanned_at or rec.id in self._scan_triggered:
-                continue
-            info = _match_torrent(rec.torrent_title or "", torrents)
-            if info is None:
-                continue
-            try:
-                progress = float(info.get("progress") or 0.0)
-            except (TypeError, ValueError):
-                continue
-            # 1.0 是 qBittorrent 的"下载本身完成"，但**文件可能还在移动**
-            # （state=moving）—— 那期间扫描会读到不完整的目录。
-            # 移动态直接跳过，等下一次轮询再看。
-            if progress < 1.0:
-                continue
-            if str(info.get("state") or "").lower() == "moving":
+            # `_scan_skipped` = 本会话已断定"扫不成"（解析不出条目）。
+            if (rec.scanned_at or rec.id in self._scan_triggered
+                    or rec.id in self._scan_skipped):
                 continue
 
-            # ---- 到这一步：qBittorrent 已经确认这个任务下完了 ----
+            # ---- 这条到底下完了没有 ----
             #
-            # 把它落库成 `done`。这不只是显示好看 —— 它是"**这条不用再盯着
-            # 了**"的持久结论，后台定时器的闸门（`_has_inflight_downloads`）
-            # 就靠它放行停机。
+            # 有 qBittorrent 任务可比 → 按它的**真实进度**判（权威口径；
+            # 库里那个 `status` 只是"我们下发过"的记录，不反映下完没有）。
+            info = _match_torrent(rec.torrent_title or "", torrents)
+            if info is not None:
+                try:
+                    progress = float(info.get("progress") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                # 1.0 是 qBittorrent 的"下载本身完成"，但**文件可能还在移动**
+                # （state=moving）—— 那期间扫描会读到不完整的目录。
+                # 移动态直接跳过，等下一次轮询再看。
+                if progress < 1.0:
+                    continue
+                if str(info.get("state") or "").lower() == "moving":
+                    continue
+                finished = True
+            else:
+                # 没有 qB 任务可比（没配 qB / 任务已被清理 / 启动补偿那一趟）
+                # —— **只有库里已经落成 `done` 的记录才敢当成下完了**。
+                #
+                # `pushed`/`downloading` 在途时没有任何东西能证实它下完了：
+                # 贸然去扫会读到下到一半的目录，更糟的是会把它标成"已处理"
+                # （`scanned_at` 是**跨会话**的永久标记），等它真下完时那次
+                # 扫描被挡掉，这一集就永远漏了。
+                finished = (rec.status == "done")
+            if not finished:
+                continue
+
+            # ---- 到这一步：确认下完了，把它落库成 `done` ----
+            #
+            # 这不只是显示好看 —— 它是"**这条不用再盯着了**"的持久结论，
+            # 后台定时器的闸门（`_has_inflight_downloads`）就靠它放行停机。
+            # 而且落成 `done` 之后，**下次启动的补偿扫描不需要 qBittorrent**
+            # 就能认出这条已经下完（上面的 finished 判据）—— 这正是
+            # "软件关着的时候下完了"能补回来的关键。
             #
             # **为什么不能只靠 `scanned_at`**：扫描未必发得出去 —— 扫描器
-            # 正忙（`_scan_subject_ok` 返回 False）或这个条目暂时读不到时，
-            # 下面的代码**故意不标记**，好留到下一轮重试。那种记录会一直
-            # 停在 `pushed`，把"按需连接"拖成永久轮询。
-            # 标记成 `done` 之后，扫描重试改由缓存驱动（见
-            # `_auto_refresh_torrents`），不再需要连 qBittorrent。
+            # 正忙或这个条目暂时读不到时，下面的代码**故意不标记**，好留到
+            # 下一轮重试。那种记录会一直停在 `pushed`，把"按需连接"拖成永久轮询。
             #
             # 只在变化时写：这个方法每 5 秒被调一次，不能每轮都写库。
             if rec.status != "done":
@@ -1705,38 +1879,262 @@ class RssBridge(QObject):
                 except Exception as e:      # pragma: no cover - 防御性
                     log.warning("标记下载记录 #%s 已完成失败：%s", rec.id, e)
 
-            sid = int(rec.subject_id or 0)
+            # ---- 解析成"当前还活着"的条目 ----
+            if sources is None:
+                try:
+                    sources = {s.id: s for s in self._db.list_rss_sources()}
+                except Exception as e:      # pragma: no cover - 防御性
+                    log.warning("读取订阅源失败（本轮暂不重解析陈旧指向）：%s", e)
+                    return
+            src = sources.get(int(rec.source_id or 0))
+
+            try:
+                sid = self._resolve_subject_id(rec, src)
+            except Exception as e:          # pragma: no cover - 防御性
+                # 读库失败是**暂时**的：不记 _scan_skipped，下一轮再来
+                log.warning("重解析记录 #%s 的条目失败（本轮跳过）：%s",
+                            rec.id, e)
+                continue
+
             if not sid:
-                # 记录没绑条目（未匹配到本地番）：扫也扫不出对应关系。
-                # **同样标记为已处理**，否则每次轮询都要重新匹配一遍标题。
+                if not _ever_bound(rec, src):
+                    # 这条订阅**从来没绑定过**本地条目（用户只是在试订阅源）：
+                    # 扫也扫不出对应关系。**照旧标记为已处理** —— 否则每轮
+                    # 都要重新匹配一遍标题，还会刷一屏无意义的告警。
+                    self._scan_triggered.add(int(rec.id))
+                    self._mark_scanned(int(rec.id))
+                    continue
+                # 曾经绑定过、现在解析不出来了 —— **这是要用户出手的情况**。
+                #
+                # 只记会话级跳过、**绝不写 `scanned_at`**：写上就把"用户
+                # 重新绑定后补扫"的路堵死了（那正是本次要修的病）。每次启动
+                # 重试一次，换来"不刷屏"（一条记录一个会话只报一次）与"能自愈"。
+                self._scan_skipped.add(int(rec.id))
+                self._note_unresolved(int(rec.source_id or 0))
+                log.warning(
+                    "下载 #%s 已完成，但解析不出对应条目（subject_id=%s，"
+                    "订阅 #%s 的绑定条目可能已被删除）—— 本轮跳过；"
+                    "重新绑定该订阅后会自动补扫：%s",
+                    rec.id, rec.subject_id, rec.source_id,
+                    (rec.torrent_title or "")[:60])
+                continue
+
+            if sid != int(rec.subject_id or 0):
+                # 解析到了**不同的**活条目 → 顺手把这一行的指向修正过来
+                # （同一轮的兄弟记录下一轮自然收敛，不必在这里成组处理）
+                try:
+                    if self._db.set_download_records_subject([int(rec.id)], sid):
+                        log.info("修正下载记录 #%s 的条目指向：%s → %s",
+                                 rec.id, rec.subject_id, sid)
+                except Exception as e:      # pragma: no cover - 防御性
+                    log.warning("修正记录 #%s 的条目指向失败：%s", rec.id, e)
+
+            if sid in seen_sids:
+                # 该条目的扫描本轮已经发过了，那次扫描覆盖这一条 —— 直接记账
                 self._scan_triggered.add(int(rec.id))
                 self._mark_scanned(int(rec.id))
                 continue
-            if not self._scan_subject_ok(sid):
-                # 条目已不存在 / 当前正在扫描 —— 这次不发，也不标记，
-                # 留到下一轮重试（见 _mark_scanned 的时序说明）
+
+            gate = self._scan_subject_ok(sid)
+            if gate == _SCAN_BUSY:
+                # 暂时：扫描器正忙。用 debug —— 一次扫描可能跑几分钟，
+                # info 会把日志刷满（这也是旧代码唯一的"静默"来源）
+                log.debug("扫描器忙，推迟「下载完自动扫描」记录 #%s → subject_id=%s",
+                          rec.id, sid)
                 continue
+            if gate == _SCAN_GONE:
+                # 永久：刚解析出来的条目在两次读库之间也没了（并发删除）
+                self._scan_skipped.add(int(rec.id))
+                self._note_unresolved(int(rec.source_id or 0))
+                log.warning("「下载完自动扫描」：条目 #%s 已不存在，跳过记录 #%s",
+                            sid, rec.id)
+                continue
+
+            seen_sids.add(sid)
             self._scan_triggered.add(int(rec.id))
             log.info("下载已完成，请求扫描条目以入媒体库：记录 #%s → subject_id=%s（%s）",
                      rec.id, sid, (rec.torrent_title or "")[:60])
             self.scanRequested.emit(sid)
             self._mark_scanned(int(rec.id))
 
-    def _scan_subject_ok(self, subject_id: int) -> bool:
-        """这次能不能真的发起扫描该条目（不能则留待下次重试）。
+    def _scan_subject_ok(self, subject_id: int) -> str:
+        """这次能不能真的发起扫描该条目（返回 `_SCAN_OK` / `_SCAN_BUSY` / `_SCAN_GONE`）。
 
-        **为什么要在这里判、而不是交给 QmlApp**：标记"已扫过"的时机必须
-        与"扫描真的发起了"一致 —— 若先把 `scanned_at` 写上、再发现扫描被
-        拒绝，那一条就**永远不会再被扫**，新集直接漏掉（比不修还糟）。
+        **为什么要在这里判、而不是交给 QmlApp**：标记"已扫过"的时机必须与
+        "扫描真的发起了"一致 —— 若先把 `scanned_at` 写上、再发现扫描被拒绝，
+        那一条就**永远不会再被扫**，新集直接漏掉（比不修还糟）。
         这里先判一次，通过之后 QmlApp 那边不会再被拒（它同一套判据）。
+
+        **为什么返回三态而不是 bool**：忙是**暂时**的（下一轮该重试），
+        条目不存在是**永久**的（重试一万次也不会变）。混成一个 False 时
+        调用方只能二选一，怎么选都是错的 —— 要么永久失败被无限重试刷屏，
+        要么暂时失败被误当成永久、错过扫描。旧版正是前者：静默重试到天荒地老。
         """
         if self._scan_busy is not None and self._scan_busy():
-            return False
+            return _SCAN_BUSY
         try:
-            return self._db.get_subject(int(subject_id)) is not None
+            if self._db.get_subject(int(subject_id)) is None:
+                return _SCAN_GONE
         except Exception as e:          # pragma: no cover - 防御性
-            log.warning("读取条目 %s 失败（跳过自动扫描）：%s", subject_id, e)
-            return False
+            # 读库失败是**暂时**的：绝不能当成"条目没了"，
+            # 否则一次 SQLite 抖动就把这一条永久跳过。
+            log.warning("读取条目 %s 失败（本轮跳过自动扫描）：%s", subject_id, e)
+            return _SCAN_BUSY
+        return _SCAN_OK
+
+    def _resolve_subject_id(self, rec, source) -> int:
+        """把一条下载记录解析成**当前还活着**的本地条目 id（0 = 解析不出）。
+
+        **为什么不能直接用 `rec.subject_id`**：它是**写入那一刻的快照**，而订阅的绑定
+        之后可能变过 —— 用户改绑、或者条目被删后重新加进来。快照一旦指向
+        不存在的条目，"下载完自动扫描"就永远解析不出该扫谁。
+
+        逐级**验活**（每级都用 `get_subject` 验，写法与 `_load_sources`
+        里"以 local_subject_id 为权威"的那段一致）：
+
+          ① 记录自己的 `subject_id` —— 还活着就直接用，**不动库**；
+          ② 订阅的 `local_subject_id` —— 现在的权威绑定；
+          ③ 订阅的 `save_subject_id` —— "存到哪个条目的目录"通常就是它；
+          ④ 订阅的 `bangumi_id` 反查本地条目 —— 兜底（老库/未回填）；
+          ⑤ 按目录唯一命中 —— 见 `_match_subject_by_folder`。
+
+        读库异常**故意不在这里吞**：调用方要据此区分"暂时读不到"与
+        "条目真没了"，否则会把一次抖动当成永久失败。
+        """
+        sid = int(rec.subject_id or 0)
+        if sid and self._db.get_subject(sid) is not None:
+            return sid
+        if source is None:
+            return 0
+        for cand in (getattr(source, "local_subject_id", None),
+                     getattr(source, "save_subject_id", None)):
+            cid = int(cand or 0)
+            if cid and self._db.get_subject(cid) is not None:
+                return cid
+        bgm = int(getattr(source, "bangumi_id", 0) or 0)
+        if bgm:
+            lid = self._db.find_subject_by_bangumi_id(bgm)
+            if lid and self._db.get_subject(int(lid)) is not None:
+                return int(lid)
+        return self._match_subject_by_folder(rec, source)
+
+    def _match_subject_by_folder(self, rec, source) -> int:
+        """末级兜底：按**目录**认这条下载记录属于哪个条目（0 = 认不出）。
+
+        只在前面四级全断时才走到这里。它能补的洞只有一个，但那个洞别的
+        办法都补不了：**条目被删之后又被重新加成本地条目**（新 id、而且
+        没匹配上 Bangumi）—— 此时绑定链全断，只有目录还对得上。
+
+        **为什么不能反过来拿它当主力**：
+          - 文件夹本身就是从**活着的条目**算出来的。`plan_save_path` 第一步
+            就是取 `save_subject_id/local_subject_id` 对应的条目，取不到就
+            返回空；`_guess_folder` 也是造个假订阅指着活条目借规则。
+            换句话说：绑定活着就不需要文件夹，绑定死了也拿不到文件夹。
+          - `download_history` **没有路径列**，没有"文件到底进了哪个目录"
+            的事实可对，只能靠订阅名去猜，猜不准。
+
+        所以判据从**最确凿的证据**开始，猜的部分放在最后，且要求**唯一命中**：
+
+          ① 本地库里已经有同一集（`episodes` 里集号相同、文件基名与种子标题
+             重合度达标）→ 它属于哪个条目就是答案。文件已经在某个条目下，
+             这是硬证据，一条 SQL 的事；
+          ② 都不中才按**订阅名推算目录**（与 `plan_save_path` 的"没有路径时
+             按系列归位"同一套规则），要求算出的目录真实存在**且**
+             `find_subject_by_folder` **恰好命中一个**。命中多个一律放弃 ——
+             猜错了会把集写进别人的条目。
+        """
+        title = rec.torrent_title or ""
+        ep = _ep_of(title)
+        if ep > 0 and title:
+            try:
+                rows = self._db.list_episodes_by_index(ep)
+            except Exception as e:      # pragma: no cover - 防御性
+                log.warning("按本地已有集反查条目失败（记录 #%s）：%s", rec.id, e)
+                rows = []
+            # 集号相同还要**发布名对得上**才算数：同一个集号在别的番里也有
+            # （"第 12 集"遍地都是），只按集号认会把集归到错的条目上。
+            # 用**对称**口径 `_release_similar`（不能用 `_title_similar`：
+            # 那是包含率）。
+            owner, best = 0, 0.0
+            for subj_id, path in rows:
+                score = _release_similar(title, Path(path).name)
+                if score > best:
+                    owner, best = int(subj_id), score
+            if owner and best >= _FOLDER_MATCH_MIN:
+                log.info("记录 #%s 按「本地已有同一集」归属到条目 #%s"
+                         "（发布名相似度 %.2f）", rec.id, owner, best)
+                return owner
+            log.debug("记录 #%s 的同集候选里没有够像的（最高 %.2f），改用目录推算",
+                      rec.id, best)
+
+        folder = self._guess_folder_of_source(source)
+        if not folder:
+            return 0
+        try:
+            subj = self._db.find_subject_by_folder(folder)
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("按目录 %s 反查条目失败：%s", folder, e)
+            return 0
+        if subj is None:
+            return 0
+        # **唯一性**：目录不是主键，`find_subject_by_folder` 取的是
+        # `ORDER BY id LIMIT 1`（`subjects.folder_path` 上没有唯一约束）。
+        # 万一有第二条也指着同一个目录，宁可不认 —— 认错会把集写进别人的条目。
+        same = self._db.count_subjects_by_folder(folder)
+        if same > 1:
+            log.warning("订阅名推算出的目录 %s 对应 %s 个条目，不敢认（记录 #%s）",
+                        folder, same, rec.id)
+            return 0
+        log.info("记录 #%s 按目录 %s 归属到条目 #%s", rec.id, folder, subj.id)
+        return int(subj.id)
+
+    def _guess_folder_of_source(self, source) -> str:
+        """按**订阅名**推算它该往哪个目录下（0 命中就返回空串）。
+
+        复用 `plan_save_path` 那套"没有 `folder_path` 时按系列归位"的规则
+        （媒体库根 / 系列名 / 季子目录），只是这里没有本地条目可依，只能拿
+        订阅名当输入 —— 所以**算不准是常态**，调用方必须再判 `is_dir()`。
+        """
+        if source is None or not self._config:
+            return ""
+        try:
+            from app.core.rss_matcher import (
+                _safe_dir_name, _season_dir_name, _split_series_season,
+            )
+
+            raw = _safe_dir_name(source.name or "")
+            if not raw:
+                return ""
+            roots = [p.strip() for p in
+                     (self._config.get("general", "library_path", "") or "").split(";")
+                     if p.strip()]
+            if not roots:
+                return ""
+            root = Path(roots[0])
+            series, season = _split_series_season(raw)
+            series = _safe_dir_name(series)
+            if series:
+                if not season:
+                    season = _season_dir_name(raw, series)
+                target = root / series / _safe_dir_name(season)
+            else:
+                target = root / raw
+            return str(target) if target.is_dir() else ""
+        except Exception as e:          # pragma: no cover - 防御性
+            log.debug("按订阅名推算目录失败：%s", e)
+            return ""
+
+    def _note_unresolved(self, source_id: int) -> None:
+        """记一笔"这条记录解析不出条目"，供订阅页提示用户重新绑定。"""
+        self._unresolved[int(source_id or 0)] = \
+            self._unresolved.get(int(source_id or 0), 0) + 1
+        self.unresolvedChanged.emit()
+
+    def _clear_unresolved(self, source_id: int) -> None:
+        """绑定变化后作废该订阅的"解析不出"计数（下一轮自然会重试）。"""
+        sid = int(source_id or 0)
+        if self._unresolved.pop(sid, None) is not None:
+            self.unresolvedChanged.emit()
 
     def _mark_scanned(self, record_id: int) -> None:
         """把"已扫过"写进下载记录（失败只记日志，不影响扫描本身）。"""

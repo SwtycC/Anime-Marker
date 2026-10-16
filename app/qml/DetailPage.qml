@@ -323,9 +323,24 @@ Item {
     // **为什么需要**：QML 里点击"别的控件"会移走焦点，但点击**空白区域**
     // 不会 —— 没有任何东西接管焦点，TextInput 的 activeFocus 一直保持，
     // 表现为"边框和浮起的「标签」停在激活态"。
-    // TapHandler 非独占（DragThreshold 策略）：不影响 Flickable 拖拽，
-    // 点在按钮 / 集数行等独占 grab 的控件上时自动让位（不触发）。
+    //
+    // **`gesturePolicy: DragThreshold` 必须保留**：
+    // `TapHandler` 铺满整页、默认收左键，在 pointer grab 阶段就会拿到
+    // 按下事件。而"划选"恰恰是"按住 → 拖动"——若不设这条策略，
+    // 左键一按下就被它拿走，下面的文本项收不到事件。
+    // 设成 DragThreshold 后，它只在"点了但基本没移动"时才算一次 tap，
+    // 用户一拖动就立即放弃，把事件让给 `TextEdit`（见 CopyableText）。
+    //
+    // **注意它的生效范围**（别再按"它铺满整页所以到处都能触发"来推理）：
+    // 被动 grab 的 handler 一旦遇上**非 child-filtering** 的独占者
+    // （`TextEdit`、`MouseArea` 这类自己处理鼠标的 item），Qt 会
+    // **故意不发 `tapped()`**。
+    // 所以这个 handler 实际只在**真正的空白处**触发，这恰好就是它
+    // 要的场景（点空白让输入框交出焦点）；点在可划选文字/按钮上时
+    // 本来也不需要它出手。
     TapHandler {
+        acceptedButtons: Qt.LeftButton
+        gesturePolicy: TapHandler.DragThreshold
         onTapped: root.forceActiveFocus()
     }
 
@@ -505,15 +520,20 @@ Item {
                     Layout.fillWidth: true
                     spacing: Theme.spacingSm
 
-                    Text {
+                    // 标题：`CopyableText` 给右键复制（点/划选行为不变）。
+                    // 高度用 implicitHeight —— 标题最多两行，会随内容变化。
+                    CopyableText {
                         Layout.fillWidth: true
                         text: root.subject.title || ""
                         color: Theme.textPrimary
                         font.pixelSize: Theme.fontXl
                         font.weight: Font.DemiBold
-                        wrapMode: Text.WordWrap
-                        elide: Text.ElideRight
-                        maximumLineCount: 2
+                        // 标题允许换行（`TextEdit` 没有 elide / 行数上限，
+                        // 见 CopyableText 说明）；给两行的高度上限，
+                        // 超出的部分被 clip 掉，视觉上与原来的
+                        // "最多两行 + 省略"基本一致。
+                        wrapMode: TextEdit.Wrap
+                        Layout.maximumHeight: Theme.fontXl * 2.4
                     }
 
                     // 跳转 Bangumi 对应条目页（如 https://bangumi.tv/subject/633836）
@@ -577,21 +597,116 @@ Item {
                     }
                 }
 
-                Text {
+                // 原名（日文/罗马音）：可划选，选中后 Ctrl+C 复制
+                // （单行，超长由外层宽度裁切 —— `TextEdit` 没有 elide）
+                CopyableText {
                     Layout.fillWidth: true
                     visible: (root.subject.name || "") !== ""
                     text: root.subject.name || ""
                     color: Theme.textSecondary
                     font.pixelSize: Theme.fontMd
-                    elide: Text.ElideRight
                 }
 
-                Text {
+                // 概要行（共 N 集 · 匹配状态）
+                CopyableText {
                     Layout.fillWidth: true
                     text: root.buildMeta()
                     color: Theme.textTertiary
                     font.pixelSize: Theme.fontSm
-                    elide: Text.ElideRight
+                }
+
+                // ---- 媒体库目录（超链接样式，**点击路径本身**打开资源管理器）----
+                //
+                // **从 buildMeta 里拆出来单列一行**：拼在 meta 里会被整行
+                // 截断（路径往往最长，正好是被截掉的那段），而且
+                // "点路径打开文件夹"需要自己的热区与悬停反馈。
+                //
+                // 视觉沿用 Bangumi 链接按钮那套语言：主题色 + 悬停出现
+                // 下划线，用户一眼能认出"这是个链接"。
+                //
+                // **为什么不再放一个文件夹图标**：
+                // 多一个图标等于多一个要认的东西，而"路径本身可点"更符合
+                // 浏览器/资源管理器的直觉。
+                Item {
+                    id: folderRow
+                    Layout.fillWidth: true
+                    implicitHeight: folderLabel.implicitHeight
+                    visible: (root.subject.folderPath || "") !== ""
+
+                    /// 悬停态。由下面的覆盖层 `MouseArea` 上报。
+                    property bool hovered: false
+
+                    // ---- 为什么这里只能是普通 `Text`，不能是 `CopyableText` ----
+                    //
+                    // Qt 的指针事件是"先发给 handler（**被动** grab）、
+                    // 再发给 item"。`CopyableText` 内部是 `TextEdit`，它随后
+                    // 拿到**独占 grab**；释放时 `TapHandler` 发现独占者是
+                    // **非 child-filtering** 的 item（`TextEdit` 不是
+                    // Flickable 那种会过滤子事件的容器），于是**故意不发
+                    // `tapped()`** —— 因为已经有东西在响应这次按下了
+                    // （定位光标）。这是 Qt 的有意设计，不是能绕过去的 bug。
+                    //
+                    // 本质矛盾：**同一次左键要么"点开目录"，要么"开始划选"**。
+                    // 已确认取舍：**要"点一下"，不需要复制路径** —— 所以这
+                    // 一行放弃拖选与划选，没有 `TextEdit` 来抢，点击必送达。
+                    Text {
+                        id: folderLabel
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+
+                        text: root.subject.folderPath || ""
+                        color: folderRow.hovered ? Theme.accent
+                                                 : Theme.textTertiary
+                        font.pixelSize: Theme.fontSm
+                        // `Text` 有 elide（`TextEdit` 没有，见 CopyableText
+                        // 文件头）：超长路径从"硬裁切"变成带省略号。
+                        wrapMode: Text.NoWrap
+                        elide: Text.ElideRight
+
+                        Behavior on color {
+                            ColorAnimation { duration: Theme.durFast }
+                        }
+
+                        // 下划线：**贴文字底边**。
+                        // `Text` 的 height就是行高，下划线必须从 bottom 定位。
+                        //
+                        // 宽度取 `contentWidth` 而不是 `implicitWidth`。
+                        // 用 implicitWidth 会让下划线远超省略号、拖到行尾。
+                        Rectangle {
+                            anchors.bottom: parent.bottom
+                            anchors.left: parent.left
+                            width: folderRow.hovered
+                                   ? Math.min(folderLabel.contentWidth,
+                                              folderLabel.width) : 0
+                            height: Theme.lineThin
+                            radius: height / 2
+                            color: Theme.accent
+                            opacity: folderRow.hovered ? 1 : 0
+                            Behavior on opacity {
+                                NumberAnimation { duration: Theme.durFast }
+                            }
+                        }
+                    }
+
+                    // ---- 点路径 → 打开资源管理器 ----
+                    //
+                    // 覆盖整行的 `MouseArea`（声明在 `Text` 之后 = 在上层）。
+                    // 它**独占左键**，但下面已经没有 `TextEdit` 要抢了，
+                    // 所以"独占"在这里正是好事 —— 点击必定触发。
+                    //
+                    // 热区是**整行**而不只是文字那几像素：这一行只有一行高，
+                    // 整行可点更宽容，也免去"文字右侧一小段点了没反应"的困惑。
+                    MouseArea {
+                        id: folderClick
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        // 链接语义：指针该跟着变成手形（早前是文本的 I 形）
+                        cursorShape: Qt.PointingHandCursor
+                        onEntered: folderRow.hovered = true
+                        onExited: folderRow.hovered = false
+                        onClicked: root.openFolder()
+                    }
                 }
 
                 // ---- 标签区（展示态 / 编辑态二选一）----
@@ -1136,13 +1251,27 @@ Item {
         var parts = []
         if (root.subject.totalEps > 0)
             parts.push("共 " + root.subject.totalEps + " 集")
-        if (root.subject.folderPath)
-            parts.push(root.subject.folderPath)
+        // **路径不再拼进这一行** —— 它单独渲染成可点击的链接行
+        // （见 folderRow）。拼在这里有两个问题：整行 elide 会把最长的
+        // 路径截断；且"点路径打开资源管理器"需要自己的热区与悬停反馈。
         if (root.subject.matchState === "pending")
             parts.push("⚠ 匹配待确认，请点右上角「重新匹配」")
         else if (root.subject.matchState === "manual")
             parts.push("已手动指定")
         return parts.join(" · ")
+    }
+
+    /// 打开该条目的媒体库目录（点路径行触发，见 folderRow）。
+    ///
+    /// **抽成独立函数**（而不是写在 `TapHandler.onTapped` 里）：
+    ///   - 交互入口可能增加（将来加右键菜单、快捷键），逻辑只留一份；
+    ///   - 便于自动化验证直接调用（无头环境下 `TapHandler` 的 tap
+    ///     没法用合成事件触发，只能调函数）。
+    function openFolder() {
+        if (typeof library === "undefined" || !library)
+            return
+        if (!library.openSubjectFolder(root.subjectId))
+            root.statusMessage("目录不存在或未设置，无法打开", true, "")
     }
 
     /// 集数左列显示文本。

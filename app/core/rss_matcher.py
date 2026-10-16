@@ -385,6 +385,36 @@ class RssMatcher:
         return "", ""
 
     # ---------- 保存路径（下载到指定条目的目录）----------
+    def _live_subject(self, source: RssSource):
+        """取"这次该用哪个条目的目录"对应的条目（取不到返回 None）。
+
+        **两个候选各自验活再取，不能短路**。早前 `plan_save_path` 里写的是
+        `save_subject_id or local_subject_id` —— 那是个 `or`：`save_subject_id`
+        指向**已删除**的 id 时它非 0、为真，于是**盖住**还活着的
+        `local_subject_id`，`get_subject` 取不到，直接算不出路径、悄悄退回
+        qBittorrent 全局目录 —— 文件下到别的地方去了，界面上却看不出来
+        （见 linkSubject 的"跟随"规则：只有 `save_subject_id == 旧绑定` 时
+        才会跟着改，别的情况下它就可能这样僵在那里）。
+
+        **为什么抽成一个方法**：`plan_save_path`（算路径）与
+        `resolve_save_path`（建目录 + 写回条目）**两处都要这份判据**。
+        分开写迟早漂移 —— 本轮就在 `resolve_save_path` 里踩过一次：那边够不着
+        `plan_save_path` 的局部变量，写回整段静默失效（只在日志里留一行
+        `name 'subj' is not defined`，下载照常，问题很难被发现）。
+        """
+        for cand in (getattr(source, "save_subject_id", 0),
+                     getattr(source, "local_subject_id", 0)):
+            cid = int(cand or 0)
+            if not cid:
+                continue
+            try:
+                subj = self.db.get_subject(cid)
+            except Exception:           # pragma: no cover - 防御性
+                subj = None
+            if subj is not None:
+                return subj
+        return None
+
     def plan_save_path(self, source: RssSource) -> tuple[str, str, bool]:
         """**纯推算**这次下载用哪个目录，**不创建任何东西**。
 
@@ -395,13 +425,9 @@ class RssMatcher:
             会变成两套逻辑，迟早对不上（用户看到 A、文件却进了 B）。
 
         """
-        sid = int(getattr(source, "save_subject_id", 0)
-                  or source.local_subject_id or 0)
-        if not sid:
-            return "", "", False
-        subj = self.db.get_subject(sid)
+        subj = self._live_subject(source)
         if subj is None:
-            # 条目不存在（如它被删了，而订阅还记着这个 id）。
+            # 两个候选都不存在（如条目被删了，而订阅还记着那些 id）。
             # **不在这里打 warning**：本方法会被界面的预览频繁调用，
             # 每次刷新都刷一行日志没有意义；真正下发时的告警
             # 留在 resolve_save_path（那里才是"出问题"的地方）。
@@ -507,16 +533,20 @@ class RssMatcher:
         #
         # 失败只记日志：写不进去不该让整次下载失败（文件照样下到 path）。
         try:
-            sid = int(getattr(source, "save_subject_id", 0)
-                      or source.local_subject_id or 0)
-            if sid:
-                cur = self.db.get_subject(sid)
-                if cur is not None and not (cur.folder_path or "").strip():
-                    # **只在原本为空时写**：已有值说明那是扫描得到的
-                    # 真实目录结构，不该被覆盖（例如用户把下载目录
-                    # 指向了另一个已扫描条目）。
-                    self.db.update_rss_subject_folder(sid, path)
-                    log.info("已把下载目录记入条目 #%s：%s", sid, path)
+            # 这是**另一个方法**，够不着 `plan_save_path` 的局部变量 ——
+            # 自己按同一份判据取一次（`_live_subject` 就是为此抽出来的）。
+            # 曾经这里直接写 `subj`，而 `subj` 是 `plan_save_path` 的局部名：
+            # 每次下发都抛 `name 'subj' is not defined`，被下面的 except 吞成
+            # 一条 warning —— 下载照常，**写回条目目录却整段失效**，很难发现。
+            subj = self._live_subject(source)
+            if subj is None:
+                return path
+            if not (subj.folder_path or "").strip():
+                # **只在原本为空时写**：已有值说明那是扫描得到的
+                # 真实目录结构，不该被覆盖（例如用户把下载目录
+                # 指向了另一个已扫描条目）。
+                self.db.update_rss_subject_folder(subj.id, path)
+                log.info("已把下载目录记入条目 #%s：%s", subj.id, path)
         except Exception as e:          # pragma: no cover - 防御性
             log.warning("写回条目目录失败（不影响本次下载）：%s", e)
         return path

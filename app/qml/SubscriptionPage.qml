@@ -26,6 +26,30 @@ Item {
                                    : []
     // 绑定弹窗里搜索框的关键词（存成小写，比较时不再重复转）
     property string bindQuery: ""
+
+    /// 「下载完自动扫描」**解析不出对应条目**的下载记录，按订阅聚合。
+    ///
+    /// **为什么要有它**：这类记录会**永久**卡在"下完了却扫不进库"（磁盘上
+    /// 的文件因此永远不入库、每一轮都还被 `new_only` 当成新集重复下发），
+    /// 而唯一的自愈手段是**用户重新绑定那个订阅** —— 代码不会自动改绑定
+    /// （绑定决定下载落点，猜错会把以后的新集下进别的番的目录）。
+    /// 既然要靠用户，就必须让他看得见，不能只写日志。
+    ///
+    /// 后端是 `rss.unresolvedDownloads`（`[{sourceId, count}]`），带
+    /// `notify`，所以在后台轮询里第一次解析失败后这里会自动刷新。
+    readonly property var unresolvedMap: {
+        var m = ({})
+        var list = (typeof rss !== "undefined" && rss)
+                   ? rss.unresolvedDownloads : []
+        for (var i = 0; i < list.length; ++i)
+            m[list[i].sourceId] = list[i].count
+        return m
+    }
+
+    /// 某个订阅有多少条记录解析不出条目（0 = 正常）。
+    function unresolvedCount(sourceId) {
+        return root.unresolvedMap[sourceId] || 0
+    }
     // 过滤后的可绑定条目（绑定弹窗的列表用这个，不是 linkableSubjects）
     //
     // 匹配四个字段 + 别名，与海报墙的 textMatches 同一套口径（见
@@ -59,6 +83,16 @@ Item {
                                         ? rss.pollStatus : ""
 
     signal statusMessage(string text)
+
+    /// 请求打开某个本地条目的详情页（由 Main.qml 接）。
+    ///
+    /// 用途：订阅卡片上那个「→ 动漫名」绑定标签 —— 点它直接进详情页，
+    /// 省掉"从海报墙里找一遍"的麻烦。
+    ///
+    /// **传本地主键 `localSubjectId`**（后端已在 `_load_sources` 里算好）：
+    /// 与详情页的 `load(sid)` 同一套 id 空间。未绑定时该值为 0，
+    /// 此时标签不可点（见下方 MouseArea 的 enabled）。
+    signal subjectClicked(int subjectId)
 
     Flickable {
         id: flick
@@ -236,14 +270,36 @@ Item {
                                     elide: Text.ElideRight
                                 }
 
-                                // 绑定状态标签
+                                // 绑定状态标签（**可点击 → 进入该动漫的详情页**）
+                                //
+                                // 视觉上给"可点"的暗示：悬停**底色加深** + 手型光标。
+                                //
+                                // **保持不透明、把颜色往主题色压深**，
+                                // 用 `Theme.mix(accentSoft, accent, 0.x)`。
                                 Rectangle {
+                                    id: bindChip
                                     anchors.verticalCenter: parent.verticalCenter
                                     visible: modelData.subjectName !== ""
                                     width: bindLabel.implicitWidth + Theme.spacingMd
                                     height: 20
                                     radius: Theme.radiusSm
-                                    color: Theme.accentSoft
+                                    color: bindChip.hovered
+                                           ? Theme.mix(Theme.accentSoft,
+                                                       Theme.accent, 0.45)
+                                           : Theme.accentSoft
+
+                                    /// 未绑定（localSubjectId=0）时不可点 ——
+                                    //  那种情况 `subjectName` 本来就是空串、
+                                    //  标签也不显示，这里只是把判据写全，
+                                    //  免得将来改了显示条件后点到一个无效 id。
+                                    readonly property bool clickable:
+                                        (modelData.localSubjectId || 0) > 0
+                                    readonly property bool hovered:
+                                        bindChipMouse.containsMouse && clickable
+
+                                    Behavior on color {
+                                        ColorAnimation { duration: Theme.durFast }
+                                    }
 
                                     Text {
                                         id: bindLabel
@@ -252,6 +308,18 @@ Item {
                                         color: Theme.accent
                                         font.pixelSize: Theme.fontXs
                                         elide: Text.ElideRight
+                                    }
+
+                                    MouseArea {
+                                        id: bindChipMouse
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        enabled: bindChip.clickable
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: root.subjectClicked(
+                                            modelData.localSubjectId || 0)
+                                        // **不挂 ToolTip**—— 底色加深 + 手型光标已经
+                                        // 足够表意，弹框是噪音。
                                     }
                                 }
 
@@ -338,6 +406,28 @@ Item {
                                     font.pixelSize: Theme.fontSm
                                     elide: Text.ElideRight
                                 }
+                            }
+
+                            // ---- 第三行半：「下载完自动扫描」找不到条目的记录 ----
+                            //
+                            // 这类记录**永远不会**自动入库（解析不出该扫哪个
+                            // 条目），磁盘上已有的集因此一直进不来，而且还
+                            // 会被 `new_only` 当成新集重复下发。唯一的出路是
+                            // **重新绑定这个订阅**。
+                            //
+                            // 用被动文字、**不弹窗**：它发生在后台轮询里，
+                            // 弹窗会成灾。点上面的「绑定」按钮即可 —— 绑定一变，
+                            // 后端立刻清掉"解析不出"的判定并自动补扫，不必重启。
+                            Text {
+                                width: parent.width
+                                visible: root.unresolvedCount(modelData.id) > 0
+                                text: "⚠ 有 " + root.unresolvedCount(modelData.id)
+                                      + " 条下载记录找不到对应条目"
+                                      + "（本订阅的绑定条目可能已被删除）——"
+                                      + " 请点「绑定」重新绑定"
+                                color: Theme.warningColor
+                                font.pixelSize: Theme.fontSm
+                                wrapMode: Text.WordWrap
                             }
 
                             // 第四行：操作按钮
@@ -729,8 +819,8 @@ Item {
 
                             width: bindList.width
                             height: 32
-                            color: bindMouse.containsMouse ? Theme.hoverFill
-                                                           : "transparent"
+                            color: bindRowMouse.containsMouse ? Theme.hoverFill
+                                                              : "transparent"
 
                             Text {
                                 anchors.verticalCenter: parent.verticalCenter
@@ -744,7 +834,7 @@ Item {
                             }
 
                             MouseArea {
-                                id: bindMouse
+                                id: bindRowMouse
                                 anchors.fill: parent
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor

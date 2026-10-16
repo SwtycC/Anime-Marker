@@ -206,6 +206,7 @@ class _CollectTypeWorker(NamedThread):
         subject_id: int,
         bangumi_id: int,
         write_type: int = 0,
+        subject_name: str = "",
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -213,17 +214,21 @@ class _CollectTypeWorker(NamedThread):
         self._api = api
         self._subject_id = subject_id
         self._bangumi_id = bangumi_id
+        #: 条目显示名，**只用于日志**（见 set_collection_type 的说明）。
+        #: 在线程构造时就定下来，避免在 run() 里再查一次库。
+        self._subject_name = subject_name
         # 0 = 只读（回查并写本地）；1~5 = 写入该状态
         self._write_type = int(write_type or 0)
 
     def run(self) -> None:
         if self._write_type:
             try:
-                self._api.set_collection_type(self._bangumi_id, self._write_type)
+                self._api.set_collection_type(self._bangumi_id, self._write_type,
+                                              subject_name=self._subject_name)
             except Exception as e:
-                log.warning("设置收藏状态失败 subject_id=%s（bgm=%s）→ %s: %s",
-                            self._subject_id, self._bangumi_id,
-                            self._write_type, e)
+                log.warning("设置收藏状态失败《%s》subject_id=%s（bgm=%s）→ %s: %s",
+                            self._subject_name or "?", self._subject_id,
+                            self._bangumi_id, self._write_type, e)
                 self.done.emit(self._subject_id, False,
                                "设置失败：%s" % e, 0)
                 return
@@ -473,10 +478,15 @@ class LibraryBridge(QObject):
                 pass
 
             local_cover = ""
+            # 本地条目记着的总集数 —— 缓存缺集数时用它当兜底分母
+            # （见下面 `total` 的说明）。取不到就是 0，等于不改原行为。
+            local_total = 0
             if local_id:
                 try:
                     s = self._db.get_subject(local_id)
-                    local_cover = self._cover_file_url(s.cover_path or "", s.id) if s else ""
+                    if s:
+                        local_cover = self._cover_file_url(s.cover_path or "", s.id)
+                        local_total = int(s.total_eps or 0)
                 except Exception:
                     pass
 
@@ -509,11 +519,25 @@ class LibraryBridge(QObject):
             # **位置要求**：必须在下面 `_next_episode` 之前算出来 ——
             # 它也要用这个值（两处口径必须一致，否则会出现"进度显示 9
             # 但「下一集」还是第 9 集"的自相矛盾）。
+
+            # ---- 分母：缓存缺集数时回落到本地条目的 ----
+            #
+            # Bangumi **收藏接口**的 `subject.eps` 对新番常常还是 0（刚开播、
+            # 尚未公布集数），而本地条目在匹配时拿到的是**另一个接口**的
+            # `total_episodes`，两边不一定同时缺。
+            #
+            # **只在缓存为 0 时回落**：现在能正常显示分母的行**逐字节不变**
+            # （全库当前只有 1 个 subject 的 total_eps=0，影响面为 0）。
+            cache_total = int(it.total_eps or 0)
+            total = cache_total or local_total
+            if cache_total <= 0 and local_total > 0:
+                log.debug("缓存缺总集数（bgm=%s），改用本地条目 %s 的 %s 集",
+                          it.bangumi_id, local_id, local_total)
+
             ep_status = int(it.ep_status or 0)
             if local_id:
                 try:
                     local_max = self._db.max_watched_ep_index(local_id)
-                    total = int(it.total_eps or 0)
                     if total <= 0 or local_max <= total:
                         ep_status = max(ep_status, local_max)
                     elif local_max > ep_status:
@@ -543,7 +567,9 @@ class LibraryBridge(QObject):
                 # **必须用这个变量**，不要再写 `int(it.ep_status or 0)` ——
                 # 否则页面上的进度条与标题又会回到旧值。
                 "epStatus": ep_status,
-                "totalEps": int(it.total_eps or 0),
+                # **必须用上面算好的 `total`**，不要再写 `int(it.total_eps or 0)`
+                # —— 那会绕开本地兜底，界面又回到"0 / ? 集"。
+                "totalEps": total,
                 # 2 = 看过（当前唯一使用的类型，见 InProgressBridge）
                 "collectType": int(it.collect_type or 2),
                 # 收藏的最后修改时间（见上方说明：不是缓存写入时刻）
@@ -1034,6 +1060,49 @@ class LibraryBridge(QObject):
         ok = QDesktopServices.openUrl(QUrl(url))
         log.info("打开 Bangumi 页面：%s（%s）", url, "成功" if ok else "失败")
         return bool(ok)
+
+    @Slot(int, result=bool)
+    def openSubjectFolder(self, subject_id: int) -> bool:
+        """在文件资源管理器里打开该条目的媒体库目录。
+
+        与 `openSubjectPage` 同一套设计：**传本地主键而非路径** ——
+        路径规则（`folder_path` 怎么来的）只由数据库一处定义，
+        QML 只表达"打开这部动漫的文件夹"这一个意图。
+
+        返回 False 的情形（QML 据此给提示，不打断界面）：
+          - 条目不存在 / 没有目录（如 RSS 刚建、还没落盘的条目）
+          - 目录在磁盘上已不存在（被用户移动 / 删除 / 盘符变了）
+        """
+        try:
+            s = self._db.get_subject(subject_id)
+        except Exception as e:
+            log.exception("读取条目 %s 失败: %s", subject_id, e)
+            return False
+        folder = (s.folder_path or "").strip() if s else ""
+        if not folder:
+            log.info("条目 %s 没有媒体库目录，无法打开", subject_id)
+            return False
+        p = Path(folder)
+        if not p.exists():
+            log.warning("条目 %s 的目录已不存在：%s", subject_id, folder)
+            return False
+        ok = QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+        log.info("打开媒体库目录：%s（%s）", folder, "成功" if ok else "失败")
+        return bool(ok)
+
+    @Slot(str)
+    def copyText(self, text: str) -> None:
+        """把任意文本放进系统剪贴板（详情页"右键复制"用）。
+
+        **为什么必须由后端做**：QML 的 `Text` 只能**划选**，没有任何
+        复制到剪贴板的 API（`copy()` 是 `TextInput` / `TextArea` 的，
+        且要求持有键盘焦点）。展示文本不能为了复制而整体换成输入框
+        （会带出光标、焦点描边、回车行为等副作用），所以复制统一经
+        QClipboard 走这里。
+        """
+        from PySide6.QtGui import QGuiApplication
+
+        QGuiApplication.clipboard().setText(text or "")
 
     @Slot(int, result="QVariantList")
     def episodes(self, subject_id: int) -> list[dict]:
@@ -1666,14 +1735,20 @@ class LibraryBridge(QObject):
             # 但仍然要发通知把界面解锁（见 docstring）。
             self.collectTypeChanged.emit(int(subject_id))
             return
+        # 名字统一在这里取（**只给日志用**）。
+        # 中文名优先，退回原名；都没有就留空（日志自动退回只报 ID）。
+        # 两条分支（远端 / 仅本地）共用它，保证日志口径一致。
+        name = s.name_cn or s.name or ""
         if not s.bangumi_id or not self._can_write_remote():
             self._set_collect_type_local(
                 int(subject_id), int(collect_type),
                 "该条目未关联 Bangumi" if not s.bangumi_id
-                else "未配置 Bangumi Token")
+                else "未配置 Bangumi Token",
+                subject_name=name)
             return
-        self._start_collect_worker(int(subject_id), int(s.bangumi_id),
-                                   int(collect_type))
+        self._start_collect_worker(
+            int(subject_id), int(s.bangumi_id), int(collect_type),
+            subject_name=name)
 
     def _can_write_remote(self) -> bool:
         """能不能把收藏状态写到 Bangumi（客户端在、且配了 Token）。
@@ -1686,21 +1761,25 @@ class LibraryBridge(QObject):
             getattr(self._api, "has_token", True))
 
     def _set_collect_type_local(self, subject_id: int, collect_type: int,
-                                why: str) -> None:
+                                why: str, subject_name: str = "") -> None:
         """只写本地快照（见 setCollectType 的模式 ②）。
 
         提示语**只说结果**："已标记为「在看」· 仅本地"。
         技术原因（没配 Token / 条目没匹配）只进日志。
+
+        `subject_name` 与远端那条日志口径一致：都要看得出"哪部动漫"。
         """
         try:
             self._db.set_subject_collect_type(subject_id, collect_type)
         except Exception as e:
-            log.exception("写入收藏状态失败 subject_id=%s: %s", subject_id, e)
+            log.exception("写入收藏状态失败《%s》subject_id=%s: %s",
+                          subject_name or "?", subject_id, e)
             self.statusMessage.emit("保存失败（详见日志）")
             self.collectTypeChanged.emit(int(subject_id))
             return
-        log.info("收藏状态仅写本地：subject_id=%s → %s（%s）",
-                 subject_id, collect_type, why)
+        log.info("收藏状态仅写本地：《%s》（subject_id=%s）→ %s（%s · %s）",
+                 subject_name or "?", subject_id, collect_type,
+                 COLLECT_TYPE_NAMES.get(collect_type, "?"), why)
         self._dirty = True
         # 「在看」页要立刻反映（标成在看就出现、从在看改走就消失）
         self._inprogress_dirty = True
@@ -1710,9 +1789,10 @@ class LibraryBridge(QObject):
             "已标记为「%s」· 仅本地" % COLLECT_TYPE_NAMES.get(collect_type, ""))
 
     def _start_collect_worker(self, subject_id: int, bangumi_id: int,
-                              write_type: int) -> None:
+                              write_type: int,
+                              subject_name: str = "") -> None:
         w = _CollectTypeWorker(self._db, self._api, subject_id, bangumi_id,
-                               write_type)
+                               write_type, subject_name=subject_name)
         self._collect_workers.append(w)
         w.done.connect(self._on_collect_type_done)
         w.finished.connect(lambda: self._drop_collect_worker(w))

@@ -410,8 +410,13 @@ Item {
     }
 
     function epText(item) {
+        // 分母未知时**不再**退回"已看 N 集"那种自成一套的文案 ——
+        // 它和邻居的"N / M 集"长得不一样，看起来像 bug，实际只是
+        // 数据缺失（Bangumi 对新番还没公布集数，见 LibraryBridge
+        // `_load_inprogress` 里 total 的兜底说明）。用 `?` 明说
+        // "分母不知道"，格式与邻居保持一致，一眼能认出是缺数据。
         if (!item.totalEps || item.totalEps <= 0)
-            return "已看 " + item.epStatus + " 集"
+            return item.epStatus + " / ? 集"
         return item.epStatus + " / " + item.totalEps + " 集"
     }
 

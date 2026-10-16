@@ -489,7 +489,7 @@ class BangumiClient:
             # **连接重试从 3 次降到 1 次**：
             # 原策略 `connect=3` = 连接不通时重试 3 次（共 4 次尝试），
             # 单次 6s 超时下最坏也要约 24 秒才报错 —— 而"连不上"这种失败
-            # 重试几乎不会改变结论（实测日志里三次全是同一个 ConnectTimeout）。
+            # 重试几乎不会改变结论。
             # read=3 保留：读超时可能是服务端偶发慢，重试有意义。
             # 这样最坏等待 ≈ 6s×2（连接）+ 少量读重试。
             retry = Retry(
@@ -833,7 +833,8 @@ class BangumiClient:
             return None
         return data if isinstance(data, dict) else None
 
-    def set_collection_type(self, subject_id: int, collect_type: int) -> None:
+    def set_collection_type(self, subject_id: int, collect_type: int,
+                            subject_name: str = "") -> None:
         """设置该条目在 Bangumi 的收藏状态（想看/看过/在看/搁置/抛弃）。
 
         端点与方法以官方 spec 为准：
@@ -854,14 +855,22 @@ class BangumiClient:
         **这里的 `-` 是对的，别顺手"统一"成 username**：同一个
         `/v0/users/{x}/collections/{subject_id}` 路径，GET 只认真实
         username、**POST 只认 `-`**（换成 username 会 404）。
+
+        参数 `subject_name`（可选）：条目显示名，**仅用于日志**。本方法只拿得到 `bgm_id`，
+        光看 `bgm=621835 → 5` 根本不知道改的是哪部，排查时还得回查库 ——
+        所以由调用方（它一定有名字）传进来。留空时日志退回只报 ID。
         """
         if collect_type not in COLLECT_TYPE_NAMES:
             raise ValueError(f"非法的收藏状态：{collect_type}")
         body = {"type": int(collect_type)}
         self._post(f"/v0/users/-/collections/{int(subject_id)}", json=body)
-        log.info("已设置收藏状态：bgm=%s → %s（%s）",
-                 subject_id, collect_type,
-                 COLLECT_TYPE_NAMES.get(collect_type, "?"))
+        name = COLLECT_TYPE_NAMES.get(collect_type, "?")
+        if subject_name:
+            log.info("已设置收藏状态：《%s》（bgm=%s）→ %s（%s）",
+                     subject_name, subject_id, collect_type, name)
+        else:
+            log.info("已设置收藏状态：bgm=%s → %s（%s）",
+                     subject_id, collect_type, name)
 
     # ---------- F18：用户在看列表 ----------
     def resolve_username(self) -> str:

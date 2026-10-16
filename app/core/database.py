@@ -1298,6 +1298,38 @@ class Database:
             row = cur.fetchone()
             return Subject(**dict(row)) if row else None
 
+    def count_subjects_by_folder(self, folder_path: str) -> int:
+        """该目录被几个条目指着。
+
+        给"按目录认条目"判**唯一命中**用（见 `find_subject_by_folder`）：
+        `subjects.folder_path` 上没有唯一约束，理论上可以有两个条目指着
+        同一个目录；那种情况下宁可不认 —— 认错会把集写进别人的条目。
+        """
+        with self._cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM subjects WHERE folder_path=?",
+                        (folder_path,))
+            return int(cur.fetchone()["n"])
+
+    def list_episodes_by_index(self, ep_index: float) -> list[tuple[int, str]]:
+        """返回**集号相同**的本地集：`[(subject_id, file_path), …]`。
+
+        给"下载记录反查该归哪个条目"用（见 `RssBridge._match_subject_by_folder`）：
+        某条记录说它下的是第 12 集，而本地某个条目下**已经有**第 12 集的
+        文件 —— 那就是硬证据，说明这条记录属于那个条目。
+
+        **只按集号粗筛，标题相似度交给调用方**：那套字符重合度算法在
+        `app/bridges/rss.py`（`_title_similar`），本层不重复实现一份，
+        免得两边口径漂移。这里把 `file_path` 原样给出，调用方自己取基名。
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT subject_id, file_path FROM episodes"
+                " WHERE ep_index = ? AND file_path IS NOT NULL AND file_path <> ''",
+                (float(ep_index),),
+            )
+            return [(int(r["subject_id"]), str(r["file_path"]))
+                    for r in cur.fetchall()]
+
     def find_manual_subject_by_folder(self, folder_path: str) -> Optional[Subject]:
         """查该目录下**用户手动指定过 Bangumi 条目**的记录（重扫时保护，不覆盖）。
 
@@ -2176,7 +2208,34 @@ class Database:
                     torrent_title=excluded.torrent_title,
                     magnet=excluded.magnet,
                     status=excluded.status,
+                    -- subject_id 也要跟着刷新，否则记录一建好就**冻结在
+                    -- 当时的绑定上**：用户改绑/删条目重建之后，这一行
+                    -- 永远指向旧 id（实况：订阅 #28 已绑 1044，12 条记录
+                    -- 还写着不存在的 1043，于是每轮"下载完自动扫描"都
+                    -- 解析不到条目、静默失败，磁盘上已有的 4 集永远进不了库）。
+                    --
+                    -- 用 COALESCE 而不是直接覆盖：`judge` 的
+                    -- `local_subject_id or _match_local_subject(title)` 在
+                    -- "未绑定且标题匹配落空"的那一轮会给出空值，直接覆盖
+                    -- 会把一个好绑定**擦掉** —— 那是比"陈旧"更糟的新漂移。
+                    subject_id=COALESCE(excluded.subject_id, download_history.subject_id),
                     last_error='',
+                    -- **重新下发 = 新一轮，上一轮的"已扫过"作废**。
+                    --
+                    -- `scanned_at` 的语义是"这一轮的下载已经被扫进库了"。
+                    -- 记录被重新入库说明它**又要下一遍**（文件被删了、
+                    -- 条目重建了、上次下到一半失败），上一轮的结论对
+                    -- 这一轮不成立 —— 不清的话，这条记录会**永远**停在
+                    -- `scanned_at` 上，下完也不会再扫。
+                    --
+                    -- 实况：记录 #341（第 2 集）10-12 扫过一次，之后文件没了、
+                    -- 被重新判成"缺集"下发（status 回到 pushed），但
+                    -- `scanned_at` 还挂着 10-12 那个时间戳 —— 于是第 2 集
+                    -- 下到磁盘上了却永远入不了库，而其余 7 集都正常。
+                    --
+                    -- 与 `last_error` 同一个道理（见上面那段说明），
+                    -- 早先只清了 `last_error`、漏了 `scanned_at`。
+                    scanned_at=NULL,
                     updated_at=excluded.updated_at
                 """,
                 (source_id, subject_id, float(ep_index), torrent_title,
@@ -2231,6 +2290,37 @@ class Database:
                 "UPDATE download_history SET scanned_at=?, updated_at=? WHERE id=?",
                 (_now(), _now(), int(record_id)),
             )
+
+    def set_download_records_subject(self, record_ids: list[int],
+                                     subject_id: Optional[int]) -> int:
+        """把若干下载记录的 `subject_id` 修正为**当前解析出来的**本地条目。
+
+        **为什么需要**：`download_history.subject_id` 是**写入那一刻的快照**，
+        而订阅的绑定之后可能变过（改绑、条目被删后重建）。快照一旦指向
+        不存在的条目，"下载完自动扫描"就永远解析不出该扫谁 —— 每轮白试，
+        而且不留日志（见 RssBridge._maybe_scan_completed）。
+
+        **为什么不复用 `add_download_record`**：那是"重新判新"的入口，
+        会顺带重置 status / last_error（见那里的说明）；这里只**修正指向**。
+
+        **绝不能碰 status / scanned_at**：调用方可能在"记录还在下载中"
+        的时候修正它（条目指向错了与此无关）。一次图省事的覆盖会把
+        `pushed` 误写成别的状态，让"下完自动扫描"的闸门判断全乱。
+
+        `subject_id` 为假值写 NULL（与 `delete_subject` 里"置 NULL"的
+        哨兵一致）。返回受影响行数，便于调用方记日志。
+        """
+        ids = [int(i) for i in record_ids if i]
+        if not ids:
+            return 0
+        marks = ",".join("?" for _ in ids)
+        with self._cursor() as cur:
+            cur.execute(
+                f"UPDATE download_history SET subject_id=?, updated_at=?"
+                f" WHERE id IN ({marks})",
+                [int(subject_id) if subject_id else None, _now(), *ids],
+            )
+            return int(cur.rowcount or 0)
 
     def list_downloads(self, source_id: Optional[int] = None) -> list[DownloadRecord]:
         with self._cursor() as cur:

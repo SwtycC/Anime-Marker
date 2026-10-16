@@ -185,6 +185,22 @@ ApplicationWindow {
                 onStatusMessage: function (text) {
                     statusBar.setMessage(text, 5000)
                 }
+                // 订阅卡片上点「→ 动漫名」→ 进该条目的详情页。
+                //
+                // **完全复用 inProgressPage / timelinePage 那套跳转**：
+                // 记来源页 → load → 切 browseStack → 切外层栈。
+                // 两处都要写（`browseStack.currentIndex` 只管内层
+                // "海报墙 / 详情页"那一栈，外层 `currentPage` 决定显示
+                // 哪一大页；只改一个会停在订阅页不动 —— 见上面
+                // onSubjectClicked 的说明）。
+                onSubjectClicked: function (subjectId) {
+                    if (subjectId <= 0)
+                        return
+                    detailOriginPage = window.currentPage    // 必须在切页**之前**记
+                    detailPage.load(subjectId)
+                    browseStack.currentIndex = 1
+                    window.currentPage = 0
+                }
             }
 
             SettingsPage     { id: settingsPage; objectName: "settingsPage" }
