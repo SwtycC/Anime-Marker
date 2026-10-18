@@ -78,6 +78,11 @@ Item {
                                     : kind === "help"     ? "help"
                                     : kind === "info"     ? "info"
                                     : kind === "feedback" ? "feedback"
+                                    // refresh：**循环箭头**，语义是"再来一遍"
+                                    // （重新扫描 / 刷新排名）。
+                                    // 与 `update` 区分开 —— 那个是"向下箭头 +
+                                    // 底线"，表达的是"把新版本拿下来"。
+                                    : kind === "refresh"  ? "refresh"
                                     : ""
     readonly property string svgUrl: svgName !== "" && iconsBase !== ""
                                      ? iconsBase + svgName + ".svg" : ""

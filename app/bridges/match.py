@@ -20,7 +20,14 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from app.core.bangumi_api import BangumiClient, BangumiError, extract_aliases
+from app.core.bangumi_api import (
+    BangumiClient,
+    BangumiError,
+    extract_air_date,
+    extract_aliases,
+    extract_rank,
+    extract_score,
+)
 from app.core.database import Database
 from app.core.matcher import SCORE_IRRELEVANT, SubjectMatcher
 from app.utils import bgm_log
@@ -139,8 +146,6 @@ class MatchBridge(QObject):
     @Slot(int, result=str)
     def defaultKeyword(self, subject_id: int) -> str:
         """默认关键词：本地条目名，`/` 换成空格。
-
-        `Fate/strange Fake` 直接搜会被当路径，实测换成空格命中率更高。
         """
         subj = self._db.get_subject(subject_id)
         if subj is None:
@@ -230,6 +235,11 @@ class MatchBridge(QObject):
                 # 动画制作公司（海报墙"制作公司"筛选栏的数据源）：
                 # 先 infobox，缺失时补一个 /persons 请求，同 scanner._process
                 studio=self._api.studio_for(subj, bangumi_id),
+                # 评分 / 首播日期（v16，海报墙排序用）：get_subject 响应里
+                # 本来就有 `rating.score` / `date`，零额外请求
+                score=extract_score(subj),
+                air_date=extract_air_date(subj),
+                rank=extract_rank(subj),
             )
         except Exception as e:
             log.exception("写入手动匹配失败 subject_id=%s", self._subject_id)

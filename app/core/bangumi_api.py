@@ -197,6 +197,89 @@ def extract_aliases(subject: dict) -> list[str]:
     return out
 
 
+def extract_score(subject: dict) -> Optional[float]:
+    """从条目响应里取 Bangumi 评分（0~10）；取不到返回 None。
+
+    结构（搜索响应与 `/v0/subjects/{id}` 一致）：
+        {"rating": {"score": 8.4, "total": 1234, "count": {...}}}
+
+    返回 None 的两种情况，**都按"缺值"处理**（排序时排最后）：
+      - 没有 `rating` 字段（新番评分人数不足时确实可能没有）；
+      - `score` 为 0 / 空 —— Bangumi 用 0 表示"暂无评分"，不是"0 分"，
+        当成真实评分会让这些条目排到最后一名，看起来像真打了 0 分。
+    """
+    rating = subject.get("rating")
+    if not isinstance(rating, dict):
+        return None
+    raw = rating.get("score")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def extract_rank(subject: dict) -> Optional[int]:
+    """从条目响应里取 Bangumi 排名（`rating.rank`）；取不到返回 None。
+
+    结构：
+        {"rating": {"score": 8.4, "rank": 128, "total": 1234}}
+
+    与 `score` 的区别（**为什么要单独存排名**）：
+      score 只有一位小数，同分条目极多（8.4 分的可能有几十部），
+      按分数排时它们的先后**完全由列表原顺序决定**，看起来"乱"。
+      而 `rank` 是 Bangumi 站内的唯一名次（1、2、3… 无并列），
+      用它排出来的顺序就是网页上"排行榜"的顺序 —— 与用户预期一致。
+
+    **`rank` 为 0 = 未排名**（收藏人数太少时 Bangumi 不给名次），
+    这种情况返回 None，排序时按"缺值排最后"处理。
+    """
+    rating = subject.get("rating")
+    if not isinstance(rating, dict):
+        return None
+    raw = rating.get("rank")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def extract_air_date(subject: dict) -> str:
+    """从条目响应里取首播日期，规范成 `YYYY-MM-DD`；取不到返回空串。
+
+    结构：顶层 `"date": "2026-01-09"`（Bangumi 偶尔给不完整值，
+    如 `"2026-01"` / `"2026"` —— 那种情况补零成 `2026-01-01` /
+    `2026-01-01`，保证字符串排序仍与时间顺序一致）。
+
+    **为什么规范成定长字符串**：排序直接按字符串比较即可，不必解析成日期
+    对象；`YYYY-MM-DD` 的字典序 == 时间序（这是选这个格式的唯一理由）。
+    """
+    raw = subject.get("date")
+    if not isinstance(raw, str):
+        return ""
+    parts = [p for p in raw.strip().split("-") if p]
+    if not parts:
+        return ""
+    # 只取数字段，防止 "2026-01-09 " 之类的脏数据
+    nums: list[str] = []
+    for p in parts[:3]:
+        digits = "".join(ch for ch in p if ch.isdigit())
+        if not digits:
+            break
+        nums.append(digits)
+    if not nums:
+        return ""
+    year = nums[0]
+    month = nums[1] if len(nums) > 1 else "01"
+    day = nums[2] if len(nums) > 2 else "01"
+    return f"{year}-{int(month):02d}-{int(day):02d}"
+
+
 # infobox 里"动画制作"那一行的 key（Bangumi 的简繁/日文写法都收进来）。
 #
 # **故意不收「製作」/「制作」**：那一行是**制作委员会**，不是动画公司 ——

@@ -343,6 +343,11 @@ class QmlApp:
         # 配置里可能是用户很久以前设过的旧值 —— 继续读会让"界面上
         # 已经没有了、行为却还跟着旧值走"，所以直接取常量。
         self.library_bridge.set_display_mode(SEASON_DISPLAY)
+        # 排名自动刷新间隔：用户可能在设置页改过（0 = 关闭自动刷新）。
+        # **只下发参数，不在这里触发刷新** —— 触发时机统一在启动时
+        # （见 maybeAutoRefreshRank 的说明），保存设置不该顺手打一轮网络。
+        self.library_bridge.setRankRefreshDays(
+            self.config.getint("library", "rank_refresh_days", 7))
         # 「集级记录条数」可能被改小 —— 立即裁剪多余的旧记录，
         # 否则界面仍会显示上一次拉取的更多部内容（见 applyEpisodeCount）
         self.inprogress_bridge.applyEpisodeCount()
@@ -501,6 +506,9 @@ class QmlApp:
         self.scanner_bridge.set_api(self.api)
         # 海报墙展示模式：固定方案（同上）
         self.library_bridge.set_display_mode(SEASON_DISPLAY)
+        # 排名自动刷新间隔（0 = 关闭）。启动时先下发，再排一次"是否该刷"。
+        self.library_bridge.setRankRefreshDays(
+            self.config.getint("library", "rank_refresh_days", 7))
         # 扫描完成后：刷新海报墙 + 顺带同步「在看」与「动态」
         self.scanner_bridge.set_finished_hook(self._on_scan_finished)
         ctx.setContextProperty("library", self.library_bridge)
@@ -553,6 +561,13 @@ class QmlApp:
         # **今天已经自动查过就什么都不挂**（记账在 config 里，见
         # update_check.auto_check_due）；手动「检查更新」不受此限。
         self.app_menu_bridge.startInitialCheck()
+
+        # ---- 排名 / 评分自动刷新----
+        # 只挂一个"60 秒后触发"的计时器，**真正是否刷新由桥接层按
+        # 距上次刷新的天数判断**（见 maybeAutoRefreshRank）。
+        # 放在这里（界面起来之后）而不是上面：它要读库、要发信号，
+        # 而启动瞬间的请求已经够多了。
+        self.library_bridge.maybeAutoRefreshRank()
 
         return app.exec()
 

@@ -317,19 +317,15 @@ class _FetchWorker(NamedThread):
         `updated_at` 是**该收藏的最后修改时间**（ISO 串，逐条不同），
         必须原样带到 `collection_updated_at` 列 —— 它既决定"最近看的是
         哪几部"的排序，也是**增量同步的水位依据**（见 sync_key）。
-        早期版本把它丢掉了，排序只能退回"本次拉取时刻"（整批相同），
-        「最近 N 部」实际变成「按名字排序的前 N 部」。
         """
         subject = raw.get("subject") or {}
         images = subject.get("images") or {}
         # 封面优先 large，其次 common（与旧版一致）
         cover = images.get("large") or images.get("common") or images.get("medium") or ""
 
-        # 总集数兜底链：subject.eps → total_episodes → 已看集数。
+        # 总集数：subject.eps → total_episodes，**取不到就是 0（未知）**。
         eps = subject.get("eps") or subject.get("total_episodes") or 0
         ep_status = raw.get("ep_status") or 0
-        if not eps and ep_status:
-            eps = ep_status
 
         raw_type = raw.get("type")
         if raw_type is None:

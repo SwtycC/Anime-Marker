@@ -56,6 +56,26 @@ Item {
     /// 筛选面板是否展开（供外部"返回"入口判断）
     readonly property bool filterOpen: filterPill.opened
 
+    // ---- 排序（面板见 SortPill.qml）----
+    /// 当前排序方式（"name" / "score" / "date"）。
+    /// **状态由后端持有**：排序要用 score / air_date（DB 列）与拼音键，
+    /// 都在 `LibraryBridge` 里现算（见 `_apply_sort`），QML 只显示与转发。
+    readonly property string sortMode: typeof library !== "undefined" && library
+                                       ? library.sortMode : "name"
+    /// 排序选项（后端给，避免枚举值与中文文案两处各写一份）
+    readonly property var sortOptions: typeof library !== "undefined" && library
+                                       ? library.sortOptions : []
+    /// 排名刷新状态（排序面板底部那一行）
+    readonly property bool rankRefreshing:
+        typeof library !== "undefined" && library ? library.rankRefreshing : false
+    readonly property string rankProgressText:
+        typeof library !== "undefined" && library ? library.rankProgressText : ""
+    readonly property string rankLastRefreshedText:
+        typeof library !== "undefined" && library
+        ? library.rankLastRefreshedText : ""
+    /// 排序面板是否展开（与筛选面板同一套"点空白处收起"处理）
+    readonly property bool sortOpen: sortPill.opened
+
     /// 过滤是否生效：关键词 / 标签 / 制作公司 / 状态**任一维度有筛选条件**即为真
     /// （真正匹配时这些维度之间是"且"，见 matches()）
     readonly property bool filtering: root._q.length > 0 || root.hasFacetFilter
@@ -66,11 +86,16 @@ Item {
     /// 供外部"返回"入口判断 —— 鼠标后侧键在海报墙时靠它决定是退出搜索/筛选
     /// 还是放行。
     readonly property bool searchActive: root.filtering || searchPill.focused
-                                         || filterPill.opened
+                                         || filterPill.opened || sortPill.opened
 
-    /// 收起筛选面板（外部"返回"入口用，见 Main.qml）
+    /// 收起筛选面板（外部"返回"入口用，见 Main.qml）。
+    ///
+    /// **排序面板也一并收起**：它们都是"顶部条展开出来的浮层"，
+    /// 后侧键/点空白处的语义是"把浮层都关掉"，只关一个会显得按了没反应
+    /// （尤其两个面板互斥后，用户分不清当前开着哪个）。
     function closeFilterPanel() {
         filterPill.opened = false
+        sortPill.opened = false
     }
 
     /// 面板里的某项被点中：kind 决定写进哪份状态（详见 TagFilterPill.rows）
@@ -151,6 +176,41 @@ Item {
                 onPicked: function (kind, title, value) {
                     root.applyFilter(kind, title, value)
                 }
+                // 两个面板不该同时展开：筛选一展开，排序自动收起
+                // （反过来由 SortPill.onPicked 里调 closeFilterPanel 处理）
+                onOpenedChanged: if (opened) sortPill.opened = false
+            }
+
+            // 排序：与筛选胶囊同一套视觉（收起 = 胶囊、展开 = 白底面板）。
+            //
+            // **放在筛选右边而不是塞进筛选面板**：排序是高频、常切换的
+            // 操作，而且它的当前值需要一直可见（收起态就写着「名称」），
+            // 藏进面板里就失去了这个提示。详见 SortPill.qml 顶部说明。
+            SortPill {
+                id: sortPill
+                objectName: "sortPill"        // 诊断/探针用
+
+                current: root.sortMode
+                options: root.sortOptions
+                refreshing: root.rankRefreshing
+                progressText: root.rankProgressText
+                lastRefreshedText: root.rankLastRefreshedText
+                // 点「刷新排名」→ 后端异步跑，结果经状态栏 + 列表刷新体现。
+                // **面板不关闭**：用户可能想看着进度（面板底部就是进度文案）。
+                onRefreshRequested: {
+                    if (typeof library === "undefined" || !library)
+                        return
+                    library.refreshRank()
+                }
+                onPicked: function (value) {
+                    if (typeof library === "undefined" || !library)
+                        return
+                    // **不能调 closeFilterPanel()** —— 它会把本面板也收起，
+                    // 而 SortPill 在 onPicked 里已经自己 `opened = false` 了。
+                    // 这里只需要确保另一个面板是关的。
+                    filterPill.opened = false
+                    library.setSortMode(value)
+                }
             }
 
             SearchPill {
@@ -207,6 +267,7 @@ Item {
             onClicked: {
                 searchPill.collapse()
                 filterPill.opened = false
+                sortPill.opened = false
             }
         }
 

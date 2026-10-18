@@ -17,18 +17,19 @@ from __future__ import annotations
 import logging
 import re
 import shutil
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
-from PySide6.QtCore import QObject, Property, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, Property, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QImage
 from PySide6.QtWidgets import QFileDialog
 
 from app.core.bangumi_api import (
     COLLECT_TYPE_DOING, COLLECT_TYPE_NAMES, BangumiClient, BangumiNotFound,
-    is_studio_name,
+    extract_rank, extract_score, is_studio_name,
 )
 from app.core.database import Database, Episode, Subject
 # 同系列排序用：把「第X季 / S1 / II」统一解析成季数（见 series_siblings）
@@ -36,6 +37,7 @@ from app.core.matcher import extract_season
 from app.utils.cover_cache import cover_path_for, known_cover_files
 from app.utils.cover_cache import download as download_cover
 from app.utils.paths import covers_dir
+from app.utils.sort_key import display_name, pinyin_key
 from app.utils.qt_thread import NamedThread, retire_worker
 
 log = logging.getLogger(__name__)
@@ -43,6 +45,24 @@ log = logging.getLogger(__name__)
 # 多季展示模式
 DISPLAY_FLAT = "flat"
 DISPLAY_GROUPED = "grouped"
+
+# 海报墙排序方式。
+#
+# 名称（中文拼音）、评分、首播日期。
+# 名称是默认值 —— 它不依赖任何网络数据，旧库升级后立刻可用；
+# 另外两种在存量条目上可能是空的（要重扫才补齐），所以不适合当默认。
+SORT_BY_NAME = "name"
+#: 值仍叫 `score`（已存在于配置/日志里，改值会让旧记录对不上），
+#: 但**语义已改为"按 Bangumi 排名"** —— 见 `_apply_sort`。
+SORT_BY_SCORE = "score"
+SORT_BY_DATE = "date"
+SORT_MODES = (SORT_BY_NAME, SORT_BY_SCORE, SORT_BY_DATE)
+#: 排序胶囊用的文案（QML 侧按同一个 key 取，避免两处各写一份）
+SORT_MODE_LABELS = {
+    SORT_BY_NAME: "名称",
+    SORT_BY_SCORE: "排名",
+    SORT_BY_DATE: "日期",
+}
 
 # 收藏缓存超过这个年龄就算"数据较旧"。
 #
@@ -101,6 +121,70 @@ def as_file_url(path: str) -> str:
         return "file:///" + quote(p.as_posix(), safe="/:")
     except OSError:
         return ""
+
+
+class _RankRefreshWorker(NamedThread):
+    """后台串行刷新全部条目的 Bangumi 排名与评分。
+
+    **为什么要单独一个 worker**（而不是复用扫描）：`rank` / `score` 会随
+    收藏人数天天变化，但**文件名、集数一个都没变** —— 走扫描要重新遍历
+    磁盘、重解析标题、重写集数，代价大得多。这里只发 `GET /v0/subjects/{id}`
+    并更新两列。
+
+    **为什么串行 + 限速**：Bangumi 的 API 对高频请求不友好，官方建议
+    每秒不超过 1 次。库里上百部时一轮要两三分钟 —— 放在后台线程里做，
+    不阻塞界面（与 `_TagFetchWorker` 同一套"用完即弃"的用法）。
+
+    **失败的条目不写库、也不记水位**：下次刷新自然会重试；单条失败
+    （网络抖动 / 条目被删）不该让整轮中断。
+    """
+
+    #: (成功条数, 总条数, 失败条数, 错误说明)
+    progress = Signal(int, int)          # (已处理, 总数) —— 状态栏用
+    done = Signal(int, int, int, str)    # (成功, 总数, 失败, error)
+
+    #: 两次请求之间的间隔（秒）。取 1.0 —— Bangumi 的宽松建议值，
+    # 本地缓存的"标红点"式高频刷新不需要，这里一轮最多 100 次。
+    REQUEST_INTERVAL = 1.0
+
+    def __init__(
+        self,
+        db: Database,
+        api: BangumiClient,
+        pairs: list[tuple[int, int]],
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._db = db
+        self._api = api
+        #: [(本地 subject_id, bangumi_id), ...]
+        self._pairs = pairs
+
+    def run(self) -> None:
+        ok = fail = 0
+        total = len(self._pairs)
+        error = ""
+        # 逐条串行：`requests.Session` 不是线程安全的（同 _UploadWorker 的
+        # 说明），而且限速本来就要求串行。
+        for i, (sid, bid) in enumerate(self._pairs, start=1):
+            try:
+                subj = self._api.get_subject(bid)
+                self._db.update_rank_score(
+                    sid, extract_rank(subj), extract_score(subj))
+                ok += 1
+            except Exception as e:
+                fail += 1
+                # 只记前几条：一个坏网络会让每条都失败，刷满日志没意义
+                if fail <= 3:
+                    log.warning("刷新排名失败 subject_id=%s（bgm=%s）: %s",
+                                sid, bid, e)
+                if not error:
+                    error = str(e)
+            self.progress.emit(i, total)
+            if i < total:
+                time.sleep(self.REQUEST_INTERVAL)
+        log.info("排名刷新完成：成功 %s / %s 条，失败 %s 条", ok, total, fail)
+        self.done.emit(ok, total, fail, error)
 
 
 class _TagFetchWorker(NamedThread):
@@ -309,6 +393,10 @@ class LibraryBridge(QObject):
     tagsBySubjectChanged = Signal()
     #: 标签拉取的进度/结果提示（状态栏展示）
     statusMessage = Signal(str)
+    #: 海报墙排序方式变化（排序胶囊据此更新选中项）
+    sortModeChanged = Signal()
+    #: 排名刷新进度/状态变化（排序面板的「刷新排名」行据此更新）
+    rankStateChanged = Signal()
 
     def __init__(
         self,
@@ -320,6 +408,9 @@ class LibraryBridge(QObject):
         self._db = db
         self._api = api
         self._display_mode = DISPLAY_FLAT
+        # 海报墙排序方式（见 SORT_BY_*）。**不持久化**：它是个"这次看看"
+        # 的临时视图偏好，重启回默认最符合预期（与"在看页"的来源切换一致）。
+        self._sort_mode = SORT_BY_NAME
         # 查询缓存：Property 会被 QML 频繁读取（每次绑定重算都会调 getter），
         # 若每次都跑 SQL + 组装 dict 会很浪费。改为「变更时失效」。
         self._subjects_cache: list[dict] = []
@@ -350,18 +441,207 @@ class LibraryBridge(QObject):
         # 无限请求循环。写在内存而不是库里：它是"这一次运行做没做过"的
         # 事实，与"库里存的值"无关。
         self._collect_queried: set[int] = set()
+        # ---- 排名 / 评分刷新----
+        #: 自动刷新的间隔天数（0 = 关闭自动）。由 QmlApp 从配置注入。
+        self._rank_refresh_days = 7
+        #: 正在跑的刷新 worker（同一时刻只允许一轮）
+        self._rank_worker: Optional[_RankRefreshWorker] = None
+        #: 进度文案（状态栏用）："刷新排名… 23/106"，空闲时为空串
+        self._rank_progress = ""
+        #: 启动后的延迟计时器（避开启动瞬间的 RSS 轮询 / 更新检查那一波）
+        self._rank_startup_timer: Optional[QTimer] = None
 
     def set_api(self, api: BangumiClient) -> None:
         """注入 Bangumi 客户端（QmlApp 在配置重建时调用）。"""
         self._api = api
 
-    # 注：**曾经**在启动时做过一次"清掉缓存里没有的条目"的对齐，已删除。
-    # 它用"最近一次同步的收藏缓存"当权威，而那个缓存可能比本地值更旧。
-    # 缓存只能当"秒显"的加速，不能当**删数据**的依据 —— 现在真值一律
-    # 由详情页回查网络得到（见 requestCollectType），同步时那次清理
-    # 仍然保留（那次缓存是刚拉的全量，判据成立）。
+    # ---------- 排名 / 评分刷新 ----------
+    @Slot(int)
+    def setRankRefreshDays(self, days: int) -> None:
+        """设置自动刷新间隔（天）；0 = 关闭自动刷新。
+
+        由 QmlApp 在启动与**设置页保存后**调用（与 apply_config 同一套路）。
+        改小间隔不会立刻触发 —— 是否该刷新由 `maybeAutoRefreshRank()`
+        按"距上次刷新的时长"判断，那种判断只发生在启动时。
+        """
+        self._rank_refresh_days = max(0, int(days))
+
+    @Slot()
+    def maybeAutoRefreshRank(self) -> None:
+        """启动时调用：距上次刷新超过阈值就**延迟 60 秒**后自动跑一轮。
+
+        **为什么要延迟**：启动瞬间已经有一堆请求在跑（RSS 轮询、更新检查、
+        收藏同步）。再挤一轮上百个 `GET /v0/subjects` 会把启动那几秒
+        拖得很慢，也更容易撞上 Bangumi 的限流。60 秒后用户已经在正常
+        浏览，后台慢慢跑最合适。
+
+        **为什么按"距上次"而不是"每次启动都跑"**：排名变化极小（见
+        `_RankRefreshWorker` 的说明），每天拉一遍纯属浪费。
+        """
+        days = self._rank_refresh_days
+        if days <= 0:
+            log.info("自动刷新排名已关闭（间隔=0）")
+            return
+        try:
+            age = self._db.rank_refresh_age()
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("读取排名刷新时间失败（跳过自动刷新）：%s", e)
+            return
+        threshold = days * 86400
+        if age is not None and age < threshold:
+            log.info("排名 %.1f 天前刚刷新过（阈值 %s 天），跳过", 
+                     age / 86400, days)
+            return
+        log.info("排名已 %s，%s 秒后自动刷新",
+                 "从未刷新" if age is None else f"{age / 86400:.1f} 天未刷新",
+                 60)
+        if self._rank_startup_timer is None:
+            self._rank_startup_timer = QTimer(self)
+            self._rank_startup_timer.setSingleShot(True)
+            self._rank_startup_timer.timeout.connect(self.refreshRank)
+        self._rank_startup_timer.start(60 * 1000)
+
+    @Slot()
+    def refreshRank(self) -> None:
+        """手动 / 自动触发一轮排名+评分刷新（异步）。"""
+        if self._api is None or not getattr(self._api, "has_token", True):
+            # 没有 Token 也能查公开接口，但没配 Token 的用户多半也没用过
+            # Bangumi，这里只在客户端缺失时拒绝
+            if self._api is None:
+                self.statusMessage.emit("未配置 Bangumi，无法刷新排名")
+                return
+        try:
+            if self._rank_worker is not None and self._rank_worker.isRunning():
+                self.statusMessage.emit("排名正在刷新中，请稍候")
+                return
+        except RuntimeError:            # C++ 对象已被 deleteLater 回收
+            pass
+        try:
+            pairs = self._db.subjects_needing_rank()
+        except Exception as e:
+            log.exception("读取待刷新条目失败：%s", e)
+            self.statusMessage.emit(f"刷新排名失败：{e}")
+            return
+        if not pairs:
+            self.statusMessage.emit("没有可刷新的条目（都未匹配 Bangumi）")
+            return
+
+        log.info("开始刷新排名/评分：共 %s 条", len(pairs))
+        w = _RankRefreshWorker(self._db, self._api, pairs)
+        w.progress.connect(self._on_rank_progress)
+        w.done.connect(self._on_rank_done)
+        w.finished.connect(lambda: retire_worker(self, "_rank_worker", w))
+        self._rank_worker = w
+        self._rank_progress = f"刷新排名… 0/{len(pairs)}"
+        self.rankStateChanged.emit()
+        w.start()
+
+    def _on_rank_progress(self, done: int, total: int) -> None:
+        # 每 10% 报一次，别刷屏（状态栏一行字，刷太快看不清）
+        step = max(1, total // 10)
+        if done == total or done % step == 0:
+            self._rank_progress = f"刷新排名… {done}/{total}"
+            self.rankStateChanged.emit()
+
+    def _on_rank_done(self, ok: int, total: int, fail: int,
+                      error: str) -> None:
+        self._rank_progress = ""
+        # **无论成败都记时间**：否则网络长期不通时会每次启动都重试一轮，
+        # 白白拖慢启动。用户想立刻重试可以点「刷新排名」。
+        #
+        # **必须先写库、再发信号**：
+        # `rankLastRefreshedText` 是个 getter，每次被读时才去查库。
+        try:
+            self._db.mark_rank_refreshed()
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("记录排名刷新时间失败：%s", e)
+        # 到这里库已更新，通知才有意义（界面会重读 rankLastRefreshedText）
+        self.rankStateChanged.emit()
+        # 排名变了 → 海报墙排序结果可能变，通知刷新
+        self._dirty = True
+        self.subjectsChanged.emit()
+
+        if fail and not ok:
+            self.statusMessage.emit(f"刷新排名失败：{error or '网络错误'}")
+        elif fail:
+            self.statusMessage.emit(
+                f"排名已更新 {ok} 条（{fail} 条失败，可稍后重试）")
+        else:
+            self.statusMessage.emit(f"排名已更新（共 {total} 条）")
+
+    @Property(bool, notify=rankStateChanged)
+    def rankRefreshing(self) -> bool:
+        """是否正在刷新排名（QML 据此显示进度 / 禁用按钮）。"""
+        try:
+            return (self._rank_worker is not None
+                    and self._rank_worker.isRunning())
+        except RuntimeError:
+            return False
+
+    @Property(str, notify=rankStateChanged)
+    def rankProgressText(self) -> str:
+        """进度文案（"刷新排名… 23/106"），空闲为空串。"""
+        return self._rank_progress
+
+    @Property(str, notify=rankStateChanged)
+    def rankLastRefreshedText(self) -> str:
+        """上次刷新时间的**人话**：「从未刷新」/「3 天前」/「今天」。
+
+        排序面板上显示它，让用户自己判断要不要点「刷新排名」。
+        """
+        try:
+            age = self._db.rank_refresh_age()
+        except Exception:               # pragma: no cover - 防御性
+            return ""
+        if age is None:
+            return "从未刷新"
+        if age < 3600:
+            return "刚刚刷新"
+        if age < 86400:
+            return f"{int(age / 3600)} 小时前"
+        days = int(age / 86400)
+        return "昨天" if days == 1 else f"{days} 天前"
+
 
     # ---------- 配置 ----------
+    @Slot(str)
+    def setSortMode(self, mode: str) -> None:
+        """切换海报墙排序方式（名称 / 评分 / 日期）。
+
+        只是改一个字段 + 让缓存失效 —— 排序在 `_apply_sort()` 里现算，
+        条数级别（几百部）的开销可以忽略，不值得做增量维护。
+        """
+        if mode not in SORT_MODES:
+            log.warning("未知的排序方式：%r（忽略）", mode)
+            return
+        if mode == self._sort_mode:
+            return
+        self._sort_mode = mode
+        log.info("海报墙排序方式：%s", SORT_MODE_LABELS.get(mode, mode))
+        self._dirty = True
+        # **两个信号都要发**：
+        #   - `subjectsChanged` 让海报墙重取排好序的列表；
+        #   - `sortModeChanged`  让 `sortMode` 这个 Property 通知 QML，
+        #     排序胶囊的 `current` / 选中态才会跟着变。
+        # 只发前者时列表确实重排了，但胶囊上仍显示旧值、选项也没打勾 ——
+        # 看起来就像"点了没反应"。
+        self.sortModeChanged.emit()
+        self.subjectsChanged.emit()
+
+    @Property(str, notify=sortModeChanged)
+    def sortMode(self) -> str:
+        """当前排序方式（QML 的排序胶囊据此显示选中项）。"""
+        return self._sort_mode
+
+    @Property("QVariantList", constant=True)
+    def sortOptions(self) -> list[dict]:
+        """排序选项（QML 渲染胶囊菜单用）。
+
+        **从后端给**而不是在 QML 写死：与 `collectOptions` 同一套理由 ——
+        枚举值改了只改一处，界面文案不会漂移。
+        """
+        return [{"value": k, "label": SORT_MODE_LABELS[k]} for k in SORT_MODES]
+
     def set_display_mode(self, mode: str) -> None:
         """由 QmlApp 在启动 / 设置保存后调用。"""
         mode = mode if mode in (DISPLAY_FLAT, DISPLAY_GROUPED) else DISPLAY_FLAT
@@ -979,8 +1259,58 @@ class LibraryBridge(QObject):
             log.exception("读取条目失败: %s", e)
             return []
         if self._display_mode == DISPLAY_GROUPED:
-            return self._build_groups(rows)
-        return [self._subject_to_dict(s) for s in rows]
+            out = self._build_groups(rows)
+        else:
+            out = [self._subject_to_dict(s) for s in rows]
+        return self._apply_sort(out)
+
+    def _apply_sort(self, items: list[dict]) -> list[dict]:
+        """按 `self._sort_mode` 排序（海报墙）。
+
+        **在 `_load_subjects` 之后、返回之前做**，而不是 QML 侧排：
+        排序要用 `score` / `air_date`（DB 列）和拼音键（依赖 pypinyin），
+        这些都不该在展示层重算。
+
+        **缺值一律排最后**：`score` 为 None / `air_date` 为空串的条目不参与
+        "谁分数高"的比较，单独归到末尾一组。
+        """
+        if not items:
+            return items
+        mode = self._sort_mode
+        if mode == SORT_BY_SCORE:
+            # **按 Bangumi 站内排名（`rank`）升序**，不是按分数降序。
+            #
+            # 三级兜底（都按"缺值排最后"的总原则）：
+            #   ① 有 rank → 按 rank 升序（1 最好）
+            #   ② 没有 rank 但有 score → 排在有 rank 的之后，按分数降序
+            #   ③ 两者都没有 → 最后，按名称（拼音）排，至少顺序稳定
+            def _key(d: dict) -> tuple:
+                rank = d.get("rank") or 0
+                score = d.get("score") or 0.0
+                if rank > 0:
+                    return (0, rank, 0.0, "")
+                if score > 0:
+                    return (1, 0, -score, "")
+                return (2, 0, 0.0, pinyin_key(
+                    d.get("sortName") or d.get("title") or ""))
+
+            return sorted(items, key=_key)
+        if mode == SORT_BY_DATE:
+            # 降序：新番在前（"日期"通常就是想看最新的）。缺值排最后。
+            # `air_date` 是定长 `YYYY-MM-DD`，字符串比较 == 时间序，
+            # 所以这里用"取反字符串"的技巧做降序较麻烦，干脆分两趟：
+            # 有值的按日期倒序在前，缺值的原样接在后面。
+            dated = [d for d in items if (d.get("airDate") or "") != ""]
+            undated = [d for d in items if (d.get("airDate") or "") == ""]
+            dated.sort(key=lambda d: d.get("airDate") or "", reverse=True)
+            return dated + undated
+        # 默认：按名称（拼音）
+        return sorted(
+            items,
+            key=lambda d: pinyin_key(d.get("sortName")
+                                     or display_name(d.get("nameCn") or "",
+                                                     d.get("title") or "")),
+        )
 
     @Property("QVariantMap", notify=tagsBySubjectChanged)
     def tagsBySubject(self) -> dict:
@@ -1900,6 +2230,16 @@ class LibraryBridge(QObject):
             "name": s.name or "",
             "nameCn": s.name_cn or "",
             "title": s.name_cn or s.name or "",
+            # ---- 排序用（v16）----
+            # 评分 0~10；None = 还没拉到（旧库 / 未匹配 Bangumi）。
+            # QML 侧只在详情页显示，海报墙排序在后端做（见 _apply_sort）。
+            "score": float(s.score) if s.score else 0.0,
+            "airDate": s.air_date or "",
+            # Bangumi 站内排名（v17）：0 = 未排名。
+            # 「按评分」排序的主依据（同分太常见，得靠名次才能排准）
+            "rank": int(s.rank or 0),
+            # 排序键用的名字（中文名优先）—— 与 ORDER BY name_cn, name 同口径
+            "sortName": display_name(s.name_cn or "", s.name or ""),
             "seriesName": s.series_name or "",
             # Bangumi infobox 的别名（**空格拼接**，见下）。
             #
@@ -2016,10 +2356,28 @@ class LibraryBridge(QObject):
                     name = name.strip()
                     if name and name not in studios:
                         studios.append(name)
+            # ---- 排序字段（v16）----
+            #
+            # 分组卡片必须**重新算**这三样，不能沿用 items[0] 的：
+            #   - `sortName`：`title` 即将被替换成系列名，沿用旧名会
+            #     让"卡片上写的字"和"排序依据"不一致 ✗；
+            #   - `score`：取系列里**最高**的那一季（用户看的是"这系列
+            #     好不好"，不该被某个低分 OVA 拖累）；
+            #   - `airDate`：取**最早**的那一季（系列的首播 = 第一季）。
+            #
+            # 缺值处理与单条一致：全部缺 → 保持 0 / 空串，排序时排最后。
+            scores = [s.score for s in items if s.score]
+            dates = [s.air_date for s in items if s.air_date]
+            # 排名取系列里**最好**的那个（数字最小），与"评分取最高"同一逻辑
+            ranks = [s.rank for s in items if s.rank]
             d.update({
                 "title": series,
                 "name": series,
                 "nameCn": series,
+                "sortName": series,
+                "score": max(scores) if scores else 0.0,
+                "airDate": min(dates) if dates else "",
+                "rank": min(ranks) if ranks else 0,
                 "aliases": " ".join(merged),
                 "coverUrl": self._cover_file_url(cover_subj.cover_path, cover_subj.id)
                             if cover_subj else "",

@@ -22,8 +22,14 @@ from typing import Iterable, Optional
 
 from PySide6.QtCore import Signal
 
-from app.core.bangumi_api import BangumiClient, BangumiError
-from app.core.database import Database
+from app.core.bangumi_api import (
+    BangumiClient,
+    BangumiError,
+    extract_air_date,
+    extract_rank,
+    extract_score,
+)
+from app.core.database import Database, Episode
 from app.core.matcher import (
     SubjectMatcher, extract_part, extract_season, is_extra_dir, is_movie_like,
     is_noise_dir,
@@ -1528,6 +1534,15 @@ class ScanWorker(NamedThread):
             # 它没有这一行时才补一个 /persons 请求。海报墙的"制作公司"
             # 筛选栏靠它，写一次就永久在库里，之后不再请求。
             studio=self.api.studio_for(subj, bangumi_id),
+            # 评分与首播日期（v16）：**同样是搜索响应里白给的**
+            # （`rating.score` / `date`），零额外请求。
+            # 海报墙的「按评分 / 按日期」排序靠它们。
+            # 取不到写 None / 空串 → 排序时按"缺值排最后"处理。
+            score=extract_score(subj),
+            air_date=extract_air_date(subj),
+            # Bangumi 站内排名（v17）：「按评分」排序的主依据 ——
+            # 评分只有一位小数、同分太多，靠排名才能排出与官网一致的顺序
+            rank=extract_rank(subj),
             match_state="auto",
         )
         # 顺路存接口前 10 个 tag（就在本次搜索响应里，零额外请求）。
@@ -1542,7 +1557,33 @@ class ScanWorker(NamedThread):
         self._fill_episodes(subject_id, bangumi_id, cand)
 
     def _write_pending(self, cand: ScanCandidate, reason: str) -> None:
-        """匹配失败：写入占位条目，状态 pending，等待用户手动指定。"""
+        """匹配失败：写入占位条目，状态 pending，等待用户手动指定。
+
+        **已有 Bangumi 匹配的条目不降级**：下载完新集自动扫描时，如果
+        代理没开/网络断了，搜索必然失败。以前这里会把一条已经匹配好的
+        番改成 `pending`、把名字覆盖成目录名，再让 `_fill_episodes` 以
+        `bangumi_id=None` 重写全部集数 —— 集标题全变成文件名、
+        `bangumi_ep_id` 被抹掉。断网是临时状态，不该销毁上一次成功
+        匹配的结果；保留原条目，只把新下载的文件补进集数列表即可
+        （新文件先显示文件名，下次联网重扫自动回填）。
+        """
+        try:
+            existing = self.db.find_subject_by_folder(str(cand.folder_path))
+        except Exception as e:
+            log.warning("查询已有条目失败 %s: %s", cand.folder_path, e)
+            existing = None
+        if existing is not None and existing.bangumi_id:
+            log.info("匹配失败（%s），保留原有 Bangumi 匹配：%s",
+                     reason, cand.folder_path)
+            self.created_subject_ids.append(int(existing.id))
+            # 计入"已匹配"：库里这一条本来就是匹配好的，不该在全量扫描的
+            # 汇总里既不算匹配、也不算待确认（会报成"匹配 0，待确认 0"）。
+            self.item_matched.emit(
+                int(existing.id),
+                existing.name_cn or existing.name or cand.display_name)
+            self._fill_episodes(int(existing.id), int(existing.bangumi_id), cand)
+            return
+
         try:
             subject_id = self.db.upsert_pending_subject(
                 folder_path=str(cand.folder_path),
@@ -1569,11 +1610,17 @@ class ScanWorker(NamedThread):
     ) -> None:
         """写入该条目的集数记录。"""
         bgm_eps: list[dict] = []
+        # 官方集数表是否**成功取到**（与"取到了但是空表"不同）：
+        # 只有失败时才允许沿用库里已有的集标题 / bangumi_ep_id，见下面的
+        # `_title_and_ep_id`。用 `bgm_eps` 是否为空当判据是不行的 ——
+        # 接口正常返回空表时，说明 Bangumi 那边确实没有集数据。
+        eps_fetch_ok = False
         if bangumi_id:
             # 优先用 Bangumi 正名（比本地目录名更准确），未匹配到则退回本地展示名
             bgm_log.bind_subject(bangumi_id, cand.bangumi_name or cand.display_name)
             try:
                 bgm_eps = self.api.get_episodes(bangumi_id)
+                eps_fetch_ok = True
             except BangumiError:
                 pass
         # 官方集数表：键 = 官方序号（sort 优先、ep 兜底），值 = 接口集对象。
@@ -1590,6 +1637,38 @@ class ScanWorker(NamedThread):
             except (TypeError, ValueError):
                 continue
             ep_map.setdefault(key, e)
+
+        # 已有集数记录（按文件路径索引）。
+        #
+        # **为什么要它**：本次扫描没取到官方集数表时（没匹配 / 断网 /
+        # 代理没开），下面原来一律写 `title = 文件名`、`bangumi_ep_id =
+        # None`，而 `upsert_episode` 是 `ON CONFLICT(file_path) DO UPDATE`
+        # ——于是**一次失败的自动重扫**就把上次匹配好的集标题全换成
+        # 文件名、把 bangumi_ep_id 抹掉（补传要依赖它）。断网是临时状态，
+        # 不该销毁上一次成功匹配的结果。
+        prev_by_path: dict[str, Episode] = {}
+        if not eps_fetch_ok:
+            try:
+                prev_by_path = {
+                    e.file_path: e for e in self.db.list_episodes(subject_id)
+                    if e.file_path
+                }
+            except Exception as e:
+                log.warning("读取已有集数失败 subject_id=%s: %s", subject_id, e)
+
+        def _title_and_ep_id(bgm: dict, path: Path) -> tuple[Optional[int], str]:
+            """本集该写的 `(bangumi_ep_id, 标题)`。
+
+            有官方数据 → 一律用官方的（重匹配、官方改名都能刷新）；
+            没有官方数据 → 沿用库里该文件原有的标题与集 ID（若有），
+            最后才退回文件名。
+            """
+            if not (bgm.get("id") or bgm.get("name_cn") or bgm.get("name")):
+                prev = prev_by_path.get(str(path))
+                if prev is not None and prev.title:
+                    return prev.bangumi_ep_id, prev.title
+            return bgm.get("id"), (bgm.get("name_cn")
+                                   or bgm.get("name") or path.stem)
 
         # 四类文件：
         #   main   —— 正片（有明确集数序号）
@@ -1758,16 +1837,17 @@ class ScanWorker(NamedThread):
 
         for idx, v in main_videos:
             bgm = ep_map.get(idx) or {}
+            ep_id, title = _title_and_ep_id(bgm, v)
             self._written_episode_ids.add(self.db.upsert_episode(
                 subject_id=subject_id,
-                bangumi_ep_id=bgm.get("id"),
+                bangumi_ep_id=ep_id,
                 ep_index=idx,
                 # **必须显式清空 ep_label**（踩坑）：`upsert_episode` 的
                 # `DO UPDATE SET` 只覆盖**传入的列**，没传的列保留旧值 ——
                 # 于是"开关从独立编号切到顺延编号后重扫"时，同一文件的
                 # 旧标签（SP01）会一直留着。正片传空串覆盖。
                 ep_label="",
-                title=bgm.get("name_cn") or bgm.get("name") or v.stem,
+                title=title,
                 file_path=str(v),
             ))
 
@@ -1800,20 +1880,22 @@ class ScanWorker(NamedThread):
             m = re.search(r"(\d+)\s*$", label)
             seq = int(m.group(1)) if m else pos
             bgm = extra_title_map.get(float(seq)) or {}
+            ep_id, title = _title_and_ep_id(bgm, v)
             self._written_episode_ids.add(self.db.upsert_episode(
                 subject_id=subject_id,
-                bangumi_ep_id=bgm.get("id"),
+                bangumi_ep_id=ep_id,
                 ep_index=extra_sort_index(label, pos, max_idx),
                 ep_label=label,
-                title=bgm.get("name_cn") or bgm.get("name") or v.stem,
+                title=title,
                 file_path=str(v),
             ))
 
         # 预告/菜单/NCOP 等：排在正片之后，不占用正片编号
-        for title, v in extra_videos:
+        for _stem, v in extra_videos:
+            ep_id, title = _title_and_ep_id({}, v)
             self._written_episode_ids.add(self.db.upsert_episode(
                 subject_id=subject_id,
-                bangumi_ep_id=None,
+                bangumi_ep_id=ep_id,
                 ep_index=next_extra_idx,
                 ep_label="",          # 显式清空旧标签（理由见正片分支）
                 title=title,
@@ -1822,10 +1904,11 @@ class ScanWorker(NamedThread):
             next_extra_idx += 0.5
 
         # 兜底：其余识别不出含义的视频，继续顺延（避免互相覆盖 file_path）
-        for title, v in plain_videos:
+        for _stem, v in plain_videos:
+            ep_id, title = _title_and_ep_id({}, v)
             self._written_episode_ids.add(self.db.upsert_episode(
                 subject_id=subject_id,
-                bangumi_ep_id=None,
+                bangumi_ep_id=ep_id,
                 ep_index=next_extra_idx,
                 ep_label="",          # 显式清空旧标签（理由见正片分支）
                 title=title,

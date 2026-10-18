@@ -48,6 +48,8 @@ ALLOWED_KEYS = {
     "rss.poll_interval", "rss.auto_download", "rss.poll_on_start",
     # 界面
     "ui.theme_mode", "ui.accent_color", "ui.poster_width",
+    # 媒体库（排名自动刷新间隔）
+    "library.rank_refresh_days",
 }
 
 # 读取时的默认值（config.ini 缺项时兜底，与 config.DEFAULTS 保持一致）
@@ -89,6 +91,7 @@ FALLBACKS: dict[str, str] = {
     "ui.theme_mode": "light",
     "ui.accent_color": "#2F6FEB",
     "ui.poster_width": "200",
+    "library.rank_refresh_days": "7",
 }
 
 
@@ -196,7 +199,7 @@ class SettingsBridge(QObject):
         **为什么需要它**：下面还有个同功能的 `value()`，但它是**普通 Python
         方法、没加 @Slot** —— QML 调用不了（会抛 TypeError，在
         `x ? f() : y` 这种三元里异常会被吞掉，表现为"取到的值恒为默认"，
-        极难定位：实测"添加动漫"弹窗里读 Token 恒为空、误判成"没填 Token"）。
+        极难定位："添加动漫"弹窗里读 Token 恒为空、误判成"没填 Token"）。
 
         QML 侧要读配置一律走这个 Slot。
         """
@@ -206,12 +209,6 @@ class SettingsBridge(QObject):
     @Slot(str, result="QVariant")
     def hotkeyAvailable(self, shortcut: str) -> Any:
         """检测快捷键是否未被其他软件占用。
-
-        **为什么要暴露给 QML**（实测踩坑）：`ctrl+alt+p` 被别的软件
-        （实测本机被占用）注册为全局热键后，Windows 会在按键到达窗口前
-        就拦掉 —— 用户录制时按下去毫无反应，而换成 `ctrl+alt+i` 立刻正常。
-        这类问题在 QML 里无从修复，只能**录完当场提示**，否则用户只会
-        看到"按了没反应"并反复重试。
 
         返回三态（QML 侧对应 true / false / null）：
              true  —— 空闲

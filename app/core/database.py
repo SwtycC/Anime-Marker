@@ -20,7 +20,7 @@ from app.utils.paths import database_path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 17
 
 #: 「把收藏缓存里已知的状态写回 `subjects.collect_type`」的那条 SQL。
 #:
@@ -101,7 +101,10 @@ CREATE TABLE IF NOT EXISTS subjects (
     ep_align     TEXT,                       -- 集数对应方式：''=按号（默认）/'order'=按顺序（可能不准）
     collect_type INTEGER,                    -- Bangumi 收藏状态：0/NULL=未知，1想看 2看过 3在看 4搁置 5抛弃
     match_state  TEXT DEFAULT 'auto',        -- auto / manual / pending
-    updated_at   TEXT
+    updated_at   TEXT,
+    score        REAL,                       -- Bangumi 评分 0~10（v16，海报墙排序用）
+    air_date     TEXT,                       -- 首播日期 YYYY-MM-DD（v16，海报墙排序用）
+    rank         INTEGER                     -- Bangumi 站内排名 1,2,3…（v17，越小越好；0/NULL=未排名）
 );
 
 CREATE TABLE IF NOT EXISTS episodes (
@@ -323,6 +326,15 @@ class Subject:
     # 4 搁置 / 5 抛弃。详情页那排状态选择器的当前选中项就取它。
     # 带默认值（同上）：旧调用方按位置构造不受影响。
     collect_type: int = 0
+    # Bangumi 评分 0~10（v16+，海报墙「按评分」排序用）。
+    # None = 还没拉到（旧库 / 未匹配 Bangumi），排序时排最后。
+    score: Optional[float] = None
+    # 首播日期 'YYYY-MM-DD'（v16+，海报墙「按日期」排序用）。
+    # 空串 / None = 未知，排序时排最后。
+    air_date: Optional[str] = None
+    # Bangumi 站内排名（v17+，海报墙「按评分」排序的主依据）。
+    # None / 0 = 未排名（收藏人数太少时 Bangumi 不给名次），排序时排最后。
+    rank: Optional[int] = None
 
 
 @dataclass
@@ -720,6 +732,38 @@ class Database:
             log.info("迁移：inprogress_cache 增加 local_at 列")
             self._conn.execute(
                 "ALTER TABLE inprogress_cache ADD COLUMN local_at TEXT")
+
+        # v16：subjects 新增 score / air_date（海报墙「按评分 / 按日期」排序）。
+        #
+        # **为什么存在库里而不是每次现算**：评分与首播日期都来自 Bangumi，
+        # 排序是纯本地高频操作（每次打开海报墙都要用），不可能为它发网络
+        # 请求。好在扫描时用的搜索响应里**本来就带** `rating.score` 与
+        # `date`（与 infobox 一样是白给的），顺手存下来即可。
+        #
+        # 旧库两列为 NULL → 排序时按"缺值排最后"处理（见 library 的排序），
+        # 用户重扫一次就补齐。
+        subj_cols = {
+            r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(subjects)")
+        }
+        if "score" not in subj_cols:
+            log.info("迁移：subjects 增加 score 列")
+            self._conn.execute("ALTER TABLE subjects ADD COLUMN score REAL")
+        if "air_date" not in subj_cols:
+            log.info("迁移：subjects 增加 air_date 列")
+            self._conn.execute("ALTER TABLE subjects ADD COLUMN air_date TEXT")
+
+        # v17：subjects 新增 rank（Bangumi 站内排名）。
+        #
+        # **为什么在 score 之外还要 rank**：
+        # 评分只有一位小数，同分条目极多 —— 按分数排时同分组内谁先谁后
+        # 完全取决于列表原顺序，看起来就是"乱"。`rank` 是站内唯一名次
+        # （1、2、3… 无并列），用它排出来与 Bangumi 排行榜一致。
+        #
+        # **改动后需要重扫才能补齐**（旧库此列为 NULL）。
+        if "rank" not in subj_cols:
+            log.info("迁移：subjects 增加 rank 列")
+            self._conn.execute("ALTER TABLE subjects ADD COLUMN rank INTEGER")
 
 
 
@@ -1450,6 +1494,9 @@ class Database:
         total_eps: int = 0,
         aliases: str = "",
         studio: str = "",
+        score: Optional[float] = None,
+        air_date: str = "",
+        rank: Optional[int] = None,
     ) -> None:
         """用户手动指定 Bangumi 条目（match_state='manual'，重扫不覆盖）。
 
@@ -1457,6 +1504,10 @@ class Database:
         `BangumiClient.studio_for(subj, bangumi_id)` 的结果；
         不传（旧调用方）时**保留原值不覆盖** —— 手动匹配的候选同样来自
         搜索接口，通常能拿到别名与公司。
+
+        `score` / `air_date`（v16）同样"不传就保留"：
+        `COALESCE(?, 列)` 对 NULL 不生效，所以 score 单独用
+        `CASE WHEN ? IS NULL THEN score ELSE ? END`。
         """
         with self._cursor() as cur:
             cur.execute(
@@ -1465,11 +1516,16 @@ class Database:
                     bangumi_id=?, name=?, name_cn=?, cover_url=?, cover_path=?,
                     total_eps=?, aliases=COALESCE(NULLIF(?, ''), aliases),
                     studio=COALESCE(NULLIF(?, ''), studio),
+                    score=CASE WHEN ? IS NULL THEN score ELSE ? END,
+                    air_date=COALESCE(NULLIF(?, ''), air_date),
+                    rank=CASE WHEN ? IS NULL THEN rank ELSE ? END,
                     match_state='manual', updated_at=?
                 WHERE id=?
                 """,
                 (bangumi_id, name, name_cn, cover_url, cover_path,
-                 total_eps, aliases or "", studio or "", _now(), subject_id),
+                 total_eps, aliases or "", studio or "",
+                 score, score, air_date or "",
+                 rank, rank, _now(), subject_id),
             )
 
     def delete_subject(self, subject_id: int) -> None:
@@ -1826,6 +1882,68 @@ class Database:
             except ValueError:
                 return None
             return (datetime.now(dt.tzinfo) - dt).total_seconds()
+
+    # ---------- 排名 / 评分刷新 ----------
+    #
+    # 用 `meta` 表存"上次刷新排名的时间"，与 `schema_version` 同表 ——
+    # 只有一两个键，不值得为它单独建表。
+    _RANK_REFRESH_KEY = "rank_refreshed_at"
+
+    def rank_refresh_age(self) -> Optional[float]:
+        """距上次刷新排名多少秒；从未刷新过返回 None。
+
+        **返回 None 与"很大"要区分开**：
+          - None = 从没刷新过（升级后第一次启动就是这种）→ 该刷新；
+          - 数值 = 距上次的秒数，调用方与阈值比较。
+        """
+        with self._cursor() as cur:
+            cur.execute("SELECT value FROM meta WHERE key=?",
+                        (self._RANK_REFRESH_KEY,))
+            row = cur.fetchone()
+        if not row or not row["value"]:
+            return None
+        try:
+            dt = datetime.fromisoformat(row["value"])
+        except ValueError:
+            return None
+        return (datetime.now(dt.tzinfo) - dt).total_seconds()
+
+    def mark_rank_refreshed(self) -> None:
+        """记下"刚刚刷新过排名"（无论成功几条都记 —— 见调用方说明）。"""
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                (self._RANK_REFRESH_KEY, _now()),
+            )
+
+    def subjects_needing_rank(self) -> list[tuple[int, int]]:
+        """需要刷新排名/评分的条目：`[(本地 id, bangumi_id), ...]`。
+
+        **只取已匹配 Bangumi 的**：没有 `bangumi_id` 就没地方查。
+        **不按"是否已有值"过滤**：排名的意义就是"能变"，已经有的也要刷新。
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT id, bangumi_id FROM subjects "
+                "WHERE bangumi_id IS NOT NULL AND bangumi_id > 0 "
+                "ORDER BY id"
+            )
+            return [(int(r["id"]), int(r["bangumi_id"]))
+                    for r in cur.fetchall()]
+
+    def update_rank_score(self, subject_id: int, rank: Optional[int],
+                          score: Optional[float]) -> None:
+        """只更新 rank / score 两列（不动 updated_at）。
+
+        **为什么不碰 `updated_at`**：那是"元数据变更时间"，被海报墙的
+        "最近添加"之类的语义依赖；排名天天在变，若每次刷新都刷它，
+        那些依赖它的地方会集体失真。
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE subjects SET rank=?, score=? WHERE id=?",
+                (rank, score, int(subject_id)),
+            )
 
     # ---------- F20：集级观看记录 ----------
     @staticmethod

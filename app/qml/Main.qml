@@ -688,9 +688,13 @@ ApplicationWindow {
                 // 不调 library.reload()，避免重建全部卡片
                 browseStack.currentIndex = 0
                 window.currentPage = detailOriginPage   // 同 onBackRequested
-            } else if (wallPage.filterOpen) {
-                // 筛选面板开着 → 先收面板。**不能顺手把搜索词也清了**：
+            } else if (wallPage.filterOpen || wallPage.sortOpen) {
+                // 筛选 / 排序面板开着 → 先收面板。**不能顺手把搜索词也清了**：
                 // 用户只是开了下面板，关键词还得留着。
+                //
+                // **两个面板都要判**（排序面板是后来加的）：只判 filterOpen
+                // 的话，排序面板开着时后侧键会走到下面的 clearSearch() ——
+                // 面板没关、搜索词却被清了，行为完全对不上。
                 wallPage.closeFilterPanel()
             } else {
                 wallPage.clearSearch()

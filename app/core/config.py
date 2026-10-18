@@ -46,11 +46,22 @@ DEFAULTS: dict[str, dict[str, str]] = {
         #       「动态 → 上传」小窗里决定（差集与幂等由那边保证）。
         # 两种情况下**本地记录都会先落袋** —— 关掉自动上传不会丢记录。
         "auto_upload": "true",
-        # 「自动完结」（v15，实测需求）：
+        # 「自动完结」（v15）：
         #   一部动漫的**每一集**都标为看过后，自动把该动漫也标记为
         #   「看过」（collect_type=2）；填了 Token 时同步到 Bangumi。
         # 开关只控制"要不要自动改状态"，不管集级记录 —— 那是 auto_upload。
         "auto_complete_watched": "true",
+    },
+    "library": {
+        # 海报墙「按排名」排序的数据**多久自动刷新一次**（天）。
+        #
+        # 排名 = Bangumi 站内名次（`rating.rank`），会随收藏人数小幅浮动。
+        # 这类变化对"我要看哪部番"几乎没有影响，7 天足够；库特别大、
+        # 或特别在意榜位的人可以调小。
+        #
+        # **0 = 关闭自动刷新**（仍可在海报墙「排序」面板里手动点）。
+        # 设置页有对应输入框（见 SettingsPage「排名刷新间隔」）。
+        "rank_refresh_days": "7",
     },
     "qbittorrent": {
         "host": "127.0.0.1",
@@ -62,7 +73,6 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "webui_url": "",
         # qBittorrent 主程序路径。
         #
-        # **为什么需要它**（实测诉求："在其退出但需要时打开"）：
         # qBittorrent 的 GUI 与 Web UI 是**同一个进程** —— 用户从托盘
         # 「退出」后 Web UI 一起消失，本程序就再也连不上，新集只能落成
         # 「待确认」。有了路径，就能在下发前**按需把它拉起来**
@@ -113,9 +123,6 @@ DEFAULTS: dict[str, dict[str, str]] = {
     "launcher": {
         "enable_ls": "true",
         # **必须与小黄鸭「设置 → 缩放快捷键」里的值一致**，否则按了也没反应。
-        # 别用 ctrl+alt+l —— 那是 QQ 的「锁定 QQ」全局快捷键，会被 QQ
-        # 抢先注册（小黄鸭也设不上），实测触发过一次 QQ 自我锁定。
-        # 小黄鸭各版本默认不同，以你机器上的设置为准。
         "ls_shortcut": "ctrl+alt+p",
         # PotPlayer 的「全屏/还原」快捷键（默认 alt+enter）。
         "fullscreen_shortcut": "alt+enter",

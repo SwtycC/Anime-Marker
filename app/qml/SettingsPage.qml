@@ -264,6 +264,8 @@ Item {
         // 因此不参与 collect —— 否则这里引用已删除的控件会直接报错。
         v["scanner.accept_score"] = acceptScoreField.value
         v["scanner.accept_gap"] = acceptGapField.value
+        // 排名自动刷新间隔（0 = 关闭；海报墙排序面板里仍可手动刷新）
+        v["library.rank_refresh_days"] = rankRefreshField.value
         v["scanner.ep_align_order"] = epAlignOrderBox.checked
         v["scanner.extra_show"] = extraShowBox.checked
         v["scanner.extra_numbering"] = extraNumberingBox.checked
@@ -893,11 +895,11 @@ Item {
                           + "各版本默认值不同，以你机器上的为准。\n\n"
                           + "推荐组合：\n"
                           + "尽量用组合键（两个以上键同时按），并避开常用软件的"
-                          + "全局热键。例如 ctrl+alt+p 实测可用。\n\n"
+                          + "全局热键。例如 ctrl+alt+p 。\n\n"
                           + "不要用的键：\n"
                           + "ctrl+alt+l —— 那是 QQ 的「锁定 QQ」全局热键，"
                           + "会被 QQ 抢先注册，小黄鸭也注册不上"
-                          + "（实测触发过一次 QQ 自我锁定）。\n\n"
+                          + "。\n\n"
                           + "小提示：\n"
                           + "应用会先按「全屏快捷键」、再等「全屏后等待」，"
                           + "最后才发这个键 —— 顺序反了捕获会失效，"
@@ -958,7 +960,6 @@ Item {
                           + "但随后的渲染模式切换会让捕获失效 —— "
                           + "表现为「全屏后右上角有帧数，一开始播放就没了」。\n\n"
                           + "这个等待就是为了让渲染模式切换完成后再发插帧键。"
-                          + "实测 1 秒不够、3 秒稳定，故默认 3 秒；"
                           + "机器较慢或播放器启动慢时可调大。\n\n"
                           + "「为什么必须先全屏」「怎么核对播放器的全屏键」"
                           + "见「全屏快捷键」那一行的说明。"
@@ -1052,6 +1053,42 @@ Item {
                             maximum: 200
                             step: 5
                             width: 140
+                        }
+                    }
+                }
+
+                // 排名 / 评分自动刷新。
+                //
+                // **为什么要做成可配置**：排名每天都有小幅变动（收藏人数
+                // 变了名次就动），但这类变化对"我要看哪部番"几乎没有影响。
+                // 固定 7 天够用；库特别大（或特别在意榜位）的人可以调小，
+                // 不想让它联网的人可以填 0 关掉。
+                FormRow {
+                    width: parent.width
+                    label: "排名刷新间隔"
+                    hint: "海报墙「按排名」排序用的数据多久刷新一次。\n\n"
+                          + "排名是 Bangumi 站内的名次（1、2、3…），"
+                          + "会随收藏人数变化小幅浮动 —— 每个条目一次请求，"
+                          + "上百部时一轮要一两分钟（后台跑，不卡界面）。\n\n"
+                          + "7 天足够；填 0 = 不自动刷新，"
+                          + "只在海报墙「排序」面板里手动点。"
+                    Row {
+                        spacing: Theme.spacingMd
+
+                        NumberStepper {
+                            id: rankRefreshField
+                            objectName: "rankRefreshField"
+                            value: root.getFloat("library.rank_refresh_days", 7)
+                            minimum: 0
+                            maximum: 365
+                            step: 1
+                            width: 140
+                        }
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "天（0 = 只手动刷新）"
+                            color: Theme.textTertiary
+                            font.pixelSize: Theme.fontSm
                         }
                     }
                 }
