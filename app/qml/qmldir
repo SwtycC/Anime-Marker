@@ -9,6 +9,9 @@ SubscriptionPage 1.0 SubscriptionPage.qml
 SettingsPage 1.0 SettingsPage.qml
 AppButton 1.0 AppButton.qml
 AppTextField 1.0 AppTextField.qml
+FontComboBox 1.0 FontComboBox.qml
+FontDialog 1.0 FontDialog.qml
+FontDeleteDialog 1.0 FontDeleteDialog.qml
 CopyableText 1.0 CopyableText.qml
 SortPill 1.0 SortPill.qml
 SearchPill 1.0 SearchPill.qml

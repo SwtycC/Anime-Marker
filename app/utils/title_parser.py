@@ -46,6 +46,19 @@ _GROUP_SUFFIX_RE = re.compile(
 _BLOCK_NOISE_RE = re.compile(
     r"(简繁|简体|繁体|双语|中字|内嵌|外挂|无修|合集|招募|新番|生肉|熟肉|字幕|搬运)")
 
+#: **季度标记** —— `★10月新番★` / `★7月新番★` 这类。
+#:
+#: **为什么要单独一条**：
+#:   `_clean_for_name` 把 `【组名】`、`[番名]`、`[03]`、`[1080p]` 全当噪声
+#:   删掉后，**只剩这个季度标记**；于是"清洗结果非空"→ 不再走
+#:   `_pick_from_blocks` 兜底 → 番名（就在被删掉的 `[学生会也有洞 / ...]`
+#:   里）根本没被看见。
+#:
+#: 星号不是括号，`_NOISE_PATTERNS` 里那几条都匹配不到它。
+#: 只认「★…★」包起来的：裸的「10月新番」也可能是番名的一部分，
+#: 而带星号的这种在资源标题里从来只是季度标签。
+_SEASON_TAG_RE = re.compile(r"★[^★]{0,20}?新番[^★]{0,20}?★")
+
 #: 汉字（CJK 统一表意文字基本区）—— 用来判"这个括号块像不像番名"。
 _CJK_RE = re.compile(r"[一-鿿]")
 
@@ -236,6 +249,9 @@ def _clean_for_name(title: str) -> str:
        的 `86` 会被当成第 86 集删掉，番名直接变成 `-不存在的战区-`。
     """
     s = _stem(title)
+    # 季度标记先剔掉（`★10月新番★`）—— 它会让清洗结果"看起来非空"，
+    # 从而挡住 `_pick_from_blocks` 兜底（见 `_SEASON_TAG_RE` 的说明）
+    s = _SEASON_TAG_RE.sub(" ", s)
     remover = _ep_remover(s)
     # 写法明确的集号：第X话 / EP01 / 分隔符后的 01 / 结尾的 01 / [01]
     for rx in (_EP_PATTERNS[0], _EP_PATTERNS[1], _EP_SEP_RE,
@@ -303,6 +319,20 @@ def _pick_from_blocks(title: str) -> str:
     return best
 
 
+def _is_noise_only(cand: str) -> bool:
+    """这个候选是不是"没有信息量的残渣"（季度标签 / 语言标记 / 纯数字）。
+
+    做法：把它按**已知噪声词**全剔掉、再去掉标点与星号/空白，
+    还剩东西 → 是真名字；什么都不剩 → 是残渣。
+    """
+    s = _SEASON_TAG_RE.sub(" ", cand or "")
+    s = _BLOCK_NOISE_RE.sub(" ", s)
+    # 去掉标点 / 星号 / 空白 / 纯数字（`10月` 的月份数字也算噪声）
+    s = re.sub(r"(?i)(\d+\s*月|\d+)", " ", s)
+    s = re.sub(r"[★☆\s\W_]+", "", s).strip()
+    return len(s) < 2
+
+
 def guess_anime_names(title: str, limit: int = 3) -> list[str]:
     """从资源标题里猜番名，**多个候选**（按可信度从高到低）。
 
@@ -326,6 +356,17 @@ def guess_anime_names(title: str, limit: int = 3) -> list[str]:
     if not cands:
         # 标题通篇是括号时，番名也在被丢掉的那堆里（见 `_pick_from_blocks`）
         cands = _split_candidates(_pick_from_blocks(title))
+    else:
+        # **兜底二：清洗结果是"季度标签 / 纯数字"这类残渣时，也回头看括号块**
+        #
+        # 判据：**所有候选都不含汉字、或全是季度/语言标记** → 视为没取到名字。
+        # 真正的番名（中文、日文原名）一定同时含汉字或较长的拉丁词，
+        # 而"★10月新番★"「简日双语」这类残渣含汉字但没有任何信息量 ——
+        # 用"去掉这些标记后还剩不剩东西"来判断，比列黑名单更稳。
+        if all(_is_noise_only(c) for c in cands):
+            block = _split_candidates(_pick_from_blocks(title))
+            if block:
+                cands = block
     # 中文名优先，其余保持原顺序（`sorted` 稳定）
     cands.sort(key=lambda c: 0 if _CJK_RE.search(c) else 1)
     return cands[:limit]

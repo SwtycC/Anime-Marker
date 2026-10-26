@@ -1,6 +1,6 @@
 """统一路径管理（开发态 vs 打包态）。
 
-- 用户数据（配置/库/封面/日志）：
+- 用户数据（配置/库/封面/缩略图/字体/日志）：
     开发态放项目根 data/，打包后放 %APPDATA%\\AnimeMarker\\
 - 资源（图标/QSS）：
     开发态放项目根 resources/，打包后从 sys._MEIPASS 读取
@@ -65,6 +65,22 @@ def thumbs_dir() -> Path:
     p = app_data_dir() / "thumbs"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def fonts_dir() -> Path:
+    """用户上传的字体目录。
+
+    - 开发态：<project_root>/data/fonts
+    - 打包态：%APPDATA%/AnimeMarker/fonts
+
+    **必须放在用户数据目录**（而不是 resources/）：程序目录在
+    Program Files 下通常不可写；而且用户上传的字体属于个人数据，
+    升级 / 重装程序时不应被覆盖。
+    """
+    p = app_data_dir() / "fonts"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
 
 
 def logs_dir() -> Path:

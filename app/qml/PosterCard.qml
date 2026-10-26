@@ -77,25 +77,12 @@ Rectangle {
         // 封面用 `MultiEffect` + **预制圆角遮罩图**裁成圆角，使四个角与
         // 卡片的圆角一致。
         //
-        // **为什么用预制遮罩图，而不是现画一个圆角矩形**（：
-        //   ① 遮罩取的是 **alpha 通道**（不是亮度，这点极易误解）。原想用
-        //      `Rectangle { radius: 8 }` 现画一个，但作为遮罩源的它
-        //      必须"真实渲染"才有纹理；`visible:false` 之外的几种藏法
-        //      （`opacity:0` / 挪到屏幕外）实测拿不到纹理 → 输出空白
-        //      （表现为"封面整张消失"）。让它正常显示再盖上去也不行。
-        //   ② 父项 `clip` 只支持轴对齐矩形，裁不了圆角。
-        //   ③ 现成的 `OpacityMask` 在 **Qt 6.9 已随 Qt5Compat 移入
-        //      PySide6-Addons** —— 本机只装了 Essentials，没有该模块，
-        //      `import` 直接失败，所以只剩 MultiEffect 一条路。
-        //
-        // 结论：遮罩必须是**天然带 alpha 的图片资源** —— 这也正是
+        // 遮罩必须是**天然带 alpha 的图片资源** —— 这也正是
         // Qt Quick Controls 内部处理圆角/阴影的常规做法。
         // 遮罩文件：resources/poster_mask.png（32×32，纯白不透明，
         // **上两角** alpha=0 用来切圆角、**下两角**保持不透明），
         // 由 qml_app.py 注入为 `posterMaskUrl`，打包时在 anime_marker.spec
         // 的 datas 里单列。
-        // （原先的生成脚本 `_gen_mask.py` 已不在仓库中；要重做就按上面
-        //   那行描述用 PIL 画一张，别去 import 一个不存在的模块。）
         Item {
             id: coverArea
             width: parent.width
@@ -172,10 +159,6 @@ Rectangle {
 
             // 遮罩源：预制的**上圆下直**遮罩图（见 resources/poster_mask.png）。
             //
-            // 形状为什么要"上圆下直"：封面区下面紧接白色文字区，两者同宽
-            // 且无缝相接。下方若也做圆角，交界处会露出两个小缺口
-            // （缺口是卡片底色，深色海报上很显眼），像"海报被啃掉一块"。
-            //
             // 用 `BorderImage` 做 9-slice 拉伸：上两个圆角区按原样保留、
             // 只拉伸中间那条纯色区域，因此适配任意卡片尺寸而**圆角不变形**
             // （普通 `Image` 拉伸会把圆弧拉成椭圆）。
@@ -206,25 +189,6 @@ Rectangle {
             }
 
             // 圆角裁切：以 coverMask 的 **alpha** 为遮罩渲染封面。
-            //
-            // **为什么不能"干脆不用效果层"**：圆角只能靠遮罩裁，而
-            // `Qt5Compat.GraphicalEffects.OpacityMask` 在本机**不存在**。所以只剩 MultiEffect
-            // 这一条路。
-            //
-            // **MultiEffect 不背"海报模糊"这个锅**：
-            // 同一张封面，走 MultiEffect+遮罩与走朴素 Image，Laplacian
-            // 分别是 13482 / 13467 —— 差 0.1%，等于没有差别；真应用截图
-            // 也复现了同一个数（13427）。
-            // 所以早先"MultiEffect 内部合成 FBO 分辨率偏低、先合成后放大
-            // 导致细节糊掉"的推断，在本机（96 DPI / DPR=1）**不成立**，
-            // 照着它加的 `layer.textureSize` 自然也没改善画质。
-            // 真正的症结是 coverImage 缺 `sourceSize`，见上面的长注释。
-            //
-            // 下面这层"按 DPR 放大再缩回"的包装，在本机（DPR=1）是
-            // **恒等变换**（width×1、scale÷1），不影响任何测量结果。
-            // 保留它是为了 DPR>1 的显示器：MultiEffect 的中间纹理按 item
-            // 的逻辑尺寸分配，DPR=2 时会被放大一次；把 item 放大到设备
-            // 像素再 scale 回来，中间纹理就跟着变大。
             Item {
                 // 逻辑尺寸（也就是最终显示尺寸）
                 readonly property int logicalWidth: coverArea.width
@@ -295,17 +259,7 @@ Rectangle {
 
         // ---- 文本区 ----
         //
-        // 外面包一层**带下圆角的背景矩形**（踩坑）。
-        //
-        // 为什么需要：卡片 `root` 设了 `radius`，但它同时开了 `clip: true`
-        // —— Qt 的 `clip` 只按**轴对齐矩形**裁剪，于是子项（这层文本区）
-        // 会一直画到卡片的直角边界，把卡片底部的两个圆角**盖成直角** ✗。
-        // （`clip` 本身不影响"无子项"矩形的圆角，所以单看卡片是圆的，
-        //   一旦有子项铺到底部就露馅。）
-        //
-        // 解法：让这层背景自己带上与卡片一致的**下圆角** ——
-        // 它就是"卡片底部"在视觉上的实际呈现，圆角由它负责画。
-        // 上两角保持直角：那里紧邻封面区，本来就该是无缝衔接。
+        // 外面包一层**带下圆角的背景矩形**。
         Rectangle {
             id: textArea
             width: parent.width
@@ -323,11 +277,17 @@ Rectangle {
                 rightPadding: 10
                 spacing: 2
 
+                // 标题 / 集数比全局字号各放大 2px / 1px。
+                //
+                // 为什么不再直接用 Theme.fontMd / fontSm：换成霞鹜文楷这类
+                // 字面（x-height）偏小的字体后，200px 宽的海报卡片上
+                // 14px 标题显得明显偏小、发虚。这里只在**海报卡片**内放大，
+                // 不动全局字号 —— 表单 / 导航的 14px 视觉是正常的。
                 Text {
                     width: parent.width - parent.leftPadding - parent.rightPadding
                     text: root.title
                     color: Theme.textPrimary
-                    font.pixelSize: Theme.fontMd
+                    font.pixelSize: Theme.fontMd + 2
                     elide: Text.ElideRight
                     maximumLineCount: 1
                 }
@@ -336,7 +296,7 @@ Rectangle {
                     width: parent.width - parent.leftPadding - parent.rightPadding
                     text: root.meta
                     color: Theme.textTertiary
-                    font.pixelSize: Theme.fontSm
+                    font.pixelSize: Theme.fontSm + 1
                     elide: Text.ElideRight
                     maximumLineCount: 1
                 }

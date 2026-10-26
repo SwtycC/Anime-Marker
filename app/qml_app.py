@@ -24,8 +24,8 @@ from PySide6.QtWidgets import QApplication
 
 from app import USER_AGENT, __version__
 from app.bridges import (
-    AppMenuBridge, InProgressBridge, LibraryBridge, MatchBridge, PlayerBridge,
-    RssBridge, ScannerBridge, SettingsBridge,
+    AppMenuBridge, FontBridge, InProgressBridge, LibraryBridge, MatchBridge,
+    PlayerBridge, RssBridge, ScannerBridge, SettingsBridge,
 )
 # 季数识别 / 多季展示已写死（界面移除，见 scanner 里常量的说明）
 from app.bridges.scanner import SEASON_DISPLAY
@@ -120,6 +120,9 @@ class QmlApp:
         self.library_bridge = LibraryBridge(self.db, self.api)
         self.scanner_bridge = ScannerBridge(self.db, self.config)
         self.settings_bridge = SettingsBridge(self.config)
+        # 字体：内置字体注册、上传、下拉列表，以及「保存后立即生效」。
+        # 构造时没有 QApplication，真正的注册在 run() 里 prepare()。
+        self.font_bridge = FontBridge(self.config)
         self.player_bridge = PlayerBridge(self.db, self.config, self.api)
         # 「自动完结」（每集都看过 → 条目自动标「看过」）成功后刷媒体库：
         # 海报墙/在看页上该条目的状态标签会立刻从「在看」变成「看过」。
@@ -360,6 +363,9 @@ class QmlApp:
         # 就已经即时生效（见 SettingsPage 的 themeModePicked/accentPicked），
         # 这里主要保证**海报宽度**跟上（它没有即时通道，只能靠保存）。
         self._apply_saved_theme()
+        # 字体同理：只有「保存」这一个生效时机（下拉选择本身不立即应用）。
+        # apply_saved() 会遍历已打开的窗口改 font.family。
+        self.font_bridge.apply_saved()
         log.info("配置已应用，服务已重建")
 
     def _on_scan_finished(self) -> None:
@@ -435,6 +441,11 @@ class QmlApp:
         app.setOrganizationName("AnimeMarker")
         app.setApplicationDisplayName("Anime Marker")
 
+        # 字体必须**在 engine.load() 之前**准备好：QML 项创建时读取
+        # QGuiApplication.font()，晚一步首帧会先闪一下系统默认字体。
+        # 这里同时会注册内置字体与用户上传过的字体。
+        self.font_bridge.prepare()
+
         self.engine = QQmlApplicationEngine()
 
         # 注册 QML 模块目录：让 `import AnimeMarker` 与 Theme 单例生效
@@ -484,19 +495,7 @@ class QmlApp:
             "posterWidth": self._saved_poster_width(),
         })
 
-        # **启动尺寸也要在 load 之前注入**（踩坑：启动瞬间下半部分黑边）。
-        #
-        # 症状：软件打开的一瞬间，窗口下半截是黑的，随后才正常。
-        # 原因：`Main.qml` 里写死的初始尺寸是 1120×720，而真实尺寸由
-        # 下面的 `_fit_window_to_columns()` 事后用 `setProperty()` 改大
-        # （到 860 高）。时序是：
-        #     ① QML 加载完成 → 窗口**立即以 720 高可见**并渲染首帧
-        #     ② Python 把高度改成 860
-        #     ③ 新长出来的 140px 还没来得及绘制 → 那块显示为黑底
-        # 即"黑边"出现在**下方**，正是被拉高的那一段。
-        #
-        # 修法：把尺寸算好、随主题一起注入，让 QML 首次渲染就用最终尺寸
-        # （`_fit_window_to_columns` 仍保留，用于 QML 起来后兜底复核）。
+        # **启动尺寸也要在 load 之前注入**。
         ctx.setContextProperty("windowStartup", self._compute_window_size())
 
         self.theme_bridge = ThemeBridge(self.config)
@@ -514,6 +513,7 @@ class QmlApp:
         ctx.setContextProperty("library", self.library_bridge)
         ctx.setContextProperty("scanner", self.scanner_bridge)
         ctx.setContextProperty("settingsBridge", self.settings_bridge)
+        ctx.setContextProperty("fontBridge", self.font_bridge)
         ctx.setContextProperty("player", self.player_bridge)
         ctx.setContextProperty("matcher", self.match_bridge)
         ctx.setContextProperty("inprogress", self.inprogress_bridge)

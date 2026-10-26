@@ -165,6 +165,13 @@ DEFAULTS: dict[str, dict[str, str]] = {
         #   accent_color = 主题色（#RRGGBB），设置页可切换
         "theme_mode": "light",
         "accent_color": "#2F6FEB",
+        # 界面字体族名（QFontDatabase 返回的 family）。
+        #
+        # **空串 = 系统默认**（Windows 上是「微软雅黑 UI」之类）。
+        # 内置「霞鹜文楷 GB 轻便版」的族名由 FontBridge 在运行时查出，
+        # 这里不写死 —— 字体文件的内部族名若变化（换版本）也不会失配。
+        # 用户上传的字体存族名而不是文件路径：Qt 的 font.family 只认族名。
+        "font_family": "",
     },
 }
 

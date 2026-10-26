@@ -2441,12 +2441,26 @@ class Database:
             return int(cur.rowcount or 0)
 
     def list_downloads(self, source_id: Optional[int] = None) -> list[DownloadRecord]:
+        """下载记录，**按下载时间倒序**（最新在下发时排最前）。
+
+        早先按 `ep_index DESC` 排：不同订阅的记录会按"第几集"交错在一起
+        （EP3、EP3、EP2、EP2…），几周前的 EP2 老记录还会夹在今天的 EP3
+        与 EP1 之间 —— 看起来像"凭空多了几条"。
+
+        `created_at` 是记录**第一次入库**的时间，重新下发（同一
+        source+ep 的 UPSERT）不会改它，所以顺序不会因为状态更新而跳动。
+        同一秒入库的（同一次轮询）再用 `ep_index DESC` 排，保持
+        "新集在上"的阅读顺序。
+        """
         with self._cursor() as cur:
             if source_id is None:
-                cur.execute("SELECT * FROM download_history ORDER BY ep_index DESC")
+                cur.execute(
+                    "SELECT * FROM download_history "
+                    "ORDER BY created_at DESC, ep_index DESC")
             else:
                 cur.execute(
-                    "SELECT * FROM download_history WHERE source_id=? ORDER BY ep_index DESC",
+                    "SELECT * FROM download_history WHERE source_id=? "
+                    "ORDER BY created_at DESC, ep_index DESC",
                     (source_id,),
                 )
             return [DownloadRecord(**dict(r)) for r in cur.fetchall()]

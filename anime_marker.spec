@@ -27,6 +27,10 @@ a = Analysis(
         # icons 目录里。由 paths.resource_path("help.html") 读取，
         # 缺了的话那一项会提示"帮助文档缺失"。
         ('resources/help.html', 'resources'),
+        # 内置字体（设置页「字体」下拉里的「霞鹜文楷 GB 轻便版」）。
+        # 由 paths.resource_path("fonts/...") 读取；漏打包时程序仍可用，
+        # 只是下拉菜单里少了内置字体（FontBridge 会记一条警告）。
+        ('resources/fonts', 'resources/fonts'),
         # QML 界面文件：映射到 _MEIPASS/qml，与 paths.qml_dir() 的契约一致。
         # .qml 是运行时加载的，PyInstaller 静态分析发现不了，必须显式打包。
         ('app/qml', 'qml'),

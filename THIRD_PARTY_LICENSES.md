@@ -17,6 +17,7 @@
 | `HPND-Pillow.txt` | Pillow | HPND（MIT-CMU 类）| 该包 wheel 内附带的原文 |
 | `MPL-2.0-certifi.txt` | certifi | MPL-2.0 | 同上（该文件是 **MPL 通知块 + 全文链接**，不是全文）|
 | `PSF-2.0-pywin32.txt` | pywin32 | PSF-2.0 | SPDX 许可证数据（pywin32 的 wheel 未附带全文）|
+| `OFL-1.1-LxgwWenKai.txt` | 内置字体「霞鹜文楷 GB 轻便版」 | SIL OFL 1.1 | 上游仓库 `lxgw/LxgwWenKai` 的 `OFL.txt` |
 
 两点说明：
 

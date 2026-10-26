@@ -7,6 +7,7 @@
 | `library.py`  | 媒体库查询（条目 / 集数 / 时间线 / 在看 / 统计） |
 | `scanner.py`  | 媒体库扫描（QThread 信号转发） |
 | `settings.py` | 配置读写（Token / 路径 / 阈值 / 下载规则）+ 文件对话框 |
+| `fonts.py`    | 内置 / 上传字体的注册与列表 + 界面字体即时切换 |
 | `player.py`   | 播放集数 + PotPlayer 进度监控 + 自动标记看过 |
 | `match.py`    | 手动匹配（搜索候选 + 打分排序 + 应用） |
 | `inprogress.py` | 在看列表（Bangumi 拉取 + 离线缓存降级） |
@@ -20,6 +21,7 @@
 """
 
 from app.bridges.app_menu import AppMenuBridge
+from app.bridges.fonts import FontBridge
 from app.bridges.inprogress import InProgressBridge
 from app.bridges.library import LibraryBridge, as_file_url
 from app.bridges.match import MatchBridge
@@ -32,6 +34,7 @@ __all__ = [
     "LibraryBridge",
     "ScannerBridge",
     "SettingsBridge",
+    "FontBridge",
     "PlayerBridge",
     "MatchBridge",
     "InProgressBridge",

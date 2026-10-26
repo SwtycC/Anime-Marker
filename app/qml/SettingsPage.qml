@@ -23,15 +23,53 @@ Item {
     // 表单值（一次读回，用属性承载便于绑定）
     property var cfg: ({})
 
+    // 字体下拉的选项：[{ name, family, builtin }]
+    // 由 FontBridge 在运行时给出（内置 / 用户上传都可能变化，不能写死）。
+    property var fontOptions: []
+
     function loadConfig() {
         root.cfg = typeof settingsBridge !== "undefined" && settingsBridge
                    ? settingsBridge.getAll() : {}
     }
 
-    Component.onCompleted: loadConfig()
+    /// 重新取字体列表（进入页面 / 上传成功后）
+    function loadFontOptions() {
+        if (typeof fontBridge !== "undefined" && fontBridge)
+            root.fontOptions = fontBridge.availableFonts()
+        else
+            root.fontOptions = [{ "name": "系统默认", "family": "",
+                                  "builtin": false }]
+
+        // 保存过的字体文件被删了：下拉会退回「系统默认」（见 FontComboBox
+        // 的 indexOfFamily），但 cfg 里还留着旧族名 —— 不纠正的话界面显示
+        // 「系统默认」、点保存却把那个不存在的族名又写回去。
+        var saved = String(root.getValue("ui.font_family", ""))
+        if (saved !== "" && !root.hasFontFamily(saved))
+            root.setValue("ui.font_family", "")
+    }
+
+    /// 当前字体列表里是否有这个族名
+    function hasFontFamily(family) {
+        var want = String(family)
+        for (var i = 0; i < root.fontOptions.length; i++) {
+            var item = root.fontOptions[i]
+            if (item && item.family !== undefined
+                    && String(item.family) === want)
+                return true
+        }
+        return false
+    }
+
+    Component.onCompleted: {
+        loadConfig()
+        loadFontOptions()
+    }
 
     // 每次切到本页时重新读取，避免外部改动后显示旧值
-    function refresh() { loadConfig() }
+    function refresh() {
+        loadConfig()
+        loadFontOptions()
+    }
 
     /// 滚动到指定位置（截图/诊断用）
     function scrollTo(y) {
@@ -114,13 +152,7 @@ Item {
 
     /// revealField 的后半段：在布局稳定后滚动到目标。
     ///
-    /// **高亮框交给控件自己画**（踩坑）：早期在设置页里算"控件视觉范围"
-    /// 再放一个外部矩形 —— 但设置页的开关是 `FormRow` 子项，会被拉伸到
-    /// 整行宽，`width` / `implicitWidth` / `childrenRect` / `FontMetrics`
-    /// 全都拿不到"轨道 + 文字"那段真实范围，框于是横跨整行、甚至左边
-    /// 溢出页面外（首次跳转时尤其明显）。
-    ///
-    /// 正解：调用控件自带的 `flash()`（见 CheckBoxLine.qml）—— 高亮矩形
+    /// 调用控件自带的 `flash()`（见 CheckBoxLine.qml）—— 高亮矩形
     /// 锚在轨道与文字上，天然贴合本体，外部不需要知道任何尺寸。
     function _revealTo(w) {
         var pos = w.mapToItem(flick.contentItem, 0, 0)
@@ -160,6 +192,12 @@ Item {
             w.currentValue = String(value)
         } else if (tn.indexOf("CheckBoxLine") >= 0) {
             w.checked = (value === true || value === "true")
+        } else if (tn.indexOf("FontComboBox") >= 0) {
+            // 字体下拉：family 为空串 = 系统默认。
+            // **只改 cfg**，让它经绑定传给 currentFamily —— 直接给
+            // currentFamily 赋值会断开 `currentFamily: root.getValue(...)`
+            // 的绑定，之后上传 / 重新读配置都再也同步不上。
+            root.setValue("ui.font_family", String(value))
         } else if (tn.indexOf("ShortcutRecorder") >= 0) {
             // 录制组件没有 text 属性，写 value（诊断脚本用它模拟"手打"）
             w.value = String(value)
@@ -171,9 +209,14 @@ Item {
 
     // 当前主题色 / 模式（用于界面区块的即时切换）
     function setValue(key, value) {
-        var c = root.cfg
-        c[key] = value
-        root.cfg = c
+        // **必须换一个新对象**：把同一个对象引用赋回 var 属性时，
+        // QML 认为值没变、不发 cfgChanged —— 绑定了 `root.cfg` 的
+        // fontCombo.currentFamily 就不会跟着更新（上传完字体选不中新项）。
+        var copy = {}
+        for (var k in root.cfg)
+            copy[k] = root.cfg[k]
+        copy[key] = value
+        root.cfg = copy
     }
 
     function getValue(key, fallback) {
@@ -198,9 +241,6 @@ Item {
 
     /// 只保存**一个键**（点选即生效的开关用）。
     ///
-    /// **为什么不直接调 save()**：`save()` 会 `collect()` 全部字段并写盘 ——
-    /// 用户在别的输入框里可能正敲了一半（比如改到一半的代理地址），
-    /// 点一下这个开关就把它一并提交了，属于"我没点保存却保存了" ✗。
     /// 这里只提交当前这一项，其余保持原样。
     function saveOne(key, value) {
         if (typeof settingsBridge === "undefined" || !settingsBridge) {
@@ -218,6 +258,70 @@ Item {
         else
             root.statusMessage("保存失败（详见日志）")
         return ok
+    }
+
+    /// 按 id（用户字体目录里的文件名）找下拉项
+    function fontById(id) {
+        var want = String(id || "")
+        for (var i = 0; i < root.fontOptions.length; i++) {
+            var item = root.fontOptions[i]
+            if (item && String(item.id || "") === want)
+                return item
+        }
+        return null
+    }
+
+    /// 删除用户上传的字体（由删除确认小窗回调）。
+    ///
+    /// 两种"正在用"要分开处理：
+    ///   ① 只是**界面上选中了**（还没保存）→ 把内存里的选择退回系统默认；
+    ///   ② **已经保存并在用** → 立刻把 `ui.font_family` 写空并应用系统默认。
+    /// 不做 ② 的话，文件已经删了、界面还在显示那个字体，直到下次保存 /
+    /// 重启才会变，用户会以为没删干净。
+    function deleteFont(fontId) {
+        if (typeof fontBridge === "undefined" || !fontBridge) {
+            root.statusMessage("字体服务不可用")
+            return
+        }
+        var item = root.fontById(fontId)
+        var r = fontBridge.deleteFont(fontId)
+        if (!r || r.ok !== true) {
+            root.statusMessage("删除字体失败："
+                               + String((r && r.message) || "未知错误"))
+            return
+        }
+
+        var family = String(r.family || (item ? item.family : "") || "")
+        var name = String(r.name || (item ? item.name : "") || family)
+        var savedFamily = (typeof settingsBridge !== "undefined" && settingsBridge)
+                          ? String(settingsBridge.getValue("ui.font_family", ""))
+                          : ""
+        var selection = String(root.getValue("ui.font_family", ""))
+
+        root.loadFontOptions()
+
+        // ① 界面上的当前选择
+        if (family !== "" && selection === family)
+            root.setValue("ui.font_family", "")
+
+        // ② 已保存 / 正在使用的字体
+        if (family !== "" && savedFamily === family) {
+            var ok = settingsBridge
+                     && settingsBridge.saveAll({ "ui.font_family": "" })
+            if (!ok) {
+                root.statusMessage("字体已删除，但恢复系统默认失败（详见日志）")
+            } else if (selection === family) {
+                root.statusMessage("已删除字体「" + name
+                                   + "」，当前字体恢复为系统默认")
+            } else {
+                // 用户还选了别的字体但没保存：已保存/正在用的那份恢复
+                // 系统默认，界面上的待保存选择保持不动。
+                root.statusMessage("已删除字体「" + name
+                                   + "」，已保存的字体恢复为系统默认")
+            }
+        } else {
+            root.statusMessage("已删除字体：" + name)
+        }
     }
 
     // ---- 保存 ----
@@ -302,6 +406,10 @@ Item {
         // 不走「主题」那套即时保存（themeBridge）：主题是点一下就该变、没有
         // "保存"语义；海报宽度要重排整个海报墙，按标签上写的**跟保存一起生效**。
         v["ui.poster_width"] = posterWidthField.value
+        // 字体：空串 = 系统默认。保存后由 QmlApp._rebuild_services →
+        // FontBridge.apply_saved() 遍历窗口改 font.family（立即生效，
+        // 不是重启生效）。用户上传的字体族名同样存这里。
+        v["ui.font_family"] = root.getValue("ui.font_family", "")
         return v
     }
 
@@ -402,14 +510,6 @@ Item {
 
     // 红色错误提示：位置与「已解析并保存」那条粉色浮条**一致**
     // （窗口顶部居中、距顶 14px，见 Main.qml 的 banner）。
-    //
-    // 为什么不用 bottom：两处提示条一上一下会让人以为是两个不同的东西；
-    // 统一放顶部居中后，"校验失败的红色"与"保存成功的粉色"出现在同一
-    // 位置，切换时视觉连续。
-    //
-    // 用**窗口坐标**（相对 Window.contentItem）而不是页面坐标：设置页在
-    // ColumnLayout 里、下方还有状态栏，用 `parent.top` 会算进页面偏移，
-    // 偏下 20 多像素，与 banner 对不齐。
     ErrorToast {
         id: errorToast
         objectName: "errorToast"
@@ -546,7 +646,7 @@ Item {
                 SectionHeader {
                     width: parent.width
                     title: "界面"
-                    hint: "外观模式与主题色立即生效；海报宽度改完点「保存」后生效"
+                    hint: "外观模式与主题色立即生效；字体与海报宽度改完点「保存」后生效"
                 }
 
                 FormRow {
@@ -576,6 +676,52 @@ Item {
                         onPicked: function (value) {
                             Theme.applyAccent(value)
                             root.accentPicked(value)
+                        }
+                    }
+                }
+
+                // 字体：Material 风格下拉框 + 右侧「上传」。
+                FormRow {
+                    width: parent.width
+                    label: "字体"
+                    hint: "界面使用的字体。「系统默认」跟随 Windows 设置。\n\n"
+                          + "点「上传」可添加 .ttf / .otf / .ttc 字体文件；"
+                          + "添加成功后会立即出现在下拉菜单里，"
+                          + "选中并点「保存」后生效。\n\n"
+                          + "上传的字体保存在用户数据目录，重开软件后仍然可用。"
+                    Row {
+                        width: parent.width
+                        spacing: Theme.spacingSm
+
+                        FontComboBox {
+                            id: fontCombo
+                            objectName: "fontCombo"
+                            width: parent.width - uploadFontBtn.width
+                                    - Theme.spacingSm
+                            options: root.fontOptions
+                            currentFamily: root.getValue("ui.font_family", "")
+                            onFontPicked: function (family) {
+                                root.setValue("ui.font_family", family)
+                            }
+                            // 上传字体右侧的「设置 / 删除」
+                            onEditRequested: function (fontId) {
+                                var item = root.fontById(fontId)
+                                if (item)
+                                    fontDialog.openEdit(item)
+                            }
+                            onDeleteRequested: function (fontId) {
+                                var item = root.fontById(fontId)
+                                if (item)
+                                    fontDeleteDialog.openFor(item.id, item.name)
+                            }
+                        }
+
+                        AppButton {
+                            id: uploadFontBtn
+                            objectName: "uploadFontBtn"
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "上传"
+                            onClicked: fontDialog.openAdd()
                         }
                     }
                 }
@@ -619,12 +765,6 @@ Item {
                 FormRow {
                     width: parent.width
                     label: "Access Token"
-                    // 说明走 FormRow 内置的 `?` 弹窗 —— **与其他每一行完全同源**。
-                    //
-                    // 现在改成 `helpAction`：按钮仍由 FormRow 统一摆放
-                    // （与其余各行**在同一 x 上**），但点击打开的是自带的
-                    // tokenDialog —— 那一版里有"一键打开生成页"的按钮，
-                    // 内置的纯文本弹窗给不了这个能力。
                     helpAction: tokenDialog
                     AppTextField {
                         id: tokenField
@@ -677,10 +817,6 @@ Item {
                     // 服务端的适配 —— 允许改的话，用户填一个非官方地址后
                     // 会得到各种难以归因的失败（字段缺失、鉴权方式不同、
                     // 返回结构不一致），排查成本远高于"直接不让改"。
-                    //
-                    // `text` 也不再从配置读：旧 config.ini 里可能存着用户
-                    // 早先填过的其它地址，读出来会显示成一个"看起来能改、
-                    // 实际不用"的值。这里直接钉死官方地址。
                     AppTextField {
                         id: apiBaseField
                         objectName: "apiBaseField"
@@ -904,10 +1040,6 @@ Item {
                           + "应用会先按「全屏快捷键」、再等「全屏后等待」，"
                           + "最后才发这个键 —— 顺序反了捕获会失效，"
                           + "详见「全屏后等待」那一行的说明。"
-                    // 快捷键用**按键录制**而不是手打：这两个值会被原样交给
-                    // keyboard / pyautogui 发送，手打的大小写、空格、分隔符、
-                    // enter/return 任一不一致都会"发出去却收不到"，
-                    // 而现象只有"按了没反应"，极难排查。见 ShortcutRecorder.qml。
                     ShortcutRecorder {
                         id: lsShortcutField
                         objectName: "lsShortcutField"
@@ -952,8 +1084,6 @@ Item {
                 FormRow {
                     width: parent.width
                     label: "全屏后等待"
-                    // 用 FormRow 内置的 `?` 弹窗（见 FormRow 的说明），
-                    // 不再手写 HelpButton + 负偏移 + 外置 Dialog。
                     hint: "「全屏后等待」是做什么的？\n\n"
                           + "PotPlayer 达到全屏尺寸后，可能仍在切换渲染模式。"
                           + "此时过早就发送插帧快捷键，小黄鸭虽然当场抓到了窗口，"
@@ -1001,7 +1131,6 @@ Item {
                         step: 0.05
                         decimals: 2
                         // 不写死宽度：与「全屏后等待」「轮询间隔」保持同宽
-                        // （原先写死 180，导致这一行右边比邻行短一截 ✗）
                     }
                 }
             }
@@ -1016,13 +1145,6 @@ Item {
                     title: "扫描与匹配"
                     hint: "季数识别与匹配阈值改动后需重新扫描"
                 }
-
-                // 注：「季数识别」「多季展示」两个选项已**移除**。
-                // 它们改为固定方案（`cn` = 第X季 / S1 / Season 1，
-                // `flat` = 平铺），不再让用户选 —— 见 scanner.ScannerBridge
-                // 与 qml_app 里写死的取值，以及 config.DEFAULTS 的说明。
-                // 保留这两个键在 DEFAULTS 里，是为了兼容旧 config.ini
-                // （用户库里可能已存过值，删掉键会让 ConfigParser 报错）。
 
                 FormRow {
                     width: parent.width
@@ -1058,11 +1180,6 @@ Item {
                 }
 
                 // 排名 / 评分自动刷新。
-                //
-                // **为什么要做成可配置**：排名每天都有小幅变动（收藏人数
-                // 变了名次就动），但这类变化对"我要看哪部番"几乎没有影响。
-                // 固定 7 天够用；库特别大（或特别在意榜位）的人可以调小，
-                // 不想让它联网的人可以填 0 关掉。
                 FormRow {
                     width: parent.width
                     label: "排名刷新间隔"
@@ -1122,8 +1239,6 @@ Item {
                     // 只能用文件名。但至少给它们**正确的显示标签**：
                     // 文件名写 `SP01` 就显示 `SP01`、写 `OVA01` 就显示
                     // `OVA01`（前导零也保留），并排在正片之后。
-                    // 早期它们完全不被识别，落进兜底桶被顺延成「13.5 集」
-                    // 这种假集号，与正片混在同一序列里。
                     hint: "SP/OVA/NCOP/特典等按文件名显示（SP01、OVA01…），排在正片之后"
                     CheckBoxLine {
                         id: extraNumberingBox
@@ -1148,8 +1263,7 @@ Item {
                     label: "集数按顺序对应"
                     // 兜底配对（scanner._align_by_order）：官方序号与本地
                     // 编号**完全对不上**、但集数数量一致时，按排序位置配对
-                    // 并改用官方序号（如 Re:零 第三季：官方 51~58 vs
-                    // 本地 [01]~[08]）。本质是"数量一致下的猜测"，没有按号
+                    // 并改用官方序号。本质是"数量一致下的猜测"，没有按号
                     // 匹配可靠 —— 命中的条目打开详情页会弹黄色提示。
                     hint: "本地编号与官方对不上但集数数量一致时按顺序配对；命中条目打开详情页会有黄色提示"
                     CheckBoxLine {
@@ -1184,7 +1298,7 @@ Item {
                     }
                 }
 
-                // 端口**不用 NumberStepper**（用户要求）：端口是个纯数字，
+                // 端口**不用 NumberStepper**：端口是个纯数字，
                 // 加减按钮在这里没用（1 步进从 8080 挪到 9090 要点 1000 下），
                 // 手打才是常态。样式与上面的「Web UI 地址」完全一致（同一个
                 // AppTextField），只是宽度只给够 5 位数的窄框。
@@ -1237,8 +1351,6 @@ Item {
                 FormRow {
                     width: parent.width
                     label: "程序路径"
-                    // 全 HTML（不要混 `\n`，原因见 FormRow.hintMarkup：
-                    // 含 `<` 即整段透传，`\n` 便不再转 `<br>`）
                     hint: "qBittorrent 主程序的完整路径。"
                           + "<br><br><b>为什么要填：</b><br>"
                           + "qBittorrent 的桌面窗口和 Web UI 是<b>同一个进程</b>，"
@@ -1276,10 +1388,6 @@ Item {
                 FormRow {
                     width: parent.width
                     label: "按需启动"
-                    // 全 HTML：含 `<` 会被 `hintMarkup` 判为"调用方已写 HTML"
-                    // 而**原样透传**，里面的 `\n` 就不会再被转成 `<br>`
-                    // （见 FormRow.hintMarkup）。所以想用 `<b>` 就必须把
-                    // 换行也写成 `<br>`，两者不能混。
                     hint: "开启后，下发新集时若连不上 qBittorrent，"
                           + "会自动用上面的路径把它启动起来，等它就绪再下发。"
                           + "<br><br>已经开着的话<b>不会重复启动</b>；"
@@ -1342,7 +1450,7 @@ Item {
                         width: 180
                         // **联动置灰**：自动轮询关掉时，间隔
                         // 这个值就没有意义了 —— 留在可编辑状态会让用户
-                        // 改了却发现没反应（"是不是坏了"）。
+                        // 改了却发现没反应。
                         // 值仍然会随 collect() 一起保存，重新打开开关后
                         // 原来设的分钟数还在，不用重设。
                         enabled: rssPollOnStartBox.checked
@@ -1360,6 +1468,32 @@ Item {
                     }
                 }
             }
+        }
+    }
+
+    // ==================== 字体：添加 / 重命名 ====================
+    FontDialog {
+        id: fontDialog
+        objectName: "fontDialog"
+        onCompleted: function (mode, family, name, fontId) {
+            root.loadFontOptions()
+            if (mode === "add") {
+                // 与原先的上传一致：添加成功后立刻在下拉里选中（内存值），
+                // 真正落盘 / 应用仍等用户点「保存」。
+                root.setValue("ui.font_family", String(family || ""))
+                root.statusMessage("已添加字体：" + name + "（点「保存」后生效）")
+            } else {
+                root.statusMessage("已重命名字体：" + name)
+            }
+        }
+    }
+
+    // ==================== 字体：删除确认 ====================
+    FontDeleteDialog {
+        id: fontDeleteDialog
+        objectName: "fontDeleteDialog"
+        onConfirmed: function (fontId) {
+            root.deleteFont(fontId)
         }
     }
 
@@ -1453,9 +1587,6 @@ Item {
         }
     }
 
-    // 注：原先这里有个手写的「全屏与等待时间说明」弹窗，现已并入 FormRow
-    // 内置的 `?` 弹窗 —— 说明文字直接写在那一行的 `hint` 属性里。
-    // 删除是为了避免"每加一处说明就手写一个 Dialog"的重复。
 
     // ==================== 底部操作栏（固定，不随滚动）====================
     //

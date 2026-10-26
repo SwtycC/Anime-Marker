@@ -47,7 +47,7 @@ ALLOWED_KEYS = {
     # RSS
     "rss.poll_interval", "rss.auto_download", "rss.poll_on_start",
     # 界面
-    "ui.theme_mode", "ui.accent_color", "ui.poster_width",
+    "ui.theme_mode", "ui.accent_color", "ui.poster_width", "ui.font_family",
     # 媒体库（排名自动刷新间隔）
     "library.rank_refresh_days",
 }
@@ -91,6 +91,7 @@ FALLBACKS: dict[str, str] = {
     "ui.theme_mode": "light",
     "ui.accent_color": "#2F6FEB",
     "ui.poster_width": "200",
+    "ui.font_family": "",
     "library.rank_refresh_days": "7",
 }
 

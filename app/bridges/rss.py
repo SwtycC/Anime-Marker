@@ -283,6 +283,15 @@ class _CreateSubjectWorker(NamedThread):
     （详见 database.upsert_local_subject 的说明）。
     """
 
+    #: 条目行**刚落库**（封面 / 制作公司可能还没拉）：(来源 id, 条目本地 id)。
+    #:
+    #: **为什么要与 `done` 分开**：绑定订阅只需要条目 id，而封面下载与
+    #: 制作公司查询都要发网络请求。如果等 worker 全部
+    #: 跑完才发 `done`、再在 `_on_subject_created` 里绑定，这 2 秒里订阅
+    #: 仍是"未绑定" —— 用户点完「新建并绑定」紧接着打开「下载器」，保存
+    #: 位置就预选不到任何条目）。所以先发这条信号，让调用方立刻绑定。
+    inserted = Signal(int, int)
+
     #: (来源 id, 新条目本地 id, 错误信息)
     done = Signal(int, int, str)
 
@@ -344,15 +353,25 @@ class _CreateSubjectWorker(NamedThread):
         self.done.emit(self._source_id, subject_id, "")
 
     def _insert(self, name: str, subj: Optional[dict]) -> int:
-        """写库并返回本地 subject id。"""
+        """写库并返回本地 subject id。
+
+        **顺序：先落库（纯本地字段），再补网络数据（封面 / 制作公司）。**
+
+        绑定订阅只需要条目 id，而封面下载与制作公司查询都要发请求。
+        若等它们都拉完才 upsert，`inserted` 会跟着推迟，
+        用户点完「新建并绑定」立刻打开的「下载器」就预选不到条目
+        （见 `inserted` 的说明）。
+        """
         if not subj:
             # 未匹配（或没 Token）：本地条目，bangumi_id 写 NULL
-            return self._db.upsert_local_subject(
+            subject_id = self._db.upsert_local_subject(
                 folder_path="",            # 订阅条目还没有本地目录
                 display_name=name,
                 series_name="",
                 total_eps=0,
             )
+            self.inserted.emit(self._source_id, subject_id)
+            return subject_id
 
         bangumi_id = int(subj.get("id") or 0)
         name_cn = subj.get("name_cn") or ""
@@ -361,34 +380,56 @@ class _CreateSubjectWorker(NamedThread):
         total_eps = int(subj.get("total_episodes")
                         or subj.get("eps_count") or 0)
 
-        # 封面下载失败不算错误 —— 与扫描入库的取舍一致（封面可事后补）
-        cover_path = ""
+        # 同一个 Bangumi 条目可能已经在库里（绑定的是一部已扫描的番）。
+        # `upsert_subject` 会把传入的字段全部覆盖 —— 先用库里的值兜住封面
+        # 与制作公司，别拿空串把它们擦掉，等下面拉到新值再补写。
+        prev = None
+        try:
+            prev_id = self._db.find_subject_by_bangumi_id(bangumi_id)
+            prev = self._db.get_subject(int(prev_id)) if prev_id else None
+        except Exception:                   # pragma: no cover - 防御性
+            prev = None
+
+        subject_id = self._db.upsert_subject(
+            bangumi_id=bangumi_id,
+            name=name_jp or name,
+            name_cn=name_cn or name,
+            cover_url=cover_url,
+            cover_path=(prev.cover_path or "") if prev else "",
+            total_eps=total_eps,
+            folder_path="",                # 见上：暂无本地目录
+            series_name="",
+            aliases=self._db.aliases_from_subject(subj),
+            studio=(prev.studio or "") if prev else "",
+            # manual 而不是 auto：这个条目是**用户手动确认过的名字**建的，
+            # 与"扫描自动匹配"来源不同。用 auto 的话，下次扫描若碰到同名
+            # 目录会把它当自动结果覆盖。
+            match_state="manual",
+        )
+        # 行已落库 → 立刻通知调用方绑定，别等下面两个网络请求。
+        self.inserted.emit(self._source_id, subject_id)
+
+        # ---- 以下都要联网。失败不算错误：两者都是展示性数据 ----
         if cover_url and self._api is not None:
             from app.utils.cover_cache import download as download_cover
             try:
                 cover_path = str(download_cover(
                     bangumi_id, cover_url, self._api.session,
                     label=name_cn or name_jp or name))
+                if cover_path:
+                    self._db.set_cover_path(subject_id, cover_path)
             except Exception as e:
                 log.warning("订阅条目封面下载失败 %s: %s", name, e)
 
-        return self._db.upsert_subject(
-            bangumi_id=bangumi_id,
-            name=name_jp or name,
-            name_cn=name_cn or name,
-            cover_url=cover_url,
-            cover_path=cover_path,
-            total_eps=total_eps,
-            folder_path="",                # 见上：暂无本地目录
-            series_name="",
-            aliases=self._db.aliases_from_subject(subj),
-            studio=self._api.studio_for(subj, bangumi_id)
-                   if self._api is not None else "",
-            # manual 而不是 auto：这个条目是**用户手动确认过的名字**建的，
-            # 与"扫描自动匹配"来源不同。用 auto 的话，下次扫描若碰到同名
-            # 目录会把它当自动结果覆盖。
-            match_state="manual",
-        )
+        if self._api is not None:
+            try:
+                studio = self._api.studio_for(subj, bangumi_id)
+                # set_subject_studio 忽略空串，不会覆盖库里已有的值
+                self._db.set_subject_studio(subject_id, studio)
+            except Exception as e:
+                log.warning("订阅条目制作公司拉取失败 %s: %s", name, e)
+
+        return subject_id
 
 
 class _PreviewWorker(NamedThread):
@@ -499,6 +540,9 @@ class _TorrentStatusWorker(NamedThread):
                 "state": str(t.state or ""),
                 "dlspeed": int(t.dlspeed or 0),
                 "name": t.name or "",
+                # 下发时打的标签（含 `bgm:<本地条目 id>`）—— `_match_torrent`
+                # 靠它把"同集号的不同番"区分开，见那里的说明。
+                "tags": str(t.tags or ""),
             }
         self.done.emit(out, "")
 
@@ -576,7 +620,15 @@ def _release_similar(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, sa, sb).ratio()
 
 
-def _match_torrent(rec_title: str, torrents: dict) -> Optional[dict]:
+def _torrent_tags(tags) -> set[str]:
+    """qBittorrent 任务的 tags 字符串 → 标签集合（qB 用逗号分隔）。"""
+    if not tags:
+        return set()
+    return {t.strip() for t in str(tags).split(",") if t.strip()}
+
+
+def _match_torrent(rec_title: str, torrents: dict,
+                   subject_id: int = 0) -> Optional[dict]:
     """把一条下载记录匹配到 qBittorrent 里的任务（拿不到返回 None）。
 
     **为什么要这么麻烦**：
@@ -584,7 +636,14 @@ def _match_torrent(rec_title: str, torrents: dict) -> Optional[dict]:
          不回传 hash，所以库里那列一直是 NULL；
       ② 按标题**精确匹配**也不行 （qB 用的是**种子内的原始名**，而我们用的是 RSS 标题）。
 
-    所以改用**两级判定**（宁可少匹配，也不要把进度显示到错的集上）：
+    **先按条目标签圈定范围**：下发时每个任务都带 `bgm:<本地条目 id>` 标签
+    （见 `rss_service` 里 tags 的组装）。同一集号的不同番，标题里都有
+    `1080p` / `HEVC-10bit` / `AAC` 这些共同片段，字符重合度能轻松过 0.5。
+    所以记录带 `subject_id` 时，只在**标签相同**的任务里选；
+    一个都没有就返回 None（不显示进度条），绝不跨番借进度。
+    没绑定条目的记录（`subject_id=0`）才退回纯标题匹配。
+
+    标签圈定之后仍是**两级判定**（宁可少匹配，也不要把进度显示到错的集上）：
         第一级：集号相同 **且** 标题字符重合度 ≥ 0.5 → 直接采纳
         第二级：集号相同 **且** 该集号在本订阅里唯一 → 采纳（兜底）
     两级都不满足就返回 None（界面不显示进度条，而不是显示错的）。
@@ -599,6 +658,15 @@ def _match_torrent(rec_title: str, torrents: dict) -> Optional[dict]:
     同集 = [c for c in torrents.values() if _ep_of(c.get("name", "")) == want_ep]
     if not 同集:
         return None
+
+    sid = int(subject_id or 0)
+    if sid:
+        want_tag = f"bgm:{sid}"
+        同集 = [c for c in 同集 if want_tag in _torrent_tags(c.get("tags", ""))]
+        if not 同集:
+            # 该条目名下没有这一集的任务（下完清理 / 还没下发）。
+            # 不拿别的番同集号的进度来冒充。
+            return None
 
     # 第一级：字符重合度
     best, best_score = None, 0.0
@@ -1568,7 +1636,8 @@ class RssBridge(QObject):
             if info is None and self._torrents:
                 # hash 一般拿不到（见 _match_torrent 的说明），走"集号 +
                 # 标题重合度"的两级匹配
-                info = _match_torrent(r.torrent_title or "", self._torrents)
+                info = _match_torrent(r.torrent_title or "", self._torrents,
+                                      int(r.subject_id or 0))
 
             progress = 0.0
             state_label = ""
@@ -1667,7 +1736,7 @@ class RssBridge(QObject):
         # 闸门停掉了，于是"下完自动扫描"会静默失效。
         self._maybe_scan_completed(self._torrents)
 
-        # **先判 `_qb`、再判在途任务**（顺序与早前相反）：没配 qBittorrent 时
+        # **先判 `_qb`、再判在途任务**：没配 qBittorrent 时
         # 也必须每 30 秒进来一次 —— 上面的 `_maybe_scan_completed` 承担了
         # 不依赖 qB 的补扫与**重试**（"当时扫描器正忙 / 条目解析不出"的记录
         # 靠它重来）。早退在这之后，那些记录就再没有第二次机会。
@@ -1834,7 +1903,8 @@ class RssBridge(QObject):
             #
             # 有 qBittorrent 任务可比 → 按它的**真实进度**判（权威口径；
             # 库里那个 `status` 只是"我们下发过"的记录，不反映下完没有）。
-            info = _match_torrent(rec.torrent_title or "", torrents)
+            info = _match_torrent(rec.torrent_title or "", torrents,
+                                  int(rec.subject_id or 0))
             if info is not None:
                 try:
                     progress = float(info.get("progress") or 0.0)
@@ -2395,6 +2465,8 @@ class RssBridge(QObject):
                                  accept_score=score, accept_gap=gap,
                                  keywords=keywords, pre_matched=confirmed)
         self._create_workers.append(w)
+        # 先接「行已落库」：立刻绑定 + 刷新媒体库缓存，别等封面下载完。
+        w.inserted.connect(self._on_subject_inserted)
         w.done.connect(self._on_subject_created)
         w.finished.connect(lambda: self._drop_create_worker(w))
         w.start()
@@ -2418,14 +2490,33 @@ class RssBridge(QObject):
             pass
         w.deleteLater()
 
+    def _on_subject_inserted(self, source_id: int, subject_id: int) -> None:
+        """条目行刚落库（封面 / 制作公司还没拉）：**立刻绑定并刷新缓存**。
+
+        绑定只需要 id。封面下载与制作公司查询都要联网，
+        等 worker 跑完再绑的话，这段时间里：
+          - 订阅卡片仍显示"未绑定"；
+          - 紧接着打开的「下载器」弹窗按 `local_subject_id` 预选保存位置，
+            读到的还是 0 → 搜索框空着。
+        """
+        self.linkSubject(int(source_id), int(subject_id))
+        subj = self._db.get_subject(int(subject_id))
+        label = ((subj.name_cn or subj.name) if subj else "") or ""
+        # 媒体库缓存也要立刻失效：下载器弹窗是**按 id 在 subjects 列表里
+        # 找名字**回填的，列表里没有这条新条目就回填不出来。
+        self.subjectCreated.emit(int(subject_id), label)
+
     def _on_subject_created(self, source_id: int, subject_id: int,
                             error: str) -> None:
         if error:
             self.failed.emit(error)
             return
-        # 建完立刻绑定（一次操作完成两件事）。linkSubject 现在**不再要求
-        # 条目已匹配 Bangumi**，所以未匹配的本地条目也能绑上。
-        self.linkSubject(int(source_id), int(subject_id))
+        # 绑定在 `_on_subject_inserted` 里已经做过（那时条目行刚落库）。
+        # 这里只在因故没绑上时补一次 —— 避免重复调用把"已绑定"的状态栏
+        # 消息刷两遍（linkSubject 本身是幂等的）。
+        cur = self._find_source(int(source_id))
+        if int(getattr(cur, "local_subject_id", 0) or 0) != int(subject_id):
+            self.linkSubject(int(source_id), int(subject_id))
         subj = self._db.get_subject(int(subject_id))
         label = (subj.name_cn or subj.name) if subj else ""
         if subj is not None and not subj.bangumi_id:
