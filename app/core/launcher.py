@@ -3,22 +3,13 @@
 一次 play() 完成：起 LS（可选）→ 起 PotPlayer → **等播放器窗口就位并置前**
 → **全屏** → 发插帧快捷键。
 
-**顺序为什么是这样（实测踩坑）**：小黄鸭的插帧快捷键只对**当前前台窗口**
-生效，所以必须"播放器已经在前台"之后再发。早期实现是
-`起 LS → 等 5s → 发快捷键 → 起播放器`，快捷键必然落在播放器之外 ——
-表现就是"小黄鸭起来了，但没开缩放/补帧"。
+小黄鸭的插帧快捷键只对**当前前台窗口**生效，所以必须"播放器已经在前台"之后再发。
 
-**为什么要先全屏再发插帧键（实测踩坑）**：小黄鸭的 `WGC` 捕获 API 抓的是
+小黄鸭的 `WGC` 捕获 API 抓的是
 "这个窗口"，输出尺寸跟随**捕获那一刻的窗口尺寸**。PotPlayer 启动时窗口
 尺寸会跳变（先以小窗口出现，之后才应用记住的尺寸），若在跳变过程中被
 捕获，LS 就锁在错误的尺寸上 —— 表现为**画面缩小、四周一圈黑边**，
 手动切一次屏幕（触发窗口尺寸变化）才会恢复正常。
-
-实测确认：由本程序启动时 PotPlayer **每次都是窗口化**（从未继承全屏），
-因此这里可以**无条件**发一次 `Alt+Enter` 切全屏（不必先判断当前是否全屏，
-那需要多一次 `GetWindowRect` 比对，且 Alt+Enter 是有状态的、判断反而更绕）。
-发完不等固定时长，而是**轮询窗口矩形直到铺满屏幕**再发插帧键 ——
-死等既可能不够（慢机器）也可能白等（快机器）。
 """
 
 from __future__ import annotations
@@ -59,9 +50,7 @@ def _window_rect(hwnd: int) -> Optional[tuple[int, int, int, int]]:
 def _window_desc(hwnd: int) -> str:
     """窗口的"类名 + 标题"描述，专供排查"键发给了谁"。
 
-    排查焦点问题时，光看 hwnd 数字毫无意义 —— 必须知道那是哪个程序
-    （实测踩过：以为是"焦点没给到 PotPlayer"，日志打出标题才发现
-    前台其实是浏览器窗口）。
+    排查焦点问题时，光看 hwnd 数字毫无意义 —— 必须知道那是哪个程序。
     """
     if not hwnd:
         return "<无>"
@@ -115,8 +104,12 @@ class PlayerLauncher:
         player_path: str,
         ls_path: str = "",
         enable_ls: bool = True,
-        ls_shortcut: str = "ctrl+alt+p",   # 须与小黄鸭一致；别用 ctrl+alt+l（QQ 锁定键）
-        fullscreen_shortcut: str = "alt+enter",   # PotPlayer 的全屏键，须与播放器一致
+        # 须与小黄鸭一致；别用 ctrl+alt+l（QQ 锁定键）。
+        # **默认空串**：调用方没给就不发任何热键，不替用户按下他没设过的组合。
+        ls_shortcut: str = "",
+        # 该播放器自己的全屏键（见 core/player_profiles）。同样默认空串 ——
+        # 空串时 `_ensure_fullscreen` 记一条 warning 并跳过全屏。
+        fullscreen_shortcut: str = "",
         ls_start_delay: float = 5.0,
         player_start_delay: float = 1.0,
         fullscreen_settle: float = 3.0,
@@ -130,11 +123,10 @@ class PlayerLauncher:
         self.player_start_delay = player_start_delay
         # 全屏成功后、发插帧键之前的**额外稳定等待**（秒）。
         #
-        # **为什么需要（实测踩坑）**：`_ensure_fullscreen()` 的判据是"窗口
+        # `_ensure_fullscreen()` 的判据是"窗口
         # 矩形铺满显示器"，但 PotPlayer 达到这个尺寸后**可能还在切换渲染
         # 模式**（窗口模式 → 全屏模式）。此时紧接着发插帧键，小黄鸭虽然在
-        # 那一刻抓到了窗口，但随后的渲染模式切换会让捕获失效 ——
-        # 实测症状："全屏后有帧数，一开始播放就没了"。
+        # 那一刻抓到了窗口，但随后的渲染模式切换会让捕获失效"。
         # 手动操作时人按完 Alt+Enter 会自然停顿一下，所以手动没问题、
         # 程序自动化才会踩到 —— 这正是"手动可以、程序不行"的原因。
         self.fullscreen_settle = fullscreen_settle
@@ -189,15 +181,9 @@ class PlayerLauncher:
     def _focus_window(self, hwnd: int) -> None:
         """把播放器置前**并确保它有键盘焦点**。
 
-        **为什么不能只 `SetForegroundWindow`（核心踩坑）**：Windows 限制
-        "非前台进程不得抢焦点"，`SetForegroundWindow` 在被限制时**不报错、
-        静默失败** —— 窗口可能被提到前面，但键盘焦点仍在别处。此时后续发的
-        `Alt+Enter` / 插帧键全部打到别的窗口上。
-
-        实测症状：日志打印"已将 PotPlayer 置前"、`已发送按键：alt+enter`，
-        但播放器**没有全屏**，且没有任何报错（因为确实没抛异常）。
-        手动用鼠标点一下播放器再按 Alt+Enter 就能全屏 —— 这正是"焦点没给到"
-        的典型表现。
+        Windows 限制"非前台进程不得抢焦点"，`SetForegroundWindow` 在被限制时
+        **不报错、静默失败** —— 窗口可能被提到前面，但键盘焦点仍在别处。
+        此时后续发的`Alt+Enter` / 插帧键全部打到别的窗口上。
 
         解法是标准的 `AttachThreadInput` 组合拳：把自己的输入线程附加到
         目标窗口所在线程，两者的输入队列合并后，`SetForegroundWindow`
@@ -262,16 +248,11 @@ class PlayerLauncher:
     def _ensure_fullscreen(self, hwnd: int, wait: float = 3.0) -> bool:
         """按配置的全屏快捷键切换全屏，并**等窗口真的铺满屏幕**。
 
-        **为什么必须真全屏（实测）**：小黄鸭的 WGC 捕获按"捕获那一刻的窗口
-        尺寸"锁定输出尺寸 ——
+        小黄鸭的 WGC 捕获按"捕获那一刻的窗口尺寸"锁定输出尺寸 ——
           - 窗口化：画面缩小 + 四周黑边
           - 最大化：帧数极不稳定，甚至只有几帧
           - **真全屏（覆盖任务栏）**：帧数正常 ✓
         因此这一步不是"锦上添花"，而是 LS 出画的前提。
-
-        **为什么无条件发、不先判断**：实测本程序启动的 PotPlayer 每次都是
-        窗口化（从未继承全屏），判断反而多一次无用比对；而这个键是
-        **有状态**的，一旦判断失误就会在窗口/全屏之间来回切。
 
         返回值：是否确认进入全屏。调用方据此决定要不要提示用户 ——
         失败时**仍继续**发插帧键（半好过完全没有），但要让用户知道。
@@ -283,7 +264,7 @@ class PlayerLauncher:
             return _is_fullscreen(hwnd)
         # 发键前**重新夺一次焦点**：小黄鸭启动时会异步弹出浏览器（欢迎页/
         # 更新页），可能在 _focus_window() 之后才抢走前台 —— 那样 alt+enter
-        # 就发到浏览器上了（实测症状：日志"取得焦点"却在 3s 后全屏超时）。
+        # 就发到浏览器上了。
         # 这里再夺一次，把"置前"与"发键"之间的窗口期压到最小。
         if win32gui.GetForegroundWindow() != hwnd:
             log.info("发全屏键前发现前台已变（当前=%s），重新夺回焦点",
@@ -300,11 +281,11 @@ class PlayerLauncher:
             time.sleep(0.1)
         # 没等到：可能是全屏动画慢 / 焦点没拿到（按键落空）/ 快捷键与
         # PotPlayer 不一致。不阻断流程，但必须让上层能提示用户。
-        rect = _window_rect(hwnd)
         log.warning("等 PotPlayer 全屏超时（%.1fs）—— 当前窗口矩形=%s，"
-                    "鼠标所在窗口=%s。请确认「全屏快捷键」配置与 PotPlayer "
-                    "一致（F5 → 基本 → 快捷键 里搜「全屏」）",
-                    wait, rect, _window_desc(_hwnd_at_cursor()))
+                    "鼠标所在窗口=%s。请确认设置页「全屏快捷键」与 "
+                    "PotPlayer 自身绑定的那一组一致",
+                    wait, _window_rect(hwnd),
+                    _window_desc(_hwnd_at_cursor()))
         return False
 
     def _send_shortcut(self) -> None:
@@ -332,9 +313,6 @@ class PlayerLauncher:
         try:
             import pyautogui
         except ImportError:
-            # **踩坑**：这两个库没装时，早期只记一句"pyautogui 发送失败"，
-            # 看起来像"快捷键发出去但没生效"，实际根本没发（实测踩过：
-            # 表现是小黄鸭起来了却不补帧）。这里把原因写死。
             log.error("未安装 pyautogui / keyboard，无法发送按键 —— "
                       "请执行：pip install pyautogui keyboard")
             return
@@ -347,7 +325,7 @@ class PlayerLauncher:
     def _wait_player_window(self, proc, timeout: float = 8.0) -> Optional[int]:
         """轮询等待 PotPlayer 主窗口出现（最多 timeout 秒）。
 
-        播放器从 Popen 到窗口可见通常要 1~3 秒，直接发快捷键会打空。
+        PotPlayer 从 Popen 到窗口可见通常要 1~3 秒，直接发快捷键会打空。
         播放器自己退出（poll() 非 None）时立即放弃等待。
         """
         from app.core.monitor import find_potplayer_hwnd   # 复用同一套窗口枚举

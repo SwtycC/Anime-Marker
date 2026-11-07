@@ -32,6 +32,16 @@ Item {
                    ? settingsBridge.getAll() : {}
     }
 
+    /// 把播放器的 path / fullscreen 回填到输入框。
+    ///
+    /// **不能在控件上直接绑 getValue**：那样用户改完路径点保存，
+    /// `save()` 之后 `loadConfig()` 会把字段刷回配置里的旧值。
+    function refreshPlayerFields() {
+        playerField.text = String(root.getValue("player.path", ""))
+        fullscreenShortcutField.value = String(
+            root.getValue("player.fullscreen", ""))
+    }
+
     /// 重新取字体列表（进入页面 / 上传成功后）
     function loadFontOptions() {
         if (typeof fontBridge !== "undefined" && fontBridge)
@@ -63,12 +73,14 @@ Item {
     Component.onCompleted: {
         loadConfig()
         loadFontOptions()
+        refreshPlayerFields()
     }
 
     // 每次切到本页时重新读取，避免外部改动后显示旧值
     function refresh() {
         loadConfig()
         loadFontOptions()
+        refreshPlayerFields()
     }
 
     /// 滚动到指定位置（截图/诊断用）
@@ -351,14 +363,15 @@ Item {
         v["bangumi.auto_complete_watched"] = autoCompleteBox.checked
         // 路径
         v["general.library_path"] = libraryField.text.trim()
-        v["general.player_path"] = playerField.text.trim()
         v["general.ls_path"] = lsField.text.trim()
+        // 播放器：路径与全屏快捷键成对提交（录制器暴露的是 `value`）
+        v["player.path"] = playerField.text.trim()
+        v["player.fullscreen"] = fullscreenShortcutField.value.trim()
         // 启动器
         v["launcher.enable_ls"] = enableLsBox.checked
         // 录制组件暴露的属性名是 `value`（不是 `text`）——
         // 录制结果已是规范格式（小写、+ 连接），只需去掉首尾空白
         v["launcher.ls_shortcut"] = lsShortcutField.value.trim()
-        v["launcher.fullscreen_shortcut"] = fullscreenShortcutField.value.trim()
         v["launcher.fullscreen_settle"] = fullscreenSettleField.value
         // 监控
         v["monitor.poll_interval"] = pollIntervalField.value
@@ -944,9 +957,37 @@ Item {
                     }
                 }
 
+                // ---- 播放器：哪个播放器 + 路径 + 全屏快捷键 ----
                 FormRow {
                     width: parent.width
-                    label: "PotPlayer 路径"
+                    label: "播放器"
+                    // 说明走 FormRow 内置的 `?` 弹窗
+                    hint: "本程序目前只支持 PotPlayer。\n\n"
+                    // 只读展示：**不用下拉**（只有一个选项，下拉没有意义，
+                    // 还会让人以为能切）。样式与只读的 AppTextField 一致：
+                    // 浅底色 + 次级文字，提示"不可改"。
+                    Rectangle {
+                        width: parent.width
+                        height: 34
+                        radius: Theme.radiusSm
+                        color: Theme.surfaceAlt
+                        border.width: Theme.lineThin
+                        border.color: Theme.border
+
+                        Text {
+                            anchors.left: parent.left
+                            anchors.leftMargin: Theme.spacingMd
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "PotPlayer"
+                            color: Theme.textSecondary
+                            font.pixelSize: Theme.fontMd
+                        }
+                    }
+                }
+
+                FormRow {
+                    width: parent.width
+                    label: "播放器路径"
                     Row {
                         width: parent.width
                         spacing: Theme.spacingMd
@@ -954,18 +995,53 @@ Item {
                         AppTextField {
                             id: playerField
                             objectName: "playerField"
-                        text: root.getValue("general.player_path", "")
+                            // 由 refreshPlayerFields() 回填
+                            // （不能直接绑 getValue：那样用户改了路径一保存
+                            //   就会被配置里的旧值刷掉，与其它行同一个道理）
                             width: parent.width - browsePlayerBtn.width - Theme.spacingMd
                         }
                         AppButton {
                             id: browsePlayerBtn
                             text: "浏览…"
                             onClicked: {
-                                var p = settingsBridge.pickFile("选择 PotPlayer", playerField.text)
+                                var p = settingsBridge.pickFile(
+                                            "选择 PotPlayer", playerField.text)
                                 if (p)
                                     playerField.text = p
                             }
                         }
+                    }
+                }
+
+                FormRow {
+                    width: parent.width
+                    label: "全屏快捷键"
+                    // 说明走 FormRow 内置的 `?` 弹窗
+                    hint: "播放前把 PotPlayer 切成真全屏用的快捷键，"
+                          + "必须与 PotPlayer 里绑定的一致（默认 alt+enter）。\n\n"
+                          + "为什么必须全屏：\n"
+                          + "小黄鸭的捕获按「捕获那一刻的窗口尺寸」出画 —— 窗口化"
+                          + "会出现黑边、最大化会帧数极不稳定，只有真全屏"
+                          + "（覆盖任务栏）才能拿到正常帧数。\n\n"
+                          + "怎么填：\n"
+                          + "点一下输入框，然后直接在键盘上按出组合键即可，不用手打。"
+                          + "按下最后一个键就自动完成；按 Esc 取消。\n\n"
+                          + "怎么核对：\n"
+                          + "PotPlayer 里按 F5 →「基本」→「快捷键」，搜「全屏」看它"
+                          + "绑的是哪组键。不一致的话按了没反应，"
+                          + "表现为「插帧一直不开」。\n\n"
+                          + "触发顺序：\n"
+                          + "① 启动 PotPlayer 并开始播放\n"
+                          + "② 按「全屏快捷键」\n"
+                          + "③ 等「全屏后等待」秒\n"
+                          + "④ 按「插帧快捷键」\n"
+                          + "第 ③ 步存在的原因见「全屏后等待」那一行的说明。"
+                    ShortcutRecorder {
+                        id: fullscreenShortcutField
+                        objectName: "fullscreenShortcutField"
+                        // 由 refreshPlayerFields() 回填
+                        width: parent.width
+                        placeholder: "点击后按下组合键"
                     }
                 }
 
@@ -1049,50 +1125,21 @@ Item {
                     }
                 }
 
-                FormRow {
-                    width: parent.width
-                    label: "全屏快捷键"
-                    // 说明走 FormRow 内置的 `?` 弹窗
-                    hint: "播放前把 PotPlayer 切成真全屏用的快捷键。\n\n"
-                          + "为什么必须全屏：\n"
-                          + "小黄鸭的捕获按「捕获那一刻的窗口尺寸」出画 —— 窗口化"
-                          + "会出现黑边、最大化会帧数极不稳定，只有真全屏"
-                          + "（覆盖任务栏）才能拿到正常帧数。\n\n"
-                          + "怎么填：\n"
-                          + "点一下输入框，然后直接在键盘上按出组合键即可，不用手打。"
-                          + "按下最后一个键就自动完成；按 Esc 取消。\n\n"
-                          + "要按成什么：\n"
-                          + "PotPlayer 默认是 alt+enter。若你改过，按 F5 →「基本」"
-                          + "→「快捷键」里搜「全屏」，看它绑的是哪组键，"
-                          + "这里就按哪组 —— 不一致的话按了没反应，"
-                          + "表现为「插帧一直不开」。\n\n"
-                          + "触发顺序：\n"
-                          + "① 启动 PotPlayer 并开始播放\n"
-                          + "② 按「全屏快捷键」\n"
-                          + "③ 等「全屏后等待」秒\n"
-                          + "④ 按「插帧快捷键」\n"
-                          + "第 ③ 步存在的原因见「全屏后等待」那一行的说明。"
-                    ShortcutRecorder {
-                        id: fullscreenShortcutField
-                        objectName: "fullscreenShortcutField"
-                        value: root.getValue("launcher.fullscreen_shortcut", "")
-                        width: parent.width
-                        placeholder: "点击后按下组合键"
-                    }
-                }
+                // 「全屏快捷键」已移到上面「路径」区的播放器档案里 ——
+                // 它跟播放器绑定，和路径必须成对改（见那里的说明）。
 
                 FormRow {
                     width: parent.width
                     label: "全屏后等待"
                     hint: "「全屏后等待」是做什么的？\n\n"
-                          + "PotPlayer 达到全屏尺寸后，可能仍在切换渲染模式。"
+                          + "播放器达到全屏尺寸后，可能仍在切换渲染模式。"
                           + "此时过早就发送插帧快捷键，小黄鸭虽然当场抓到了窗口，"
                           + "但随后的渲染模式切换会让捕获失效 —— "
                           + "表现为「全屏后右上角有帧数，一开始播放就没了」。\n\n"
                           + "这个等待就是为了让渲染模式切换完成后再发插帧键。"
                           + "机器较慢或播放器启动慢时可调大。\n\n"
                           + "「为什么必须先全屏」「怎么核对播放器的全屏键」"
-                          + "见「全屏快捷键」那一行的说明。"
+                          + "见上面「路径 → 全屏快捷键」那一行的说明。"
                     NumberStepper {
                         id: fullscreenSettleField
                         objectName: "fullscreenSettleField"

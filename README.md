@@ -127,7 +127,8 @@ main.py                 入口（run_qml.py 为兼容转发）
 app/qml/                QML 界面（页面、组件、Theme 单例）
 app/bridges/            QML ↔ Python 桥接层（Property / Signal / Slot）
 app/core/               业务逻辑（scanner / matcher / bangumi_api / monitor /
-                        launcher / database / config / rss_* / qbittorrent_api）
+                        launcher / player_profiles / database / config /
+                        rss_* / qbittorrent_api）
 app/utils/              工具（paths / logger / cover_cache / title_parser）
 resources/icons/        图标（SVG）
 data/                   运行时数据（SQLite 库、封面缓存、日志）—— 自动生成

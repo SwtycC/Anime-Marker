@@ -1,7 +1,14 @@
 """配置读取/写入（config.ini）。
 
 首次打开时若文件不存在，按 DEFAULTS 生成；
-后续打开时补齐缺失的 section / option，便于版本升级。
+后续打开时：
+
+1. **先跑版本迁移**（`core/config_migrations.py`）—— 处理"键改名 /
+   挪位置 / 废弃"这类结构变化，旧值搬进新键、旧键删掉、并留一份备份；
+2. **再补齐缺失的 section / option** —— 处理"新增键"。
+
+顺序不能反：迁移要在补默认值之前，否则新键已被填成默认值，
+迁移函数就分不清"用户没填"和"用户填了默认值"，无法判断该不该搬。
 """
 
 from __future__ import annotations
@@ -11,13 +18,26 @@ from pathlib import Path
 from typing import Any
 
 from app import USER_AGENT
+from app.core import config_migrations
 from app.utils.paths import config_path
 
 DEFAULTS: dict[str, dict[str, str]] = {
+    # 配置自身的元信息（不由设置页读写）。
+    #
+    # `config_version` = 这份配置的**结构最后迁移到的版本**，迁移框架
+    # 据此判断该跑哪些步骤（见 core/config_migrations.py）。它**不等于**
+    # "最后打开它的软件版本"：只发版、没有结构变化时不会更新。
+    # 全新安装由 `_init_defaults` 按当前版本写入，不需要在这里写死。
+    #
+    # **放在第一个**：写出的 config.ini 以它开头，打开文件一眼能看到
+    # 这份结构属于哪个版本。`save()` 会按这个顺序重排节。
+    "meta": {
+        "config_version": "",
+    },
     "general": {
         "library_path": "",
-        "player_path": r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
-        "ls_path": r"C:\Program Files\Lossless Scaling\LosslessScaling.exe",
+        # **路径类一律给空串填。
+        "ls_path": "",
     },
     "bangumi": {
         "token": "",
@@ -120,12 +140,25 @@ DEFAULTS: dict[str, dict[str, str]] = {
         #   关：沿用旧行为（在正片之后顺延 13.5 / 14 / 14.5…）。
         "extra_numbering": "true",
     },
+    # 播放器。
+    #
+    # 路径与**该播放器自己的**全屏快捷键放在一起：全屏键由播放器定义
+    # （PotPlayer 是 alt+enter），配错的表现是"按了没反应 → 插帧一直不开"。
+    #
+    # 目前只支持 PotPlayer（进度读取绑死了它的接口），所以只有一组值；
+    # 将来支持多播放器时再加"档案名"这一层，现在不预留。
+    #
+    # 首次使用时由设置页「浏览…」选定，空串会被
+    # `PlayerLauncher._check_exists` 拦成「路径未配置」。
+    "player": {
+        "path": "",
+        "fullscreen": "",
+    },
     "launcher": {
         "enable_ls": "true",
         # **必须与小黄鸭「设置 → 缩放快捷键」里的值一致**，否则按了也没反应。
-        "ls_shortcut": "ctrl+alt+p",
-        # PotPlayer 的「全屏/还原」快捷键（默认 alt+enter）。
-        "fullscreen_shortcut": "alt+enter",
+        # 初始空串：没配小黄鸭时不往系统里发任何热键。
+        "ls_shortcut": "",
         # 全屏后、发插帧键前的额外等待（秒）。PotPlayer 达到全屏尺寸后可能
         # 仍在切换渲染模式，太早发插帧键会让小黄鸭的捕获失效 
         # 更快的机器可调小、更慢的调大（设置页「全屏后等待」）。
@@ -186,12 +219,18 @@ class Config:
             self._init_defaults()
         else:
             self._parser.read(self.path, encoding="utf-8")
+            # ① 结构迁移（改名/搬迁/废弃）必须先于 ② 补默认值，
+            #    见模块 docstring
+            if config_migrations.run(self):
+                self.save()
             self._ensure_sections()
 
     # ---------- 初始化 ----------
     def _init_defaults(self) -> None:
         for section, kv in DEFAULTS.items():
             self._parser[section] = dict(kv)
+        # 全新配置直接记成当前版本：没有旧结构要迁，也就不需要备份
+        config_migrations.mark_current(self)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.save()
 
@@ -226,9 +265,54 @@ class Config:
             self._parser.add_section(section)
         self._parser.set(section, key, str(value))
 
+    # `has_option` / `remove_option` 是给 config_migrations 用的 ——
+    # 迁移函数只该调 Config 的方法，不该直接摸 `self._parser`（实现细节）。
+    def has_option(self, section: str, key: str) -> bool:
+        return self._parser.has_option(section, key)
+
+    def has_section(self, section: str) -> bool:
+        return self._parser.has_section(section)
+
+    def remove_option(self, section: str, key: str) -> bool:
+        """删掉一项；不存在返回 False（**不抛异常**，迁移里可放心调）。"""
+        if not self._parser.has_option(section, key):
+            return False
+        return self._parser.remove_option(section, key)
+
     def save(self) -> None:
+        self._reorder_sections()
         with self.path.open("w", encoding="utf-8") as f:
             self._parser.write(f)
+
+    def _reorder_sections(self) -> None:
+        """按 `DEFAULTS` 的键顺序重排节，让文件打开时层次稳定。
+
+        **为什么需要**：`configparser` 把节存在 dict 里，`set` / 新增节
+        一律**追加到末尾**。因此 `meta` 即便是 `DEFAULTS` 的第一项，
+        老用户盘上那份也会因为它"早已存在"而留在文件末尾（`[meta]` 在
+        最下面是第 74 行那种观感）。这里在每次写盘前统一按 `DEFAULTS`
+        的顺序摆好，新旧配置就都从 `[meta]` 开始了。
+
+        不在 `DEFAULTS` 里的节（用户手加的、或早期版本遗留的）保持原有
+        相对顺序，统一排在后面 —— 不能丢，丢了等于吃掉用户的配置。
+        """
+        known = [s for s in DEFAULTS if self._parser.has_section(s)]
+        extra = [s for s in self._parser.sections() if s not in DEFAULTS]
+        order = known + extra
+        if order == self._parser.sections():
+            return                  # 已经是期望顺序，省掉一次重建
+
+        # ConfigParser 没有"移动节"的接口，只能按目标顺序重建一份
+        old = self._parser
+        new = configparser.ConfigParser()
+        # 保留大小写选项（与 old 一致）与非严格解析行为
+        new.optionxform = old.optionxform
+        new.defaults().clear()
+        for section in order:
+            new.add_section(section)
+            for key, value in old.items(section, raw=True):
+                new.set(section, key, value)
+        self._parser = new
 
     # ---------- 便捷访问 ----------
     @property

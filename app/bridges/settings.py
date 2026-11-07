@@ -30,11 +30,12 @@ ALLOWED_KEYS = {
     "bangumi.ep_timeline_count", "bangumi.auto_upload",
     "bangumi.auto_complete_watched",
     # 路径
-    "general.library_path", "general.player_path", "general.ls_path",
+    "general.library_path", "general.ls_path",
+    # 播放器（路径 + 该播放器自己的全屏快捷键，见 core/player_profiles）
+    "player.path", "player.fullscreen",
     # 启动器
     "launcher.enable_ls", "launcher.ls_shortcut", "launcher.ls_start_delay",
-    "launcher.player_start_delay", "launcher.fullscreen_shortcut",
-    "launcher.fullscreen_settle",
+    "launcher.player_start_delay", "launcher.fullscreen_settle",
     # 监控
     "monitor.poll_interval", "monitor.trigger_threshold", "monitor.title_regex",
     # 扫描与匹配
@@ -52,7 +53,11 @@ ALLOWED_KEYS = {
     "library.rank_refresh_days",
 }
 
-# 读取时的默认值（config.ini 缺项时兜底，与 config.DEFAULTS 保持一致）
+# 读取时的默认值（config.ini 缺项时兜底，与 config.DEFAULTS 保持一致）。
+#
+# **路径类一律不在这里兜底**，缺项就是空串：
+#
+#   `player.path` / `general.ls_path`
 FALLBACKS: dict[str, str] = {
     "bangumi.token": "",
     "bangumi.username": "",
@@ -62,11 +67,12 @@ FALLBACKS: dict[str, str] = {
     "bangumi.auto_upload": "true",
     "bangumi.auto_complete_watched": "true",
     "general.library_path": "",
-    "general.player_path": r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
-    "general.ls_path": r"C:\Program Files\Lossless Scaling\LosslessScaling.exe",
+    # 路径：不兜底，缺项 = 空串
+    "general.ls_path": "",
+    "player.path": "",
+    "player.fullscreen": "",
     "launcher.enable_ls": "true",
-    "launcher.ls_shortcut": "ctrl+alt+p",
-    "launcher.fullscreen_shortcut": "alt+enter",
+    "launcher.ls_shortcut": "",
     "launcher.fullscreen_settle": "3.0",
     "monitor.poll_interval": "3",
     "monitor.trigger_threshold": "0.90",

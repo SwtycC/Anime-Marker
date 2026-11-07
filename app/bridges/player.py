@@ -26,6 +26,7 @@ from PySide6.QtCore import (Q_ARG, QMetaObject, QObject, Property, QRunnable,
 from app.core.bangumi_api import BangumiClient
 from app.core.config import Config
 from app.core.database import Database, Episode
+from app.core import player_profiles
 from app.core.launcher import LauncherError, PlayerLauncher
 from app.core.monitor import ProgressMonitor
 
@@ -46,7 +47,7 @@ class _LaunchWorker(QRunnable):
         fullscreen_settle   → time.sleep(...)                 默认 3.0s
 
     而 `playEpisode` 是 QML 直接调的 Slot，**跑在 UI 线程上** —— 这段时间
-    窗口完全冻结。用户此时去关掉小黄鸭（正是实测的操作），点击落在冻结的
+    窗口完全冻结。用户此时去关掉小黄鸭），点击落在冻结的
     界面上，Windows 立刻判"未响应"。
 
     原注释写的"启动进程很快，不阻塞"只对第一个 `Popen` 成立，忽略了后面
@@ -113,10 +114,6 @@ class PlayerBridge(QObject):
     #: 读的是 `max_watched_ep_index` 与 Bangumi 缓存 —— 本地观看记录变了，
     #: 那一行就该重算。只发一个无参信号，QML 侧也能整体重取，但带上 id
     #: 便于日志说明"刷的是哪一部"，也方便将来做"只刷这一行"的优化。
-    #:
-    #: **为什么需要这个信号**：原先播放结束后没有任何东西通知在看页，
-    #: 用户必须切到别的页再切回来（`onCurrentPageChanged` 里那次
-    #: `reloadInProgress()`）才能看到进度更新。
     playbackStopped = Signal(int)
 
     def __init__(
@@ -186,8 +183,9 @@ class PlayerBridge(QObject):
         一次性读入的，改完配置不重启程序不生效。表现就是"勾了自动上传，
         看完这集仍只写本地，得手动刷新才补传上 Bangumi"。
 
-        `player_path` / `ls_path` 等启动参数不需要同步 —— `playEpisode()`
-        每次播放都现读配置（见该方法内构造 `PlayerLauncher` 的地方）。
+        `player.path` / `player.fullscreen` / `ls_path` 等启动参数不需要
+        同步 —— `playEpisode()` 每次播放都现读配置
+        （见该方法内构造 `PlayerLauncher` 的地方）。
         """
         self._monitor.apply_config(
             poll_interval=self._config.getint("monitor", "poll_interval", 3),
@@ -268,13 +266,15 @@ class PlayerBridge(QObject):
             self.failed.emit("未找到该集")
             return False
 
+        # 路径与全屏快捷键**成对**读（见 core/player_profiles）：全屏键由
+        # 播放器自己定义，配错的表现是"按了没反应、插帧一直不开"。
+        player_path, fullscreen_shortcut = player_profiles.resolve(self._config)
         launcher = PlayerLauncher(
-            player_path=self._config.get("general", "player_path", ""),
+            player_path=player_path,
             ls_path=self._config.get("general", "ls_path", ""),
             enable_ls=self._config.getbool("launcher", "enable_ls", True),
             ls_shortcut=self._config.get("launcher", "ls_shortcut", "ctrl+alt+p"),
-            fullscreen_shortcut=self._config.get(
-                "launcher", "fullscreen_shortcut", "alt+enter"),
+            fullscreen_shortcut=fullscreen_shortcut,
             fullscreen_settle=self._config.getfloat(
                 "launcher", "fullscreen_settle", 3.0),
             ls_start_delay=self._config.getfloat("launcher", "ls_start_delay", 5.0),
