@@ -24,10 +24,7 @@ ApplicationWindow {
 
     // 初始尺寸由 Python 算好后注入（`windowStartup`，见 QmlApp.run 的说明）。
     //
-    // **为什么不写死**（踩坑：启动瞬间下半截黑边）：窗口一旦 `visible: true`
-    // 就会立刻渲染首帧，而 Python 侧改尺寸是在 QML 加载**之后**才做的。
-    // 早期这里写死 1120×720、随后被改到 860 高，新长出来的那 140px
-    // 来不及绘制 → 下半截先显示为黑色。
+    // 窗口一旦 `visible: true`就会立刻渲染首帧，而 Python 侧改尺寸是在 QML 加载**之后**才做的。
     // 现在尺寸随主题一起在 load 之前注入，首帧就是最终尺寸。
     //
     // 兜底：注入缺失时（如组件被单独加载、或注入那段被误改）回退到
@@ -78,9 +75,8 @@ ApplicationWindow {
         // 海报墙与详情页共用一层子栈：详情不是独立的一级导航页，
         // 从海报墙点进去、返回后仍回到海报墙（与旧版 MainWindow.browse_stack 一致）。
         //
-        // **踩坑（两层栈：改了内层却看不见）**：详情页在**内层** `browseStack` 里，
-        // 而动态页 / 收藏页是外层 `pageStack` 的**平级页**。从它们那里只写
-        //     browseStack.currentIndex = 1
+        // 详情页在**内层** `browseStack` 里，而动态页 / 收藏页是外层 `pageStack` 的**平级页**。
+        // 从它们那里只写    browseStack.currentIndex = 1
         // 是**完全没有反应**的 —— 外层还停在原来的页面，内层切到哪都看不见。
         // 海报墙不受影响（外层本来就在 browseStack 上），所以这个 bug 只在
         // "从动态页 / 收藏页进详情"时暴露。
@@ -89,7 +85,7 @@ ApplicationWindow {
         //     window.currentPage = 0         // 外层：切回 browseStack 所在的那一层
         // 之所以赋给 `window.currentPage` 而不是 `pageStack.currentIndex`：
         // 后者本身是 `currentIndex: window.currentPage` 的绑定，
-        // 直接赋值会**永久断开该绑定**（同类坑见 TimelinePage 里 entries 的注释）。
+        // 直接赋值会**永久断开该绑定**。
         StackLayout {
             id: pageStack
             objectName: "pageStack"
@@ -135,7 +131,7 @@ ApplicationWindow {
                     detailOriginPage = window.currentPage    // 必须在切页**之前**记
                     detailPage.load(subjectId)
                     browseStack.currentIndex = 1
-                    // **必须同时把外层栈切到 browseStack**（见下方踩坑）
+                    // **必须同时把外层栈切到 browseStack**
                     window.currentPage = 0
                 }
                 // 未入库的行点不出详情 —— 由页面发提示
@@ -169,7 +165,7 @@ ApplicationWindow {
                     detailOriginPage = window.currentPage    // 必须在切页**之前**记
                     detailPage.load(subjectId)
                     browseStack.currentIndex = 1
-                    // **必须同时把外层栈切到 browseStack**（见下方踩坑）
+                    // **必须同时把外层栈切到 browseStack**
                     window.currentPage = 0
                 }
                 // 未入库的行点不出详情 —— 由页面发提示（"未入库，无法打开详情"）
@@ -368,7 +364,14 @@ ApplicationWindow {
         // 每条目只查一次"的闸门兜底（见那里注释），所以这个 reload 不会
         // 变成"reload → 回查 → collectTypeChanged → reload"的循环。
         function onCollectTypeChanged(subjectId) {
-            if (detailPage.subjectId !== subjectId)
+            // 0 = 批量变化（整批收藏同步，见 LibraryBridge 的信号声明）。
+            // 这时不知道是哪一条变了，**当前打开着详情页就刷新它** ——
+            // 否则用户正看着的那一部会停在同步前的状态，非得退出去再进来。
+            // 单条变化（subjectId > 0）仍然只处理匹配的那一条，避免
+            // 无关条目的写入把详情页也白刷一遍。
+            if (detailPage.subjectId <= 0)
+                return
+            if (subjectId !== 0 && detailPage.subjectId !== subjectId)
                 return
             // 走与 `onSubjectsChanged` 同一条轻量路径（只换 collectType 字段，
             // 不重取整条、不滚回顶部）。早期这里调的是 `load(subjectId)` ——

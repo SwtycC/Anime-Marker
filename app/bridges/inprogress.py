@@ -1,4 +1,4 @@
-"""Bangumi 收藏列表桥接（阶段 7 · F18 的 QML 版本）。
+"""Bangumi 收藏列表桥接。
 
 职责：从 Bangumi 拉取「当前用户 · **全部收藏状态**」收藏，写入
 `inprogress_cache`，然后通知 `LibraryBridge` 刷新（QML 侧读 `library.inProgress`）。
@@ -9,7 +9,7 @@
 > **动态页的候选是全部状态**（逐集记录主要产生于追番期间，但看过/搁置的
 > 条目同样可能有逐集标记）。
 
-> **命名说明**：表名、Property 名都还叫 `inprogress*`（沿用 F18 的旧实现），
+> **命名说明**：表名、Property 名都还叫 `inprogress*`，
 > 但**语义已改为「看过」**。之所以不改名，是因为要动 `inprogress_cache` 表、
 > `library.inProgress`、`InProgressPage` 一整条链路，收益仅是"名字更好看"，
 > 而风险是漏改某处导致静默失效。这里用注释显式记录，避免后人误判。
@@ -454,7 +454,7 @@ class _EpisodeWorker(NamedThread):
 
         # ---- 每个线程一个独立 Session ----
         #
-        # **踩坑（性能）**：`requests.Session` **不是线程安全的**。
+        # `requests.Session` **不是线程安全的**。
         # 多线程共享同一个 Session 时，内部连接池会成为瓶颈。
         # 原因是共享 Session 的 `HTTPAdapter` 在多线程下会争用同一批连接，
         # 叠加本项目配置的 3 次重试与指数退避，耗时被放大 20 倍以上。
@@ -802,7 +802,12 @@ class InProgressBridge(QObject):
         self._api = api
 
     def set_done_hook(self, hook) -> None:
-        """设置拉取成功后的回调（通常是 library.reloadInProgress）。"""
+        """设置拉取成功后的回调（通常是 library.reloadAfterCollectSync）。
+
+        **不要传 `reloadInProgress`**：那个槽只作用于「在看」列表、
+        故意不发收藏状态通知；整批同步回填了 `subjects.collect_type`，
+        必须走会补发 `collectTypeChanged` 的版本，否则海报墙筛选不更新。
+        """
         self._done_hook = hook
 
     def set_episode_done_hook(self, hook) -> None:

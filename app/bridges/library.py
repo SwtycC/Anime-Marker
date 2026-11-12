@@ -159,6 +159,28 @@ class _RankRefreshWorker(NamedThread):
         self._api = api
         #: [(本地 subject_id, bangumi_id), ...]
         self._pairs = pairs
+        #: 退出时由 `waitRankWorker` 置位。**只在条目之间检查** —— 一轮
+        #: 跑起来要几分钟，不可能等它自然结束（见 waitRankWorker 说明）。
+        #: 用普通布尔而不是 threading.Event：GIL 保证这里读写是原子的，
+        #: 且只需要"最迟下一条看到"的语义，不需要唤醒阻塞中的等待。
+        self._stop = False
+
+    def requestStop(self) -> None:
+        """请求在本条请求结束后停止（退出时调用，见 `waitRankWorker`）。"""
+        self._stop = True
+
+    def _sleep(self, seconds: float) -> None:
+        """可被 `requestStop()` 打断的等待。
+
+        **为什么不能直接 `time.sleep(REQUEST_INTERVAL)`**：那是整整 1 秒
+        的不可打断睡眠，退出时只能干等；拆成 100ms 一片，停止请求最迟
+        100ms 后就会被看到。真正的最坏延迟是"正在飞的那个 HTTP 请求"
+        （6 秒超时，见 BangumiClient），这也是 waitRankWorker 默认值取
+        7 秒的原因。
+        """
+        end = time.monotonic() + seconds
+        while not self._stop and time.monotonic() < end:
+            time.sleep(min(0.1, end - time.monotonic()))
 
     def run(self) -> None:
         ok = fail = 0
@@ -167,6 +189,14 @@ class _RankRefreshWorker(NamedThread):
         # 逐条串行：`requests.Session` 不是线程安全的（同 _UploadWorker 的
         # 说明），而且限速本来就要求串行。
         for i, (sid, bid) in enumerate(self._pairs, start=1):
+            if self._stop:
+                # **刻意不发 `done`**：`_on_rank_done` 会写刷新水位，
+                # 而这一轮只跑了一部分 —— 写了水位就会把没刷到的条目
+                # 拖到下一次自动刷新（最长一个星期）。不写水位则下次
+                # 符合条件时整轮重来，最多浪费已刷过的那几条。
+                log.info("排名刷新收到停止请求（已完成 %s/%s），本轮不记水位",
+                         i - 1, total)
+                return
             try:
                 subj = self._api.get_subject(bid)
                 self._db.update_rank_score(
@@ -182,7 +212,7 @@ class _RankRefreshWorker(NamedThread):
                     error = str(e)
             self.progress.emit(i, total)
             if i < total:
-                time.sleep(self.REQUEST_INTERVAL)
+                self._sleep(self.REQUEST_INTERVAL)
         log.info("排名刷新完成：成功 %s / %s 条，失败 %s 条", ok, total, fail)
         self.done.emit(ok, total, fail, error)
 
@@ -380,7 +410,12 @@ class LibraryBridge(QObject):
 
     # 数据变化通知（QML 侧用它触发列表重建）
     subjectsChanged = Signal()
-    #: 某条目的收藏状态变化（参数：subject_id）—— 详情页那排状态选择器刷新
+    #: 某条目的收藏状态变化（参数：subject_id）—— 详情页那排状态选择器刷新。
+    #: **0 = 批量变化 / 来源未知**（整批收藏同步后由
+    #: `reloadAfterCollectSync` 发出）：两个聚合 Property
+    #: （`collectTypes` / `collectOptions`）需要它来重算，而具体 id 对它们
+    #: 没有意义；本地主键从 1 起，0 不会与真实条目撞车。
+    #: QML 侧（Main.qml）收到 0 时应刷新当前打开的详情页而不是按 id 比较。
     collectTypeChanged = Signal(int)
     episodesChanged = Signal()
     inProgressChanged = Signal()
@@ -500,6 +535,47 @@ class LibraryBridge(QObject):
             self._rank_startup_timer.setSingleShot(True)
             self._rank_startup_timer.timeout.connect(self.refreshRank)
         self._rank_startup_timer.start(60 * 1000)
+
+    def waitRankWorker(self, ms: int = 7000) -> None:
+        """退出时**先停止、再等待**排名刷新线程（QmlApp.shutdown 调用）。
+
+        排名刷新一轮要「条目数 × 1 秒」（上百部就是两三分钟），用户完全
+        可能在它跑着的时候关软件。这时若不等，Python 侧 `LibraryBridge`
+        先析构 → 它持有的 QThread 对象跟着销毁 → 撞上 qt_thread 模块
+        说明里的那颗雷（Qt 6 上是 `qFatal`，进程直接被杀，日志断在半截）。
+
+        **光等是不够的**：一轮几分钟，等 3 秒等于没等。必须先
+        `requestStop()`，让 worker 在**下一条**开始前退出；等待只是给
+        它收尾的时间。
+
+        **默认 7 秒的来历**：停止只在条目之间检查，最坏情况是"停下时
+        正好有一个请求在飞"，而 `BangumiClient.timeout = 6.0`。常见情况
+        （在两条之间的睡眠里）100ms 内就结束，不会真让用户等 7 秒。
+
+        **超时也不强杀**：worker 可能正持有 `Database._lock`，`terminate()`
+        会把锁永久留死，随后 `db.close()` 直接挂住 —— 那比崩溃更难排查。
+        所以超时只记 warning 并继续关闭流程。请求超时是 6 秒，正常情况下
+        不会等满 7 秒；真超时说明请求卡得比客户端超时还久（极端网络 /
+        接口异常），此时仍可能撞上 Qt 析构，日志要留下证据。
+
+        被停止时 worker **不发 `done`**，因此不会写刷新水位；下次
+        `maybeAutoRefreshRank()` 判定到期时会整轮重来（见 worker 的说明）。
+        顺序上必须在 `self._db.close()` **之前**调用，否则线程里正在
+        `update_rank_score()` 会撞上已关闭的连接。
+        """
+        # 计时器可能还没触发（60 秒延迟启动）：先停掉，免得关闭过程中再起一轮
+        if self._rank_startup_timer is not None:
+            self._rank_startup_timer.stop()
+        w = self._rank_worker
+        try:
+            if w is not None and w.isRunning():
+                log.info("请求停止排名刷新线程…")
+                w.requestStop()
+                if not w.wait(ms):
+                    log.warning("排名刷新线程 %s 秒内未结束（网络可能卡在超时）",
+                                ms // 1000)
+        except RuntimeError:            # C++ 对象已被回收
+            pass
 
     @Slot()
     def refreshRank(self) -> None:
@@ -673,9 +749,53 @@ class LibraryBridge(QObject):
 
     @Slot()
     def reloadInProgress(self) -> None:
-        """仅刷在看列表（在线拉取完成后由 InProgressBridge 调用）。"""
+        """只让「在看」列表重取数据（**不发收藏状态通知**）。
+
+        高频路径（播放结束、切页）用它：只标 `_inprogress_dirty` 并发
+        `inProgressChanged`，QML 只是重读 Property，不重建海报墙卡片。
+
+        **为什么不在这里发 `collectTypeChanged`**：播放结束不会改
+        `collect_type`（自动完结走的是 `reload()`）。无条件发会让海报墙
+        每次播放结束都重查一遍状态映射 —— 虽然只是一条两列 SQL，但没有
+        任何数据变化支撑，属于该省就省的高频开销。
+
+        整批收藏同步完成请走 `reloadAfterCollectSync()`。
+        """
         self._inprogress_dirty = True
         self.inProgressChanged.emit()
+
+    @Slot()
+    def reloadAfterCollectSync(self) -> None:
+        """整批收藏同步完成后调用（InProgressBridge 的 done_hook）。
+
+        刷新范围：**在看列表 + 收藏状态映射**，但**不重建海报墙卡片**。
+
+        **为什么必须补发 `collectTypeChanged`**：
+
+        `inprogress.py` 拉完收藏后先 `replace_inprogress_cache()` ——
+        那一步末尾的 `_COLLECT_TYPE_BACKFILL_SQL` 会把新状态**写回
+        `subjects.collect_type`**。数据是对的，但没有任何信号告诉 QML。
+        于是：
+
+          ① 详情页因为 `requestCollectType()` 命中缓存、自己写了库并发信号，
+             能正确显示「看过」；
+          ② 海报墙却没收到任何通知 —— `collectTypes` 是带 notify 的
+             Property，不发信号就不重算，那一部在「收藏状态」筛选里
+             还算「未标记」，非得重扫 / 进详情页才对。
+
+
+        **参数传 0**（"批量 / 未知"的约定，见 `collectTypeChanged` 的
+        声明处）：`collectTypes` / `collectOptions` 都是**整表重取**，
+        具体哪个 id 变了对它们没有意义，传任何一个真实 id 反而会
+        冒充"只有它变了"。
+
+        **为什么不能用 `reload()`**：那会发 `subjectsChanged`，海报墙的
+        `Repeater` 会**销毁重建全部卡片**（每张重新解码封面）。一次同步
+        可能改动几十条的收藏状态，而墙上筛选只需要重读那份两列映射，
+        不值得付出整墙重建的代价。
+        """
+        self.reloadInProgress()
+        self.collectTypeChanged.emit(0)
 
     # ---------- Bangumi 收藏列表（阶段 7）----------
     @Property("QVariantList", notify=inProgressChanged)
@@ -2166,16 +2286,6 @@ class LibraryBridge(QObject):
 
     def _original_cover_path(self, s: Subject) -> Path:
         """原版海报的本地缓存路径（按实际情况探测，不靠猜）。
-
-        **踩坑（两种命名混用，导致"更换海报"一打开就显示已自定义）**：
-        原版缓存文件是 `scanner` / `match` 写的，两者传给
-        `cover_cache.download()` 的都是 **bangumi_id**（见 scanner.py 与
-        match.py 的调用点），所以真实文件名是 `covers/<bangumi_id>.<ext>`。
-        这里如果按 `s.id` 反推，只要本地 id 与 bangumi_id 不等，就会算出一个**不存在的
-        路径**，于是：
-          - `coverInfo().isCustom` 恒为 True → 小窗一打开就打上「自定义」
-            徽标、「恢复原版海报」按钮错误地可点；
-          - `restoreCover()` 认为原版不存在 → 白下载一次（或断网直接失败）。
 
         改为按优先级探测真实文件：
           bangumi_id → subject_id（兼容早期按本地 id 命名的数据）

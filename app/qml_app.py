@@ -144,8 +144,12 @@ class QmlApp:
         self.player_bridge.playbackStopped.connect(self._on_playback_stopped)
         self.match_bridge = MatchBridge(self.db, self.api)
         self.inprogress_bridge = InProgressBridge(self.db, self.config, self.api)
-        # 收藏列表拉取完成后，让 QML 侧的 library.inProgress 重新取数
-        self.inprogress_bridge.set_done_hook(self.library_bridge.reloadInProgress)
+        # 收藏列表拉取完成后，让 QML 侧的 library.inProgress 重新取数，
+        # 并补发收藏状态通知（同步会回填 subjects.collect_type，海报墙
+        # 的筛选映射要跟着重算）。**不能挂 reloadInProgress**：那个槽
+        # 故意不发 collectTypeChanged（播放结束的高频路径用它）。
+        self.inprogress_bridge.set_done_hook(
+            self.library_bridge.reloadAfterCollectSync)
         # 集级观看记录（第二阶段）拉完后，刷新动态页数据源
         self.inprogress_bridge.set_episode_done_hook(
             self.library_bridge.reloadWatchedEpisodes)
@@ -715,6 +719,14 @@ class QmlApp:
             self.library_bridge.waitCollectWorkers()
         except Exception as e:  # pragma: no cover - 防御性
             log.warning("等待收藏状态写入结束失败：%s", e)
+        # 排名刷新线程：一轮要「条目数 × 1 秒」，关软件时很可能还在跑。
+        # 不等的话 QThread 会在运行中被销毁 ——
+        #   QThread: Destroyed while thread '_RankRefreshWorker' is still running
+        # 它也在写库（update_rank_score），必须在 db.close() 之前收尾。
+        try:
+            self.library_bridge.waitRankWorker()
+        except Exception as e:  # pragma: no cover - 防御性
+            log.warning("等待排名刷新线程结束失败：%s", e)
         # 「下载完自动扫描」的后台轮询：先停掉，免得关闭过程中又发起一次扫描
         try:
             self.rss_bridge.stopScanWatch()
