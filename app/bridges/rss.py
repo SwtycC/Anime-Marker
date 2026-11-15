@@ -260,9 +260,6 @@ class _FeedTitleWorker(NamedThread):
 class _CreateSubjectWorker(NamedThread):
     """从订阅源新建本地条目（可带 Bangumi 匹配）。
 
-    需求："条目名先从订阅源中获取，自动填入文本框，然后支持
-    手动修改。需要匹配，没填 token 则跳过。一个订阅源一个条目。"
-
     所以这个 worker 做两件事，取决于有没有 Token：
       ① 有 Token → 拿用户确认的名字搜 Bangumi，匹配上就**带封面/集数/别名/
          tag 入库**（与扫描入库同一套字段），没匹配上则退化为本地条目；
@@ -876,10 +873,20 @@ class RssBridge(QObject):
         #: 解析不出条目的记录数，按订阅聚合 `{source_id: 条数}`。
         #: 订阅页据此提示"请重新绑定"（见 unresolvedChanged）。
         self._unresolved: dict[int, int] = {}
+        #: 启动补偿这一趟**结束**后的回调（QmlApp 注入）。
+        #:
+        #: 谁需要它：「集标题自动补全」要等这一趟定下"要不要补扫"之后再跑
+        #: —— 补扫会发起一次扫描，两边同时跑只会互相让路（见 bridges/refill.py）。
+        #: 本桥接不认识 EpisodeRefillBridge，只回调。
+        self._compensation_hook = None
 
     def set_scan_busy_hook(self, hook) -> None:
         """注入「扫描是否正在进行」的查询函数（QmlApp 调用）。"""
         self._scan_busy = hook
+
+    def set_compensation_hook(self, hook) -> None:
+        """注入启动补偿结束后的回调（QmlApp 调用，用于触发集标题补全）。"""
+        self._compensation_hook = hook
 
     def set_api(self, api) -> None:
         """注入 Bangumi 客户端（QmlApp 在配置重建时调用）。"""
@@ -1223,8 +1230,7 @@ class RssBridge(QObject):
         vals = {
             "must_include": (must_include or "").strip(),
             "must_exclude": (must_exclude or "").strip(),
-            # **保存过 = 启用下载**（v13 的闸门，见 database 建表处说明）。
-            # 用户需求："下载器必须点保存才能启用这个订阅的下载"。
+            # **保存过 = 启用下载**。
             "downloader_saved": 1,
         }
         sid = int(save_subject_id or 0)
@@ -1698,10 +1704,25 @@ class RssBridge(QObject):
             pending = []
         if not pending:
             log.info("启动补偿：没有需要补扫的记录（下完的都扫过了）")
+            self._notify_compensation()
             return
         log.info("启动补偿：发现 %s 条「已确认下完但未扫描」的记录，开始补扫",
                  len(pending))
         self._maybe_scan_completed({})
+        # **放在后面**：`_maybe_scan_completed` 可能刚发起一次扫描（直连，
+        # 返回时 `scanner.running` 已为真）。补全自己会在扫描期间让路，
+        # 看到忙就 15 秒后再看 —— 但触发点必须在这趟结束之后，否则两套
+        # 启动任务会同时抢着读目录/发请求。
+        self._notify_compensation()
+
+    def _notify_compensation(self) -> None:
+        """通知「启动补偿这一趟结束了」（回调由 QmlApp 注入，容错处理）。"""
+        if self._compensation_hook is None:
+            return
+        try:
+            self._compensation_hook()
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("启动补偿后的回调失败：%s", e)
 
     @Slot()
     def _auto_refresh_torrents(self) -> None:
@@ -2422,8 +2443,6 @@ class RssBridge(QObject):
     def createSubjectFromSource(self, source_id: int, name: str,
                                 match: bool = True) -> bool:
         """用给定名字新建本地条目，并**绑定到该订阅**。
-
-        需求："需要匹配，没填 token 则跳过。一个订阅源一个条目。"
 
         `match=True` 且有 Token 时走 Bangumi 匹配（拿封面/集数/别名/tag）；
         否则直接建本地条目。匹配失败**不报错**，退化为本地条目 ——

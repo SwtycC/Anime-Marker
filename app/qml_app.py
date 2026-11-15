@@ -24,8 +24,9 @@ from PySide6.QtWidgets import QApplication
 
 from app import USER_AGENT, __version__
 from app.bridges import (
-    AppMenuBridge, FontBridge, InProgressBridge, LibraryBridge, MatchBridge,
-    PlayerBridge, RssBridge, ScannerBridge, SettingsBridge,
+    AppMenuBridge, EpisodeRefillBridge, FontBridge, InProgressBridge,
+    LibraryBridge, MatchBridge, PlayerBridge, RssBridge, ScannerBridge,
+    SettingsBridge,
 )
 # 季数识别 / 多季展示已写死（界面移除，见 scanner 里常量的说明）
 from app.bridges.scanner import SEASON_DISPLAY
@@ -119,6 +120,9 @@ class QmlApp:
         # ---- 桥接层 ----
         self.library_bridge = LibraryBridge(self.db, self.api)
         self.scanner_bridge = ScannerBridge(self.db, self.config)
+        # 集标题自动补全：扫描时没拉到官方集数表的条目（代理没开 / Token
+        # 过期），事后自动回填。
+        self.refill_bridge = EpisodeRefillBridge(self.db)
         self.settings_bridge = SettingsBridge(self.config)
         # 字体：内置字体注册、上传、下拉列表，以及「保存后立即生效」。
         # 构造时没有 QApplication，真正的注册在 run() 里 prepare()。
@@ -210,6 +214,18 @@ class QmlApp:
         # 只拿一个回调（见 RssBridge.set_scan_busy_hook 的说明）。
         self.rss_bridge.set_scan_busy_hook(
             lambda: bool(self.scanner_bridge.running))
+        # 每次扫描结束都给「集标题补全」一次机会：这次扫描可能正是因为
+        # 网络/Token 失败才没拿到集标题（见 bridges/refill.py）。
+        self.scanner_bridge.finished.connect(self.refill_bridge.kick_after_scan)
+        self.refill_bridge.set_scan_busy_hook(
+            lambda: bool(self.scanner_bridge.running))
+        self.refill_bridge.set_finished_hook(
+            self.library_bridge.reloadEpisodes)
+        # 启动补偿那趟（扫「下完未扫描」记录）结束后，立刻接着查一次
+        # 集标题 —— 两件事都在回答"上次退出时有没有留下没做完的活"，
+        # 放在同一时机，日志里也前后相邻。
+        self.rss_bridge.set_compensation_hook(
+            self.refill_bridge.kick_after_startup)
 
         # 配置保存后重建依赖配置的服务
         self.settings_bridge.saved.connect(self._rebuild_services)
@@ -331,6 +347,10 @@ class QmlApp:
         self.match_bridge.set_api(self.api)
         self.inprogress_bridge.set_api(self.api)
         self.library_bridge.set_api(self.api)
+        # 补全桥接：换 Token / 代理后立刻再试一次 —— 用户很可能正是
+        # 为了让集标题补上才去改配置的（401 时它不会自动重试，见 refill.py）。
+        self.refill_bridge.set_api(self.api)
+        self.refill_bridge.kick_after_config()
         # 订阅桥接：换 API 后「从订阅源新建条目」才能用新的 Token 匹配
         self.rss_bridge.set_api(self.api)
         # RSS 轮询：**重建 qB 客户端与轮询间隔**。
@@ -507,6 +527,8 @@ class QmlApp:
 
         # 桥接层：QML 侧直接用 library / scanner 这两个名字
         self.scanner_bridge.set_api(self.api)
+        # 补全线程用同一个客户端（代理 / Token 配置与扫描保持一致）
+        self.refill_bridge.set_api(self.api)
         # 海报墙展示模式：固定方案（同上）
         self.library_bridge.set_display_mode(SEASON_DISPLAY)
         # 排名自动刷新间隔（0 = 关闭）。启动时先下发，再排一次"是否该刷"。
@@ -555,6 +577,12 @@ class QmlApp:
         # 详情页/海报墙写状态 —— 界面没起来时做这些没有意义，
         # 还可能和首帧渲染抢资源（用户会看到窗口"卡一下才出来"）。
         self.rss_bridge.startScanWatch()
+
+        # ---- 「集标题自动补全」----
+        # 放在「下载完自动扫描」之后：两者都要碰 `episodes`。首次检查
+        # 不靠固定延迟，而是挂在上面那趟启动补偿的结束回调上（见
+        # __init__ 里的 set_compensation_hook）；这里只是挂兜底计时器。
+        self.refill_bridge.start()
 
         # ---- 检查更新（**每天第一次**开软件时延迟一次，静默）----
         # 同样要等界面起来：它启动的是定时器（不是立刻发请求，见
@@ -732,6 +760,12 @@ class QmlApp:
             self.rss_bridge.stopScanWatch()
         except Exception as e:  # pragma: no cover - 防御性
             log.warning("停止「下载完自动扫描」失败：%s", e)
+        # 集标题补全：先停计时器、再等线程收尾（它也在写 db，必须早于
+        # db.close()；不等的话还会撞上 QThread 运行中被销毁的 qFatal）
+        try:
+            self.refill_bridge.wait_worker()
+        except Exception as e:  # pragma: no cover - 防御性
+            log.warning("等待集标题补全线程结束失败：%s", e)
         # 检查更新的线程：停掉定时器并等它跑完 —— QThread 还在跑时
         # 对象被销毁会直接崩（"Destroyed while thread is still running"）
         try:

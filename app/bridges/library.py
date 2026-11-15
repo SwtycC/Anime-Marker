@@ -748,6 +748,20 @@ class LibraryBridge(QObject):
         self.episodesChanged.emit()
 
     @Slot()
+    def reloadEpisodes(self) -> None:
+        """只通知**集数列表**重取（集标题被后台补全后调用）。
+
+        与 `reload()` 的区别：这里不发 `subjectsChanged`，海报墙不会
+        重建。补全改的只是 `episodes.title` / `bangumi_ep_id`，与海报墙
+        的卡片、排序、筛选都无关；而 `reload()` 会触发整面墙的卡片重建，
+        对一次后台维护来说代价太大。
+
+        QML 侧 `Main.qml` 已把 `episodesChanged` 接到当前详情页的
+        `refreshEpisodes()`，所以用户正开着的那一页会原地刷新。
+        """
+        self.episodesChanged.emit()
+
+    @Slot()
     def reloadInProgress(self) -> None:
         """只让「在看」列表重取数据（**不发收藏状态通知**）。
 

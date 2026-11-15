@@ -1,4 +1,4 @@
-"""QML 桥接层（§5.12.6）。
+"""QML 桥接层。
 
 每个 bridge 负责把一类后端能力翻译成 QML 可调用的形式：
 
@@ -13,6 +13,7 @@
 | `inprogress.py` | 在看列表（Bangumi 拉取 + 离线缓存降级） |
 | `rss.py`      | RSS 订阅源管理 + 下载记录查询 |
 | `app_menu.py` | 状态栏「更多」菜单（检查更新 / 打开日志目录 / 帮助 / 反馈） |
+| `refill.py`   | 集标题自动补全的调度（什么时候重试失败过的集数请求） |
 
 约定：
 - 对外只用 `@Slot` / `@Property` / `Signal`，不暴露 ORM 对象
@@ -26,6 +27,7 @@ from app.bridges.inprogress import InProgressBridge
 from app.bridges.library import LibraryBridge, as_file_url
 from app.bridges.match import MatchBridge
 from app.bridges.player import PlayerBridge
+from app.bridges.refill import EpisodeRefillBridge
 from app.bridges.rss import RssBridge
 from app.bridges.scanner import ScannerBridge
 from app.bridges.settings import SettingsBridge
@@ -39,6 +41,7 @@ __all__ = [
     "MatchBridge",
     "InProgressBridge",
     "RssBridge",
+    "EpisodeRefillBridge",
     "AppMenuBridge",
     "as_file_url",
 ]

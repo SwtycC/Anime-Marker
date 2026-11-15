@@ -1324,6 +1324,38 @@ class Database:
             )
             return int(cur.rowcount)
 
+    def list_subjects_missing_ep_meta(self) -> list[int]:
+        """有 Bangumi 条目、但正片集仍缺 `bangumi_ep_id` 的 subject_id。
+
+        给「集标题补全」用（见 `core/ep_refill.py`）。判据就是
+        `_fill_episodes` 当时放弃回填的那一类行：
+
+          - `bangumi_id` 非空 —— 没匹配的条目无从补；
+          - `ep_label` 为空 —— SP/OVA/NCOP 的标题本来就该用文件名；
+          - `bangumi_ep_id IS NULL` —— 当时没拿到官方数据；
+          - `ep_index` 是**正整数** —— 顺延兜底（plain/extra）的编号是
+            `max + 0.5`，它们不对应官方集数，不该把条目拖进候选。
+            `CAST(...)=ep_index` 用来筛掉这些 .5 值。
+
+        一个条目只要有一行缺失就返回一次（`DISTINCT`）。
+        """
+        with self._cursor() as cur:
+            rows = cur.execute(
+                """
+                SELECT DISTINCT s.id
+                FROM subjects s
+                JOIN episodes e ON e.subject_id = s.id
+                WHERE s.bangumi_id IS NOT NULL AND s.bangumi_id > 0
+                  AND COALESCE(e.ep_label, '') = ''
+                  AND e.bangumi_ep_id IS NULL
+                  AND e.ep_index IS NOT NULL
+                  AND e.ep_index > 0
+                  AND e.ep_index = CAST(e.ep_index AS INTEGER)
+                ORDER BY s.id
+                """
+            ).fetchall()
+            return [int(r["id"]) for r in rows]
+
     def find_subject_by_bangumi_id(self, bangumi_id: int) -> Optional[int]:
         """按 Bangumi ID 查本地 subject 主键（F18 本地关联）。"""
         with self._cursor() as cur:
@@ -1593,7 +1625,7 @@ class Database:
     def max_watched_ep_index(self, subject_id: int) -> int:
         """本地已看的**最大集号**（「看到第几集」），没看过返回 0。
 
-        **与 `count_locally_watched_eps()` 的区别很重要**（这是一个踩过的坑）：
+        **与 `count_locally_watched_eps()` 的区别很重要**：
             count  —— 已看**条数**（看了 1 集 → 1）
             max    —— 已看的**最大集号**（看了第 9 集 → 9）
         只有"从第 1 集一集不落看下来"时两者才相等。中间的漏看会让 count 远小于真实进度。
