@@ -221,11 +221,14 @@ class QmlApp:
             lambda: bool(self.scanner_bridge.running))
         self.refill_bridge.set_finished_hook(
             self.library_bridge.reloadEpisodes)
+        # 集标题补全真的补到行 → 立刻补传一次：没有 `bangumi_ep_id` 的集
+        # 根本进不了待传清单（见 Database.pending_uploads），补完才可能上传。
+        self.refill_bridge.finished.connect(
+            self.inprogress_bridge.kickAutoUpload)
         # 启动补偿那趟（扫「下完未扫描」记录）结束后，立刻接着查一次
-        # 集标题 —— 两件事都在回答"上次退出时有没有留下没做完的活"，
-        # 放在同一时机，日志里也前后相邻。
-        self.rss_bridge.set_compensation_hook(
-            self.refill_bridge.kick_after_startup)
+        # 集标题、再补一次上次没传上去的观看记录 —— 三件事都在回答
+        # "上次退出时有没有留下没做完的活"，放在同一时机，日志里也前后相邻。
+        self.rss_bridge.set_compensation_hook(self._on_startup_compensation)
 
         # 配置保存后重建依赖配置的服务
         self.settings_bridge.saved.connect(self._rebuild_services)
@@ -282,6 +285,19 @@ class QmlApp:
         ok, msg = self.rss_service.push_pending(record_id)
         self.rss_bridge.onPushResult(record_id, ok, msg)
 
+    @Slot()
+    def _on_startup_compensation(self) -> None:
+        """启动补偿那趟结束：补集标题，再补上次没传上去的观看记录。
+
+        **先补标题**：没有 `bangumi_ep_id` 的集进不了待传清单，补完才可能
+        上传（补全真补到行时还会再由 `refill_bridge.finished` 触发一次，
+        所以这里不等待它跑完 —— 两边都只是"看一眼有没有活")。
+        **再补传**：这是"上次退出时没开代理、自动上传失败"的那批集
+        唯一会自动重来的时机之一（其余时机见 `kickAutoUpload`）。
+        """
+        self.refill_bridge.kick_after_startup()
+        self.inprogress_bridge.kickAutoUpload()
+
     @Slot(int)
     def _on_playback_stopped(self, subject_id: int) -> None:
         """播放结束 → 让「在看」页重算进度（见 player_bridge 连线处的说明）。
@@ -315,6 +331,15 @@ class QmlApp:
                 self.inprogress_bridge.refresh()
         except Exception as e:          # pragma: no cover - 防御性
             log.warning("播放结束后自动回查收藏数据失败：%s", e)
+
+        # ---- 顺手补一次上传 ----
+        # 这一集如果是"看完那一刻代理没开"没传上去的（B 类），用户现在
+        # 很可能已经开好代理了；即使还没开，失败后也会按退避自己再来
+        # （见 InProgressBridge.kickAutoUpload）。
+        try:
+            self.inprogress_bridge.kickAutoUpload()
+        except Exception as e:          # pragma: no cover - 防御性
+            log.warning("播放结束后自动补传失败：%s", e)
 
     @Slot(int)
     def _on_scan_subject_requested(self, subject_id: int) -> None:
@@ -351,6 +376,9 @@ class QmlApp:
         # 为了让集标题补上才去改配置的（401 时它不会自动重试，见 refill.py）。
         self.refill_bridge.set_api(self.api)
         self.refill_bridge.kick_after_config()
+        # 换代理 / 换 Token 后立刻补传一次 —— 这正是"自动上传失败"
+        # （没开代理）最常见的恢复时刻。开自动上传的开关由桥接层自己判。
+        self.inprogress_bridge.kickAutoUpload()
         # 订阅桥接：换 API 后「从订阅源新建条目」才能用新的 Token 匹配
         self.rss_bridge.set_api(self.api)
         # RSS 轮询：**重建 qB 客户端与轮询间隔**。

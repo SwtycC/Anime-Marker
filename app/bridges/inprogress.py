@@ -62,6 +62,15 @@ _COLLECT_TYPE_NAMES = {
     COLLECT_TYPE_DROPPED: "抛弃",
 }
 
+#: 自动补传的网络失败退避档位（最后一档封顶）。
+#:
+#: 与「集标题补全」（`bridges/refill.py` 的 `RETRY_DELAYS_MS`）同一口径 ——
+#: 都是"软件一直开着、稍后代理恢复也能自愈"，成功一批就归零。
+AUTO_UPLOAD_RETRY_MS = (2 * 60_000, 5 * 60_000, 10 * 60_000,
+                        20 * 60_000, 30 * 60_000)
+#: 上一批上传还在跑时，自动补传推迟多久再看一次
+AUTO_UPLOAD_BUSY_MS = 30_000
+
 
 def _collection_time(item: dict) -> str:
     """取条目的「Bangumi 收藏修改时间」（ISO 串），缺失时回落到缓存写入时间。
@@ -138,7 +147,7 @@ def sync_candidates(
         当前是「在看」                    → "在看"
         水位.synced_at 超过 30 天          → "超期"
 
-    设计取舍（每条都踩过或差点踩）：
+    设计取舍：
 
     1. **「在看」永远重拉**：增量依赖"标了集 → 收藏行会变"这个假设。
        在看番通常只有十几部，全部重拉的成本可忽略，换来"最新动态一定不漏"。
@@ -787,6 +796,17 @@ class InProgressBridge(QObject):
         self._resolve_worker: Optional[_ResolveUserWorker] = None
         # 待传集的本地行（bangumi_ep_id → 行），上传成功后写回用
         self._upload_meta: dict[int, dict] = {}
+        # ---- 自动补传 ----
+        #
+        # **为什么要它**：`bangumi.auto_upload` 只管"看完那一刻传一次"。
+        # 那次失败（没开代理）之后本地记录还在，但**没有任何事件会再来
+        # 触发一次上传** —— 用户只能自己到动态页点「上传」。
+        # 这里用一个单次计时器按退避回来看（触发点见 kickAutoUpload）。
+        self._auto_upload_timer = QTimer(self)
+        self._auto_upload_timer.setSingleShot(True)
+        self._auto_upload_timer.timeout.connect(self._auto_upload_tick)
+        #: 连续网络失败的档位（一批没有任何失败就归零）
+        self._auto_retry_index = 0
         # 界面刷新节流：首次全量会写十几批，合并到最多 1 次/秒
         # （见 _schedule_ui_refresh）
         self._ui_refresh_pending = False
@@ -1204,38 +1224,13 @@ class InProgressBridge(QObject):
                     "message": "尚未配置 Bangumi Token，无法补传（请到设置页填写）"}
 
         try:
-            pend = self._db.pending_uploads()      # {subject_id: [集...]}
-            blocked = sum(self._db.blocked_upload_counts().values())
+            # 只取勾选的集；判据仍由 _collect_upload_tasks →
+            # Database.pending_uploads() 给出（与界面计数、自动补传同源）
+            tasks, meta, unmatched, blocked = self._collect_upload_tasks(ids)
         except Exception as e:
             log.exception("准备补传失败: %s", e)
             return {"ok": False, "pending": 0, "subjects": 0,
                     "message": f"准备补传失败：{e}"}
-
-        tasks: list[tuple[int, list[dict]]] = []
-        meta: dict[int, dict] = {}      # bangumi_ep_id → 写回本地的行（见 _on_upload_finished）
-        unmatched = 0
-        for sid, eps in pend.items():
-            sel = [e for e in eps if int(e.get("episode_id") or 0) in ids]
-            if not sel:
-                continue
-            try:
-                subj = self._db.get_subject(int(sid))
-            except Exception:
-                subj = None
-            if subj is None or not subj.bangumi_id:
-                # 本地条目没匹配到 Bangumi → 没有可提交的目标，跳过
-                unmatched += len(sel)
-                continue
-            tasks.append((int(subj.bangumi_id), sel))
-            for e in sel:
-                meta[int(e["bangumi_ep_id"])] = {
-                    "bangumi_ep_id": int(e["bangumi_ep_id"]),
-                    "subject_id": int(sid),
-                    "bangumi_id": int(subj.bangumi_id),
-                    "subject_name": subj.name_cn or subj.name or "",
-                    "ep_index": e.get("ep_index") or 0,
-                    "ep_name": e.get("ep_title") or "",
-                }
         self._upload_meta = meta
 
         if not tasks:
@@ -1260,6 +1255,130 @@ class InProgressBridge(QObject):
             msg += f"；另有 {blocked} 集缺 Bangumi 集号，无法补传"
         return {"ok": True, "pending": total, "subjects": len(tasks),
                 "message": msg}
+
+    # ---------- 自动补传 ----------
+    @Slot()
+    def kickAutoUpload(self) -> None:
+        """外部触发一次「自动补传」检查（启动 / 播放结束 / 配置保存后）。
+
+        **补什么**：`Database.pending_uploads()` 的**全部**结果 —— 就是
+        「上传本地观看记录」小窗里会列出来的那些集（本地看过、有集号、
+        Bangumi 未标）。与手动上传共用同一判据，所以重复触发也不会重复
+        POST：传成功的会从待传清单里消失（见 `_UploadWorker` 的幂等说明）。
+
+        **什么时候不补**：
+          - `bangumi.auto_upload` 关着（用户明确只要手动）；
+          - 没配 Token（PATCH 必然 401，等「配置保存」再来）；
+          - 上一批上传还在跑（推迟 30 秒再看，见 `_auto_upload_tick`）。
+
+        触发点由 QmlApp 接（都是"刚刚失败 / 刚刚恢复"的时刻）：
+          · 启动补偿那趟结束（`QmlApp._on_startup_compensation`）；
+          · 集标题补全刚补到集号（`refill_bridge.finished`）——
+            没有 `bangumi_ep_id` 的集根本进不了待传清单，补完才可能上传；
+          · 每次播放结束（`QmlApp._on_playback_stopped`）；
+          · 配置保存后（换代理 / Token 最可能让上传恢复的时刻）。
+        一批里有失败时由 `_on_upload_finished` 按 2/5/10/20/30 分钟退避
+        自己再来；401 不重试（Token 不改，重试多少次都是同一个结果）。
+        """
+        # 立刻跑：外部触发说明"环境可能刚变好"，已排的退避作废
+        self._auto_upload_timer.stop()
+        self._auto_upload_tick()
+
+    def _auto_upload_tick(self) -> None:
+        """自动补传的一次检查（计时器到点 / 被 kick 时执行）。"""
+        if not self._config.getbool("bangumi", "auto_upload", True):
+            return
+        if not getattr(self._api, "has_token", False):
+            return
+        # 连点两次时，上一个 worker 可能已经跑完并被 deleteLater 销毁 ——
+        # 此时 `isRunning()` 会抛 RuntimeError（C++ 对象已删），按"没在跑"处理
+        # （与 uploadEpisodes 同一坑）。
+        try:
+            if self._upload_worker is not None and self._upload_worker.isRunning():
+                self._schedule_auto_upload(AUTO_UPLOAD_BUSY_MS)
+                return
+        except RuntimeError:
+            pass
+        try:
+            tasks, meta, unmatched, blocked = self._collect_upload_tasks(None)
+        except Exception as e:
+            log.exception("自动补传：准备待传清单失败: %s", e)
+            return
+        if not tasks:
+            self._auto_retry_index = 0
+            # 用 info 而不是 debug：自动行为"什么都没做"也要能一眼看到，
+            # 否则用户会怀疑它根本没跑（与 refill 的日志口径一致）。
+            log.info("自动补传：没有需要补传的集")
+            return
+
+        self._upload_meta = meta
+        total = sum(len(eps) for _, eps in tasks)
+        self._upload_worker = _UploadWorker(self._api, tasks)
+        self._upload_worker.progress.connect(self._on_upload_progress)
+        self._upload_worker.finished_upload.connect(self._on_upload_finished)
+        self._upload_worker.finished.connect(self._upload_worker.deleteLater)
+        self._upload_worker.start()
+        log.info("开始自动补传：%s 集 → %s（%s 集所在条目未匹配 Bangumi，已跳过）",
+                 total, self._upload_target_desc(tasks), unmatched)
+        msg = f"自动补传 {total} 集（{len(tasks)} 部）…"
+        if blocked:
+            msg += f"；另有 {blocked} 集缺 Bangumi 集号，无法补传"
+        self.message.emit(msg)
+
+    def _collect_upload_tasks(
+        self, selected: Optional[set[int]]
+    ) -> tuple[list[tuple[int, list[dict]]], dict[int, dict], int, int]:
+        """把待传清单组装成 `_UploadWorker` 的 tasks。
+
+        `selected=None` 表示**全部待传**（自动补传）；传集合则只取勾选的集
+        （手动上传，见 `uploadEpisodes`）。
+
+        **判据只走 `Database.pending_uploads()`**：界面上显示的条数、手动
+        上传的筛选、自动补传的范围三者同源 —— 否则会出现"显示 3 条却只
+        传了 1 条"这类对不上的现象。
+
+        返回 `(tasks, meta, 未匹配条目的集数, 缺集号无法补传的集数)`。
+        `meta` 是 `bangumi_ep_id → 写回本地的行`（见 `_on_upload_finished`）。
+        """
+        pend = self._db.pending_uploads()
+        blocked = sum(self._db.blocked_upload_counts().values())
+        tasks: list[tuple[int, list[dict]]] = []
+        meta: dict[int, dict] = {}
+        unmatched = 0
+        for sid, eps in pend.items():
+            sel = eps if selected is None else [
+                e for e in eps if int(e.get("episode_id") or 0) in selected]
+            if not sel:
+                continue
+            try:
+                subj = self._db.get_subject(int(sid))
+            except Exception:
+                subj = None
+            if subj is None or not subj.bangumi_id:
+                # 本地条目没匹配到 Bangumi → 没有可提交的目标，跳过
+                unmatched += len(sel)
+                continue
+            tasks.append((int(subj.bangumi_id), sel))
+            for e in sel:
+                meta[int(e["bangumi_ep_id"])] = {
+                    "bangumi_ep_id": int(e["bangumi_ep_id"]),
+                    "subject_id": int(sid),
+                    "bangumi_id": int(subj.bangumi_id),
+                    "subject_name": subj.name_cn or subj.name or "",
+                    "ep_index": e.get("ep_index") or 0,
+                    "ep_name": e.get("ep_title") or "",
+                }
+        return tasks, meta, unmatched, blocked
+
+    def _schedule_auto_upload(self, delay_ms: int) -> None:
+        """排一次自动补传检查；已排更早的就不往后推（与 refill 同一策略）。"""
+        delay = max(0, int(delay_ms))
+        if not self._auto_upload_timer.isActive():
+            self._auto_upload_timer.start(delay)
+            return
+        left = self._auto_upload_timer.remainingTime()
+        if left < 0 or left > delay:
+            self._auto_upload_timer.start(delay)
 
     def _on_upload_progress(self, done: int, total: int) -> None:
         # 只在整数分档时报一次，别刷屏
@@ -1363,22 +1482,41 @@ class InProgressBridge(QObject):
             log.warning("补传后回查「自动完结」失败（不影响补传）: %s", e)
         if aborted:
             # Token 被拒：**不能说"可再点一次"** —— 换 Token 之前点多少次
-            # 都是同一个结果（这正是用户 2026-10-06 那次踩的坑：日志里
-            # 只有一串 `401 Client Error`，状态栏还劝他重试）
+            # 都是同一个结果
             # 成功的那些照常写回本地（上面已经写了），这里只把"为什么停下"
             # 说清楚。可操作的部分放最前 —— 状态栏是单行、右端会被截断。
+            # 自动补传**不排重试**：Token 不改，重试一万次也是 401；
+            # 等「配置保存」把 kickAutoUpload 叫醒（与 refill 同一口径）。
+            self._auto_retry_index = 0
             tail = f"（已成功 {ok} 条）" if ok else ""
             self.message.emit(f"补传中止：{aborted}{tail}")
             return
+        auto_on = self._config.getbool("bangumi", "auto_upload", True)
         if fail:
             # 失败的不清掉"待上传"状态 —— 小窗里再点一次即只补它们。
             # **点名失败的动漫**：只报条数时用户不知道自己去小窗里该找哪一部。
             who = f"（{'、'.join(fail_names)}）" if fail_names else ""
+            # 自动上传开着时由下面的退避自动重试，别再劝用户手点
+            tail = "（将自动重试）" if auto_on else "（可再点一次只补失败的）"
             self.message.emit(
-                f"补传完成：成功 {ok} 条，失败 {fail} 条{who}（可再点一次只补失败的）")
+                f"补传完成：成功 {ok} 条，失败 {fail} 条{who}{tail}")
         else:
             who = f"（{'、'.join(ok_names)}）" if ok_names else ""
             self.message.emit(f"补传完成：{ok} 条已同步到 Bangumi{who}")
+
+        # ---- 4. 有失败 → 按退避自己再来一次 ----
+        #
+        # 只处理"网络 / 单条失败"：401 已在上面 return 掉（Token 不改，
+        # 重试没有意义）。成功一批就归零，否则下次又从最长档开始等。
+        if fail and auto_on:
+            delay = AUTO_UPLOAD_RETRY_MS[
+                min(self._auto_retry_index, len(AUTO_UPLOAD_RETRY_MS) - 1)]
+            self._auto_retry_index += 1
+            log.info("自动补传：%s 集未传成功，%s 秒后按退避重试",
+                     fail, delay // 1000)
+            self._schedule_auto_upload(delay)
+        else:
+            self._auto_retry_index = 0
 
     @Slot(str)
     def resolveUsername(self, token: str = "") -> None:
@@ -1496,6 +1634,9 @@ class InProgressBridge(QObject):
         早期版本没接住这个异常，退出时必打一条"等待拉取结束失败"的
         误导性警告（看着像线程没退干净，其实早就结束了）。
         """
+        # 先停自动补传的计时器：否则退出过程中它若到点，会去查一个
+        # 即将/已经关闭的数据库（`QmlApp.shutdown` 先 cancel 再关库）。
+        self._auto_upload_timer.stop()
         for w, label in ((self._worker, "收藏列表"), (self._ep_worker, "集级记录"),
                          (self._upload_worker, "补传")):
             if w is None:

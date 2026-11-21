@@ -879,7 +879,7 @@ Item {
                         value: root.getFloat("bangumi.ep_timeline_count", 30)
                         minimum: 0
                         maximum: 300
-                        step: 5          // 需求：按一下 ±5
+                        step: 5          // 按一下 ±5
                         suffix: "条"
                         width: 180
                     }
@@ -888,16 +888,19 @@ Item {
                 FormRow {
                     width: parent.width
                     label: "自动上传"
-                    // 只管"**看完那一刻是否立即同步**。
-                    // 关掉之后：本地记录照写（来源 tag 只有「本地」），什么时候
-                    // 上传由「动态 → 上传」小窗决定 —— 差集与幂等由那边保证，
+                    // 语义有两半：**看完那一刻立即同步** + **失败后自动补传**
+                    // （见 InProgressBridge.kickAutoUpload）。关掉之后：本地
+                    // 记录照写（来源 tag 只有「本地」），什么时候上传由
+                    // 「动态 → 上传」小窗决定 —— 差集与幂等由那边保证，
                     // 所以关掉**不会丢记录**，只是延迟同步。
-                    hint: "看完一集后立即标记到 Bangumi；关闭则只记本地，改用「动态 → 上传」手动补传"
+                    hint: "看完一集后立即标记到 Bangumi；上传失败时（例如当时没开代理）"
+                          + "会在启动、播放结束或改完设置后自动重试，直到传上去为止。\n\n"
+                          + "关闭后只记本地，改用「动态 → 上传」手动补传 —— 记录不会丢。"
                     CheckBoxLine {
                         id: autoUploadBox
                         objectName: "autoUploadBox"
                         checked: root.getBool("bangumi.auto_upload", true)
-                        text: "启用（关闭后可在「动态 → 上传」里手动补传）"
+                        text: "启用（失败后会在恢复联网时自动补传）"
                     }
                 }
 
