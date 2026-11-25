@@ -68,16 +68,72 @@ a = Analysis(
     # 排除其它 Qt 绑定：Conda 环境里常同时装着 PyQt5，
     # PyInstaller 会为它跑 hook，然后因为"多个 Qt 绑定"直接中止打包。
     # 本项目只用 PySide6，显式排除即可。
+    #
+    # 后面几项是**体积裁剪**（模块层面）：conda 环境里 numpy/Tcl-Tk 会被
+    # 其它包的 hook 顺带拉进来，本项目一行都没用过（见下方 _PRUNE_PREFIXES）。
     excludes=[
         'PyQt5',
         'PyQt6',
         'PySide2',
+        'tkinter',
+        'numpy',
+        'scipy',
+        'pandas',
+        'matplotlib',
+        'PySide6.QtWebEngineCore',
+        'PySide6.QtWebEngineQuick',
+        'PySide6.QtWebChannel',
+        'PySide6.QtWebSockets',
+        'PySide6.QtPdf',
+        'PySide6.QtPdfQuick',
+        'PySide6.QtTest',
+        'PySide6.QtQuickTest',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
 )
+
+# ---------------------------------------------------------------------------
+# 体积裁剪（二进制 / 数据层面）
+#
+# 这里按**打包目标路径前缀**过滤 Analysis 的TOC —— 打包时就不再复制，源文件一行不动。
+#
+# 只按前缀匹配，Qt 升级后多出来的同名变体（如 Qt6WebEngineQuick*）也能
+# 一并覆盖。
+_PRUNE_PREFIXES = (
+    # conda 数学库 / OpenMP / MPI
+    'mkl', 'libiomp', 'omptarget', 'msmpi', 'tbb',
+    # 未使用的 Qt 模块
+    'qt6webengine', 'qt6webchannel', 'qt6websockets',
+    'qt6pdf', 'qt6quicktest', 'qt6test',
+    # Tcl/Tk
+    'tcl', 'tk86', '_tcl_data', '_tk_data', '_tkinter',
+    # numpy 残留（excludes 已挡模块，这里清 DLL / dist-info）
+    'numpy',
+    # 对应的 QML 模块目录
+    'pyside6/qml/qtwebengine', 'pyside6/qml/qtwebchannel',
+    'pyside6/qml/qtwebsockets', 'pyside6/qml/qttest',
+    'pyside6/qml/qmltime',
+)
+
+
+def _prune_toc(toc):
+    """丢掉目标路径以 _PRUNE_PREFIXES 开头的条目。"""
+    kept = []
+    for name, src, kind in toc:
+        if str(name).replace('\\', '/').lower().startswith(_PRUNE_PREFIXES):
+            continue
+        kept.append((name, src, kind))
+    return kept
+
+
+_toc_before = len(a.binaries) + len(a.datas)
+a.binaries = _prune_toc(a.binaries)
+a.datas = _prune_toc(a.datas)
+print(f'[spec] 体积裁剪：TOC {_toc_before} -> '
+      f'{len(a.binaries) + len(a.datas)} 个条目')
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
