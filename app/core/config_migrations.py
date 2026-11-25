@@ -26,7 +26,7 @@
    `config.ini` —— 紧挨着放的备份（如 `config.ini.1.0.0`）不会被
    忽略，一次 `git add .` 就把 Token 带进仓库。
    `data/` 整个目录都是忽略的，放里面天然安全。打包态同理：
-   `%APPDATA%\\AnimeMarker\\config_backups\\` 与库文件、封面缓存分开，
+   `data\\config_backups\\` 与库文件、封面缓存分开，
    用户一眼知道能删。
 
 新增一次迁移的做法（以「从 1.1.0 升上来时删掉废弃键」为例）：

@@ -136,6 +136,7 @@ app/core/               业务逻辑（scanner / matcher / bangumi_api / monitor
 app/utils/              工具（paths / logger / cover_cache / title_parser）
 resources/icons/        图标（SVG）
 data/                   运行时数据（SQLite 库、封面缓存、日志）—— 自动生成
+                        开发态在项目根；打包后与 AnimeMarker.exe 同级
 ```
 
 ---
