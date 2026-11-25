@@ -19,6 +19,7 @@ import sys
 from typing import Any, Optional
 
 from PySide6.QtCore import QObject, QUrl, Slot
+from PySide6.QtGui import QIcon
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtWidgets import QApplication
 
@@ -488,10 +489,33 @@ class QmlApp:
 
     # ---------- 启动 ----------
     def run(self, argv: list[str]) -> int:
+        # 任务栏归组 / 图标：Windows 按 AppUserModelID 认应用。
+        # 不显式设置时，从源码运行会归到 python.exe 名下 —— 表现为任务栏
+        # 显示 Python 图标、把本项目和其他 Python 程序并成一组，且会盖掉
+        # 下面 setWindowIcon() 的效果。必须在创建窗口之前调用。
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                    "AnimeMarker.AnimeMarker")
+            except (AttributeError, OSError):
+                log.warning("AppUserModelID 设置失败，任务栏图标可能沿用 python.exe")
+
         app = QApplication(argv)
         app.setApplicationName("Anime Marker")
         app.setOrganizationName("AnimeMarker")
         app.setApplicationDisplayName("Anime Marker")
+
+        # 窗口 / 任务栏图标：与「关于」页同一份 logo 渲染出的多尺寸 ICO。
+        # 开发态读项目 resources/，打包态读 _MEIPASS/resources（见 spec 的 datas）。
+        # 缺失时不让启动失败：QIcon 为空即回退系统默认图标，只记一条警告。
+        icon_path = resource_path("app.ico")
+        if icon_path.exists():
+            app.setWindowIcon(QIcon(str(icon_path)))
+            log.info("应用图标：%s", icon_path)
+        else:
+            log.warning("应用图标缺失：%s", icon_path)
 
         # 字体必须**在 engine.load() 之前**准备好：QML 项创建时读取
         # QGuiApplication.font()，晚一步首帧会先闪一下系统默认字体。

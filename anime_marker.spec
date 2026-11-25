@@ -16,6 +16,12 @@ a = Analysis(
     binaries=[],
     datas=[
         ('resources/icons', 'resources/icons'),
+        # 应用图标（EXE 图标 + 运行时窗口/任务栏图标）。
+        # 由 resources/icons/logo.svg 渲染的 16/24/32/48/64/128/256 多尺寸 ICO：
+        #   - 打包时给 EXE(icon=) 用；
+        #   - 运行时由 QmlApp 调 resource_path("app.ico") 设置窗口图标。
+        # 它在 resources/ 根下、不在 icons/ 里，必须单列。
+        ('resources/app.ico', 'resources'),
         # 海报圆角遮罩（PosterCard 用它把封面裁成"上圆下直"）。
         # **必须单列**：它不在 resources/icons 里，而是在 resources/ 根下，
         # 上面的目录条目覆盖不到。漏了它 → 打包后封面四角全变直角
@@ -82,12 +88,9 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # 应用图标：**暂缺，故不指定**（Windows 用默认 exe 图标）。
-    #
-    # 注意 `icon=` 指向的文件**必须存在**，否则 PyInstaller 直接报错终止。
-    # 项目里目前没有任何 .ico（resources/icons/ 只放 SVG，见该目录 README）。
-    # 以后补图标时：把 .ico 放进 resources/，再解开下面这行并改对路径。
-    # icon='resources/app.ico',
+    # 应用图标：resources/app.ico（由 resources/icons/logo.svg 渲染，
+    # 含 16/24/32/48/64/128/256 七种尺寸）。
+    icon='resources/app.ico',
 )
 
 coll = COLLECT(

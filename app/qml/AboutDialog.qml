@@ -15,9 +15,9 @@ Window {
     property string version: ""
 
     width: 420
-    height: 240
+    height: 360
     minimumWidth: 360
-    minimumHeight: 240
+    minimumHeight: 340
     modality: Qt.ApplicationModal
     title: "关于 Anime Marker"
     color: Theme.windowBg
@@ -30,6 +30,11 @@ Window {
         dlg.requestActivate()
     }
 
+    /// 外部 SVG 图标基地址（由 Python 注入，见 QmlApp 的 iconsBaseUrl）。
+    /// 单独用 qmlscene 预览本文件时该属性不存在，故做防御。
+    readonly property string iconsBase: typeof iconsBaseUrl !== "undefined"
+                                        ? iconsBaseUrl : ""
+
     Column {
         anchors.left: parent.left
         anchors.right: parent.right
@@ -37,16 +42,33 @@ Window {
         anchors.margins: Theme.spacingXl
         spacing: Theme.spacingMd
 
+        // 第一行：Logo 居中。
+        // sourceSize 取 2 倍再缩小：SVG 先按 128px 解码，高分屏下边缘更干净。
+        Image {
+            width: 64
+            height: 64
+            anchors.horizontalCenter: parent.horizontalCenter
+            source: dlg.iconsBase ? dlg.iconsBase + "logo.svg" : ""
+            sourceSize.width: 128
+            sourceSize.height: 128
+            fillMode: Image.PreserveAspectFit
+            smooth: true
+        }
+
+        // 第二行：软件名居中
         Text {
             width: parent.width
+            horizontalAlignment: Text.AlignHCenter
             text: "Anime Marker"
             color: Theme.textPrimary
             font.pixelSize: Theme.fontLg
             font.bold: true
         }
 
+        // 第三行：版本号居中
         Text {
             width: parent.width
+            horizontalAlignment: Text.AlignHCenter
             text: "v" + dlg.version
             color: Theme.textTertiary
             font.pixelSize: Theme.fontSm

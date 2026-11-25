@@ -1,4 +1,11 @@
-# Anime-Marker
+<p align="center">
+  <img src="resources/icons/logo.svg" alt="Anime Marker logo" width="120">
+</p>
+
+<h1 align="center">Anime Marker</h1>
+
+------
+
 
 Windows 桌面端本地动漫管理 + Bangumi 进度同步 + RSS 自动下载工具。
 
