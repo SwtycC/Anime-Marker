@@ -3,9 +3,9 @@
 两类字体分开存放：
 
 - **内置**：`resources/fonts/...`，随发行包分发，只读；
-- **用户上传**：`paths.fonts_dir()`（开发态 `data/fonts`，
-  打包态 `%APPDATA%/AnimeMarker/fonts`）。放用户数据目录而不是程序目录：
-  Program Files 下通常不可写，且升级 / 重装不应丢掉用户添加的字体。
+- **用户上传**：`paths.fonts_dir()`（开发态 `<项目根>/data/fonts`，
+  打包态 `<exe 同级>/data/fonts`）。放 data 目录而不是 resources：
+  用户字体属于个人数据，覆盖安装 / 替换 exe 时不应被清掉。
 
 配置键 `ui.font_family` 存的是**字体族名**（QFontDatabase 返回的
 family），空串 = 系统默认。存族名而不是文件路径：Qt 的 `font.family`

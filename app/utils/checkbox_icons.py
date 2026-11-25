@@ -1,7 +1,7 @@
 """生成 QSS 用对勾 SVG 图标（复选框 ::indicator:checked 的 image）。
 
 QSS 无法直接绘制对勾，只能通过 image: 引用文件；这里在运行时把 SVG
-写到用户数据目录（打包后为 %APPDATA%），避免依赖 resources 打进 exe。
+写到用户数据目录（打包后为 exe 同级 data\），避免依赖 resources 打进 exe。
 
 对应 Uiverse 设计：勾形为旋转 45° 的 L 形描边，此处用 path 等价实现。
 """

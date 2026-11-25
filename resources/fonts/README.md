@@ -1,7 +1,7 @@
 # 内置字体
 
 本目录存放随程序分发的字体（只读）。用户上传的字体不在这里，而是在用户
-数据目录（开发态 `data/fonts`，打包态 `%APPDATA%/AnimeMarker/fonts`），
+数据目录（开发态 `<项目根>/data/fonts`，打包态 `<exe 同级>/data/fonts`），
 见 `app/utils/paths.py` 的 `fonts_dir()`。
 
 | 目录 | 字体 | 下拉菜单显示名 |
