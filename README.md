@@ -4,9 +4,6 @@
 
 <h1 align="center">Anime Marker</h1>
 
-------
-
-
 Windows 桌面端本地动漫管理 + Bangumi 进度同步 + RSS 自动下载工具。
 
 Python + PySide6（QML 界面）。核心闭环：
