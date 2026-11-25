@@ -14,12 +14,16 @@
 from __future__ import annotations
 
 import configparser
+import logging
 from pathlib import Path
 from typing import Any
 
 from app import USER_AGENT
 from app.core import config_migrations
 from app.utils.paths import config_path
+from app.utils.secret import is_encrypted, protect, unprotect
+
+log = logging.getLogger(__name__)
 
 DEFAULTS: dict[str, dict[str, str]] = {
     # 配置自身的元信息（不由设置页读写）。
@@ -209,6 +213,16 @@ DEFAULTS: dict[str, dict[str, str]] = {
 }
 
 
+#: 需要加密存储的配置项（`(section, key)`）。
+#:
+#: 只登记**确实敏感**的字段：加密后配置文件不能跨机器 / 跨 Windows 用户
+#: 直接复用，登记得越多，迁移与排障的成本越高。
+#:
+#: 加解密在 `Config.get/set` 里透明完成，调用方拿到的仍然是明文，
+#: 不需要知道存储格式（见 app/utils/secret.py）。
+SECRET_OPTIONS: set[tuple[str, str]] = {("bangumi", "token")}
+
+
 class Config:
     """INI 配置封装。"""
 
@@ -224,6 +238,8 @@ class Config:
             if config_migrations.run(self):
                 self.save()
             self._ensure_sections()
+            # ③ 敏感项加密（幂等）：旧版本存的是明文，读到就地加密回写。
+            self._migrate_secrets()
 
     # ---------- 初始化 ----------
     def _init_defaults(self) -> None:
@@ -247,9 +263,38 @@ class Config:
         if changed:
             self.save()
 
+    def _migrate_secrets(self) -> None:
+        """把历史遗留的**明文**敏感项就地加密（幂等）。
+
+        只处理 `SECRET_OPTIONS` 里登记的项；已经带 `enc:v1:` 前缀的跳过。
+        加密不可用（非 Windows / DPAPI 异常）时 `protect()` 会返回原文，
+        此时**不写盘**，避免每次启动都做一次无意义的保存。
+        """
+        changed = False
+        for section, key in SECRET_OPTIONS:
+            if not self._parser.has_option(section, key):
+                continue
+            raw = self._parser.get(section, key, fallback="")
+            if not raw or is_encrypted(raw):
+                continue
+            protected = protect(raw)
+            if not is_encrypted(protected):
+                continue
+            self._parser.set(section, key, protected)
+            changed = True
+            log.info("敏感配置已加密存储：%s.%s", section, key)
+        if changed:
+            self.save()
+
     # ---------- 通用读写 ----------
     def get(self, section: str, key: str, fallback: str = "") -> str:
-        return self._parser.get(section, key, fallback=fallback)
+        value = self._parser.get(section, key, fallback=fallback)
+        if (section, key) in SECRET_OPTIONS:
+            plain, ok = unprotect(value)
+            # 解不开（换机器/换用户/文件被改）时按「没配」处理：
+            # 交给上层走"未配置 Token"的分支，而不是把密文当 Token 发出去。
+            return plain if ok else fallback
+        return value
 
     def getint(self, section: str, key: str, fallback: int = 0) -> int:
         return self._parser.getint(section, key, fallback=fallback)
@@ -263,7 +308,11 @@ class Config:
     def set(self, section: str, key: str, value: Any) -> None:
         if not self._parser.has_section(section):
             self._parser.add_section(section)
-        self._parser.set(section, key, str(value))
+        text = str(value)
+        # 敏感项统一加密后再落盘；已经是密文的（如迁移时复制）不重复加密。
+        if (section, key) in SECRET_OPTIONS and not is_encrypted(text):
+            text = protect(text)
+        self._parser.set(section, key, text)
 
     # `has_option` / `remove_option` 是给 config_migrations 用的 ——
     # 迁移函数只该调 Config 的方法，不该直接摸 `self._parser`（实现细节）。

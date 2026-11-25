@@ -59,6 +59,8 @@ a = Analysis(
         'sqlite3',
         'win32gui',
         'win32con',
+        # Token 的 DPAPI 加解密。
+        'win32crypt',
     ],
     hookspath=[],
     hooksconfig={},
