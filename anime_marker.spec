@@ -65,7 +65,14 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # 排除其它 Qt 绑定：Conda 环境里常同时装着 PyQt5，
+    # PyInstaller 会为它跑 hook，然后因为"多个 Qt 绑定"直接中止打包。
+    # 本项目只用 PySide6，显式排除即可。
+    excludes=[
+        'PyQt5',
+        'PyQt6',
+        'PySide2',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

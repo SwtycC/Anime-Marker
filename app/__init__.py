@@ -12,7 +12,7 @@
 历史说明：早期是 QWidget 界面（`app/ui/` + `app/ui_styles/`）。
 """
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 # Bangumi API 要求的 User-Agent。
 #

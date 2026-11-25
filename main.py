@@ -21,12 +21,6 @@ def _force_basic_controls_style() -> None:
     **必须在导入 QmlApp（进而导入 QtQuick.Controls 相关模块）之前设置**，
     否则 `QQuickStyle.setStyle()` 会因控件已实例化而无效。
 
-    背景：Windows 上的默认风格是 `windows`（原生），该风格**不支持**
-    自定义 `background` / `contentItem`。表现为：
-    - `AppScrollBar` 的透明轨道被忽略，仍画出原生浅灰滚动条
-    - 深色界面右侧出现一条 10px 宽的白边（实测 `#f3f3f3`）
-    - 控制台会打印 "The current style does not support customization"
-
     改为 Basic 后所有控件均可自由定制，且外观在各平台一致。
     """
     os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")

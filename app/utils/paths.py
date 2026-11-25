@@ -1,9 +1,12 @@
 """统一路径管理（开发态 vs 打包态）。
 
-- 用户数据（配置/库/封面/缩略图/字体/日志）：
-    开发态放项目根 data/，打包后放 %APPDATA%\\AnimeMarker\\
+- 用户数据（配置/库/封面/缩略图/字体/日志）：统一放 <project_root>/data/
+    开发态 = 项目根；打包态 = exe 同级目录（便携式，数据跟 exe 走）
 - 资源（图标/QSS）：
-    开发态放项目根 resources/，打包后从 sys._MEIPASS 读取
+   开发态放项目根 resources/，打包后从 sys._MEIPASS 读取
+
+注意：打包态数据写在 exe 同级，因此程序目录必须可写；
+放到 Program Files 等受保护目录下会写入失败。
 
 代码中所有 I/O 路径必须经本模块，禁止 Path(__file__).parent 拼接。
 """
@@ -33,12 +36,9 @@ def app_data_dir() -> Path:
     """用户数据目录。
 
     - 开发态：<project_root>/data
-    - 打包态：%APPDATA%/AnimeMarker
+    - 打包态：<exe 同级>/data（便携式，数据随 exe 移动）
     """
-    if is_frozen():
-        base = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
-    else:
-        base = project_root() / "data"
+    base = project_root() / "data"
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -68,14 +68,10 @@ def thumbs_dir() -> Path:
 
 
 def fonts_dir() -> Path:
-    """用户上传的字体目录。
+    """用户上传的字体目录：<data>/fonts。
 
-    - 开发态：<project_root>/data/fonts
-    - 打包态：%APPDATA%/AnimeMarker/fonts
-
-    **必须放在用户数据目录**（而不是 resources/）：程序目录在
-    Program Files 下通常不可写；而且用户上传的字体属于个人数据，
-    升级 / 重装程序时不应被覆盖。
+    **必须放在用户数据目录**（而不是 resources/）：用户上传的字体
+    属于个人数据，替换 exe / 覆盖安装时不应被清掉。
     """
     p = app_data_dir() / "fonts"
     p.mkdir(parents=True, exist_ok=True)
