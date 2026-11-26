@@ -8,8 +8,6 @@
 - app.utils      工具（paths / logger / cover_cache / title_parser / bgm_log …）
 
 入口：`python main.py`（`run_qml.py` 为兼容转发）。
-
-历史说明：早期是 QWidget 界面（`app/ui/` + `app/ui_styles/`）。
 """
 
 __version__ = "1.1.1"

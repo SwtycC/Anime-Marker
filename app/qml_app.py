@@ -37,7 +37,7 @@ from app.core.database import Database
 from app.core.qbittorrent_api import QbClient
 from app.core.rss_service import RssService
 from app.utils.logger import setup_logging
-from app.utils.paths import app_data_dir, qml_dir, resource_path
+from app.utils.paths import app_data_dir, is_frozen, qml_dir, resource_path
 
 log = logging.getLogger(__name__)
 
@@ -493,12 +493,15 @@ class QmlApp:
         # 不显式设置时，从源码运行会归到 python.exe 名下 —— 表现为任务栏
         # 显示 Python 图标、把本项目和其他 Python 程序并成一组，且会盖掉
         # 下面 setWindowIcon() 的效果。必须在创建窗口之前调用。
+        #
+        # 开发态用带 `.Dev` 后缀的独立 AUMID。
         if sys.platform == "win32":
             try:
                 import ctypes
 
-                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                    "AnimeMarker.AnimeMarker")
+                aumid = ("AnimeMarker.AnimeMarker.Dev" if not is_frozen()
+                         else "AnimeMarker.AnimeMarker")
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(aumid)
             except (AttributeError, OSError):
                 log.warning("AppUserModelID 设置失败，任务栏图标可能沿用 python.exe")
 
