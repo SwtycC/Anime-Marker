@@ -17,7 +17,7 @@ Python + PySide6（QML 界面）。核心闭环：
 
 - 扫描本地目录（多个根目录用 `;` 分隔），提取标题、季数、集数
 - 调 Bangumi 搜索接口自动匹配，按分数判定；低分条目进「待确认」，可手动指定或重新匹配
-- 海报墙支持**平铺 / 按系列聚合**；封面本地缓存，断网也能出图
+- 封面本地缓存，断网也能出图
 - 详情页：集列表、观看进度、播放、重新扫描、重新匹配
 
 **播放联动**
@@ -50,14 +50,14 @@ Python + PySide6（QML 界面）。核心闭环：
 
 ## 环境要求
 
-| 项 | 要求 |
-| --- | --- |
-| 系统 | Windows 10 / 11（依赖 `win32gui` 读播放器窗口与播放位置）|
-| Python | **3.10+**（用到 `X \| None` 语法）|
-| PotPlayer | 播放功能需要（[下载](https://potplayer.daum.net/)）|
-| Lossless Scaling | 可选，自动插帧 |
-| qBittorrent | 可选，RSS 下载需要（需开启 Web UI）|
-| Bangumi Token | 可选，收藏 / 动态 / 自动上传需要 |
+| 项               | 要求                                                        |
+| ---------------- | ----------------------------------------------------------- |
+| 系统             | Windows 10 / 11（依赖 `win32gui` 读播放器窗口与播放位置） |
+| Python           | **3.10+**（用到 `X \| None` 语法）                   |
+| PotPlayer        | 播放功能需要（[下载](https://potplayer.daum.net/)）          |
+| Lossless Scaling | 可选，自动插帧                                              |
+| qBittorrent      | 可选，RSS 下载需要（需开启 Web UI）                         |
+| Bangumi Token    | 可选，收藏 / 动态 / 自动上传需要                            |
 
 ## 安装与运行
 
@@ -70,14 +70,14 @@ python main.py
 
 「设置」页填写后点「保存并扫描」：
 
-| 配置项 | 说明 |
-| --- | --- |
-| **Bangumi Token** | 获取：<https://next.bgm.tv/demo/access-token>（勾选「读取收藏」权限）|
-| 媒体库根目录 | 本地动漫所在目录，多个用 `;` 分隔 |
-| PotPlayer 路径 | `PotPlayerMini64.exe` |
-| 小黄鸭路径 | `LosslessScaling.exe`（可选）|
-| qBittorrent | 地址 / 端口 / 用户名 / 密码；可选填**程序路径**用于连不上时自动启动 |
-| 代理 | 可选，国内访问 `bgm.tv` / `api.bgm.tv` 可能需要 |
+| 配置项                  | 说明                                                                                                        |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------- |
+| **Bangumi Token** | 获取：[https://next.bgm.tv/demo/access-token](https://next.bgm.tv/demo/access-token)（勾选「读取收藏」权限） |
+| 媒体库根目录            | 本地动漫所在目录，多个用 `;` 分隔                                                                         |
+| PotPlayer 路径          | `PotPlayerMini64.exe`                                                                                     |
+| 小黄鸭路径              | `LosslessScaling.exe`（可选）                                                                             |
+| qBittorrent             | 地址 / 端口 / 用户名 / 密码；可选填**程序路径**用于连不上时自动启动                                   |
+| 代理                    | 可选，国内访问 `bgm.tv` / `api.bgm.tv` 可能需要                                                         |
 
 ### 关于「看完自动标记」
 
@@ -114,12 +114,12 @@ python main.py
 
 ## 截图
 
-| 海报墙 | 动态 |
-| --- | --- |
+| 海报墙                                      | 动态                                   |
+| ------------------------------------------- | -------------------------------------- |
 | ![海报墙](docs/screenshots/poster-wall.png) | ![动态](docs/screenshots/timeline.png) |
 
-| 详情页 | 设置 |
-| --- | --- |
+| 详情页                                 | 设置                                   |
+| -------------------------------------- | -------------------------------------- |
 | ![详情页](docs/screenshots/detail.png) | ![设置](docs/screenshots/settings.png) |
 
 ---
@@ -154,7 +154,7 @@ data/                   运行时数据（SQLite 库、封面缓存、日志）�
 - 本程序与 Bangumi 官方无关，通过其公开 API 读写**你自己的**观看记录：
   只会把「你看完的集」标记为看过，以及在你主动操作时修改该条目的收藏状态；
   不涉及评分、吐槽等其他内容。
-- API 调用遵守 Bangumi 的 [User-Agent 约定](https://github.com/bangumi/api/blob/master/docs-raw/user%20agent.md)。
+- API 调用遵守 Bangumi 的 [User-Agent 约定](<https://github.com/bangumi/api/blob/master/docs-raw/user%20agent.md>)。
 - 请自行确保所管理媒体内容的来源合法。
 
 ## 参与
